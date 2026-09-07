@@ -546,8 +546,21 @@ class AutoCameraBank(CameraBank):
         self._inner: CameraBank = MockCameraBank(self.count, self.width, self.height, self.hz)
 
     def start(self) -> None:
-        self._inner = self._choose()
-        self._inner.start()
+        try:
+            picked = self._choose()
+        except Exception:
+            logger.exception("识别作业相机失败")
+            picked = MockCameraBank(
+                self.count, self.width, self.height, self.hz, reason="识别作业相机失败"
+            )
+        old = self._inner
+        self._inner = picked
+        picked.start()
+        if old is not picked:
+            try:
+                old.stop()
+            except Exception:
+                pass
 
     def stop(self) -> None:
         self._inner.stop()

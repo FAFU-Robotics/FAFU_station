@@ -21,7 +21,7 @@ from pathlib import Path
 from robot_station.adapters.camera import CameraBank, build_camera
 from robot_station.bridge import MotionClient
 from robot_station.config import ROOT, StationConfig, load_config
-from robot_station.lock import MOTION_LOCK, wait_lock_free
+from robot_station.lock import MOTION_LOCK, port_open, wait_lock_free
 from robot_station.motion import MotionCore, run_motion_process
 from robot_station.netinfo import guess_lan_ip
 from robot_station.runtime import RuntimeStatus, inspect_runtime, plan_startup, should_open_browser
@@ -174,8 +174,15 @@ class WebFront:
         return _guess_ip(self.cfg)
 
     def start(self) -> None:
-        self.camera.start()
+        # Camera must not block the web port or the motion TCP connect.
+        threading.Thread(target=self._boot_camera, name="cam-boot", daemon=True).start()
         self.motion.connect(timeout_s=15.0)
+
+    def _boot_camera(self) -> None:
+        try:
+            self.camera.start()
+        except Exception:
+            logger.exception("作业相机启动失败")
 
     def stop(self) -> None:
         try:
@@ -554,15 +561,39 @@ def _maybe_open_browser(cfg: StationConfig, url: str, status: RuntimeStatus) -> 
     _open_browser(url, wait=True)
 
 
-def _replace_old(cfg: StationConfig) -> None:
-    logger.warning("按 --replace 结束旧站控。")
+def _replace_old(cfg: StationConfig, *, motion: bool = True) -> None:
+    logger.warning("按 --replace 结束旧站控%s。", "" if motion else "网页")
     replace_listener(cfg.http_port)
-    replace_listener(cfg.motion_port)
-    if not wait_lock_free(MOTION_LOCK, 3.0):
-        logger.warning("运动锁仍被占用，仍尝试启动")
+    if motion:
+        replace_listener(cfg.motion_port)
+        if not wait_lock_free(MOTION_LOCK, 3.0):
+            logger.warning("运动锁仍被占用，仍尝试启动")
+        wait_port_closed(cfg.motion_port, 2.0)
     wait_port_closed(cfg.http_port, 2.0)
-    wait_port_closed(cfg.motion_port, 2.0)
     time.sleep(0.2)
+
+
+def _serve_http_loop(front: Station | WebFront, cfg: StationConfig, stop: threading.Event) -> int:
+    """Rebind 9400 if the web loop dies. Never touch the motion process here."""
+    from robot_station.web.server import serve_http
+
+    while not stop.is_set():
+        try:
+            serve_http(front, cfg, stop)
+            return 0
+        except OSError as exc:
+            if exc.errno == errno.EADDRINUSE:
+                logger.error(
+                    "端口 %s 已被占用。若站控已在跑，直接打开网页即可；确认没人用再：python run_station.py --replace",
+                    cfg.http_port,
+                )
+                return 1
+            logger.exception("网页端口异常，稍后重绑（运动进程不动）")
+        except Exception:
+            logger.exception("网页服务异常，稍后重绑（运动进程不动）")
+        if stop.wait(0.6):
+            return 0
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -686,6 +717,9 @@ def main(argv: list[str] | None = None) -> int:
     if plan.action == "replace_then_start":
         _replace_old(cfg)
         status = inspect_runtime(cfg)
+    elif plan.action == "replace_web_then_start":
+        _replace_old(cfg, motion=False)
+        status = inspect_runtime(cfg)
 
     if args.motion_only:
         cfg.open_browser = False
@@ -696,14 +730,12 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         return 0
 
-    want_web_only = args.web_only or plan.action == "web_only"
+    want_web_only = args.web_only or plan.action in ("web_only", "replace_web_then_start")
     if want_web_only and not args.in_process:
         args.web_only = True
 
     if not should_open_browser(cfg, status):
         cfg.open_browser = False
-
-    from robot_station.web.server import serve_http
 
     motion_proc: subprocess.Popen | None = None
     if args.in_process:
@@ -728,21 +760,10 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     try:
-        serve_http(front, cfg, stop)
-    except OSError as exc:
-        if exc.errno == errno.EADDRINUSE:
-            logger.error(
-                "端口 %s 已被占用。若站控已在跑，直接打开网页即可；确认没人用再：python run_station.py --replace",
-                cfg.http_port,
-            )
-            front.stop()
-            _stop_proc(motion_proc)
-            return 1
-        raise
+        return _serve_http_loop(front, cfg, stop)
     finally:
         front.stop()
         _stop_proc(motion_proc)
-    return 0
 
 
 if __name__ == "__main__":

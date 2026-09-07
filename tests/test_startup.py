@@ -33,6 +33,22 @@ class StartupPlanTests(unittest.TestCase):
         plan = plan_startup(_st(motion_up=True, lock_held=True))
         self.assertEqual(plan.action, "web_only")
 
+    def test_web_only_replace_skips_motion_port(self) -> None:
+        plan = plan_startup(
+            _st(http_up=True, motion_up=True, lock_held=True), replace=True, web_only=True
+        )
+        self.assertEqual(plan.action, "replace_web_then_start")
+        self.assertIn("不杀运动", plan.reason)
+
+    def test_web_only_attaches_if_http_already_up(self) -> None:
+        plan = plan_startup(_st(http_up=True, motion_up=True, lock_held=True), web_only=True)
+        self.assertEqual(plan.action, "attach")
+
+    def test_wait_port_closed_imports_port_open(self) -> None:
+        from robot_station.service import wait_port_closed
+
+        self.assertTrue(wait_port_closed(59998, 0.2))
+
     def test_http_orphan_refuses(self) -> None:
         plan = plan_startup(_st(http_up=True))
         self.assertEqual(plan.action, "refuse")

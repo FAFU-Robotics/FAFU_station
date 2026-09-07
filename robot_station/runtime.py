@@ -52,6 +52,13 @@ def plan_startup(
     if web_only:
         if not status.motion_up:
             return StartupPlan("refuse", "网页单独启动需要运动进程已在 9470 听着。请先 python run_station.py")
+        if replace and status.http_up:
+            return StartupPlan(
+                "replace_web_then_start",
+                "只结束网页端口再补网页，不杀运动",
+            )
+        if status.http_up:
+            return StartupPlan("attach", "网页已在运行，复用，不杀进程")
         return StartupPlan("web_only", "只跑网页，接到已有运动进程")
 
     if in_process:

@@ -10,6 +10,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -18,6 +19,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 CONF = HERE / "station_client.conf"
 DEFAULT_PORT = 9400
+MOTION_PORT = 9470
 DEFAULT_PATH = "/"
 APP_TITLE = "FAFU 机械臂站控"
 WAIT_S = 25.0
@@ -218,29 +220,49 @@ def _station_info(port: int) -> dict:
     return data if isinstance(data, dict) else {}
 
 
+def _station_http_ok(port: int) -> bool:
+    info = _station_info(port)
+    if isinstance(info, dict) and info.get("ok"):
+        return True
+    return _looks_like_station("127.0.0.1", port)
+
+
+def _motion_up() -> bool:
+    return _port_open("127.0.0.1", MOTION_PORT)
+
+
 def _live_station_ready(port: int) -> bool:
     return _existing_live_station_ok(_station_info(port))
 
 
 def _existing_live_station_ok(info: dict | None) -> bool:
-    """Reuse only a live arm that already auto-picks the USB work camera."""
+    """Reuse a live arm host. Camera mock must not kill a working serial session."""
     if not info:
         return False
     if str(info.get("arm") or "") != "fafu":
         return False
-    if not info.get("arm_allow_motion"):
-        return False
-    cam = str(info.get("camera") or "mock").strip().lower()
-    return cam in ("auto", "live", "usb", "realsense")
+    return bool(info.get("arm_allow_motion"))
 
 
-def _spawn_local_station() -> subprocess.Popen | None:
+def _station_should_outlive_window() -> bool:
+    """Live motion must keep 100 Hz hold; the window is only a viewer."""
+    return _live_arm_wanted() or _motion_up()
+
+
+def _spawn_local_station(web_only: bool = False, *, replace_web: bool = False) -> subprocess.Popen | None:
     root = _repo_root()
     run_py = root / "run_station.py"
     if not run_py.is_file():
         return None
     cmd = [_python_exe(), str(run_py), "--no-browser"]
-    if _live_arm_wanted():
+    if web_only:
+        cmd.extend(["--web-only", "--camera", "auto"])
+        if replace_web:
+            cmd.append("--replace")
+            _log("9400 hung, motion still up: replace web-only (do not kill arm)")
+        else:
+            _log("9400 down, motion still up: spawn web-only + camera auto")
+    elif _live_arm_wanted():
         cmd.extend(["--replace", "--arm", "fafu", "--allow-motion", "--camera", "auto"])
         _log("live arm: STATION_ALLOW_LIVE_ARM set, spawning fafu + allow-motion + camera auto")
     try:
@@ -261,11 +283,43 @@ def _spawn_local_station() -> subprocess.Popen | None:
         "stderr": subprocess.STDOUT,
     }
     if os.name == "nt":
-        kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200) | 0x08000000
+        # CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB
+        # so closing the GUI / console job cannot take 9400/9470 with it.
+        kwargs["creationflags"] = (
+            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+            | 0x08000000
+            | 0x01000000
+        )
     else:
         kwargs["start_new_session"] = True
     _log("spawn " + " ".join(cmd))
     return subprocess.Popen(cmd, **kwargs)
+
+
+def _spawn_and_wait(port: int, *, web_only: bool, replace_web: bool = False) -> tuple[bool, subprocess.Popen | None]:
+    proc = _spawn_local_station(web_only=web_only, replace_web=replace_web)
+    if proc is None:
+        return False, None
+    deadline = time.monotonic() + WAIT_S
+    saw_gap = not replace_web
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            if _port_open("127.0.0.1", port) and (not replace_web or _station_http_ok(port)):
+                return True, proc
+            _log(f"host exited {proc.returncode} before :{port} listened")
+            return False, None
+        up = _port_open("127.0.0.1", port)
+        ok = up and (not replace_web or _station_http_ok(port))
+        if replace_web and not saw_gap:
+            if not up or not _station_http_ok(port):
+                saw_gap = True
+            time.sleep(0.3)
+            continue
+        if ok:
+            return True, proc
+        time.sleep(0.3)
+    _stop_proc(proc)
+    return False, None
 
 
 def _stop_proc(proc: subprocess.Popen | None) -> None:
@@ -292,32 +346,71 @@ def _stop_proc(proc: subprocess.Popen | None) -> None:
 
 
 def _ensure_local_station(port: int) -> tuple[bool, subprocess.Popen | None]:
-    if _port_open("127.0.0.1", port):
-        if _live_arm_wanted():
-            info = _station_info(port)
-            arm = str((info or {}).get("arm") or "")
-            if _existing_live_station_ok(info):
-                return True, None
-            _log(
-                f"live arm requested; existing :{port} is arm={arm or 'unknown'} "
-                f"camera={ (info or {}).get('camera') or 'unknown' }, replacing"
-            )
-            proc = _spawn_local_station()
-            if proc is None:
-                return False, None
-            if _wait_ready("127.0.0.1", port, WAIT_S, proc):
-                return True, proc
-            _stop_proc(proc)
-            return False, None
+    http_up = _port_open("127.0.0.1", port)
+    motion_up = _motion_up()
+    if http_up and motion_up:
+        _log(f"attach existing :{port} (motion :{MOTION_PORT} up, never replace while motion)")
         return True, None
+    if http_up and _live_arm_wanted():
+        info = _station_info(port)
+        arm = str((info or {}).get("arm") or "")
+        if _existing_live_station_ok(info):
+            return True, None
+        _log(
+            f"live arm requested; existing :{port} is arm={arm or 'unknown'} "
+            f"camera={(info or {}).get('camera') or 'unknown'} without motion, replacing"
+        )
+        return _spawn_and_wait(port, web_only=False)
+    if http_up:
+        return True, None
+    if motion_up:
+        _log(f"port {port} down, motion :{MOTION_PORT} still up — web-only (do not kill arm)")
+        return _spawn_and_wait(port, web_only=True)
     _log(f"port {port} down, starting host")
-    proc = _spawn_local_station()
-    if proc is None:
-        return False, None
-    if _wait_ready("127.0.0.1", port, WAIT_S, proc):
-        return True, proc
-    _stop_proc(proc)
-    return False, None
+    return _spawn_and_wait(port, web_only=False)
+
+
+def _guard_web(
+    window,
+    host: str,
+    port: int,
+    path: str,
+    halt: threading.Event,
+    state: dict,
+) -> None:
+    """While the window is open: if 9400 dies and 9470 lives, only respawn the web process."""
+    misses = 0
+    while not halt.wait(1.5):
+        listening = _port_open(host, port)
+        if listening:
+            misses = 0
+            if state.get("offline"):
+                try:
+                    window.load_url(_make_url(host, port, path))
+                    state["offline"] = False
+                    _log("web restored, reloaded window")
+                except Exception as exc:
+                    _log(f"reload after web restore failed: {exc}")
+            continue
+        if not _motion_up():
+            misses = 0
+            continue
+        misses += 1
+        if misses < 2:
+            continue
+        _log("web lost, motion still up; respawn web-only")
+        ok, _proc = _spawn_and_wait(port, web_only=True, replace_web=False)
+        if not ok and _port_open(host, port):
+            ok, _proc = _spawn_and_wait(port, web_only=True, replace_web=True)
+        if not ok:
+            continue
+        misses = 0
+        if state.get("offline"):
+            try:
+                window.load_url(_make_url(host, port, path))
+                state["offline"] = False
+            except Exception as exc:
+                _log(f"reload after web restore failed: {exc}")
 
 
 class _Api:
@@ -456,12 +549,22 @@ def _start_webview(url: str, ready: bool, host: str, port: int, path: str) -> in
         window_kwargs["html"] = _OFFLINE_HTML.format(url=url, host=host, port=port)
     window = webview.create_window(**window_kwargs)
     holder["window"] = window
+    halt = threading.Event()
+    state = {"offline": not ready}
 
     def _after_start() -> None:
-        if ready:
-            return
-        if _wait_ready(host, port, 2.0):
-            window.load_url(url)
+        if (not ready) and _wait_ready(host, port, 2.0):
+            try:
+                window.load_url(url)
+                state["offline"] = False
+            except Exception as exc:
+                _log(f"late load failed: {exc}")
+        threading.Thread(
+            target=_guard_web,
+            args=(window, host, port, path, halt, state),
+            name="web-guard",
+            daemon=True,
+        ).start()
 
     _log(f"window {url} ready={ready}")
     start_kwargs = {
@@ -471,17 +574,20 @@ def _start_webview(url: str, ready: bool, host: str, port: int, path: str) -> in
     if os.name == "nt":
         start_kwargs["gui"] = "edgechromium"
     try:
-        webview.start(_after_start, **start_kwargs)
-        return 0
-    except Exception as exc:
-        _log(f"edgechromium failed: {exc}")
         try:
-            start_kwargs.pop("gui", None)
             webview.start(_after_start, **start_kwargs)
             return 0
-        except Exception as exc2:
-            _alert(f"无法打开站控窗口：{exc2}")
-            return 1
+        except Exception as exc:
+            _log(f"edgechromium failed: {exc}")
+            try:
+                start_kwargs.pop("gui", None)
+                webview.start(_after_start, **start_kwargs)
+                return 0
+            except Exception as exc2:
+                _alert(f"无法打开站控窗口：{exc2}")
+                return 1
+    finally:
+        halt.set()
 
 
 def main() -> int:
@@ -511,7 +617,10 @@ def main() -> int:
     try:
         return _start_webview(url, ready, host, args.port, path)
     finally:
-        _stop_proc(child)
+        if _station_should_outlive_window():
+            _log("window closed; leave station running (do not kill arm / web)")
+        else:
+            _stop_proc(child)
 
 
 if __name__ == "__main__":

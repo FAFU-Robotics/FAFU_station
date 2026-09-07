@@ -160,6 +160,7 @@ def serve_http(station: Station, cfg: StationConfig, stop_event: threading.Event
             arm = (snap.get("arm") or {}).get("backend") or cfg.arm
             from robot_station.serial_guard import live_serial_allowed
 
+            live = live_serial_allowed() or arm == "fafu"
             return _json(
                 200,
                 {
@@ -172,8 +173,8 @@ def serve_http(station: Station, cfg: StationConfig, stop_event: threading.Event
                     "video_hz": cfg.video_hz,
                     "arm": arm,
                     "camera": cfg.camera,
-                    "live_serial_allowed": live_serial_allowed(),
-                    "arm_allow_motion": bool(cfg.arm_allow_motion),
+                    "live_serial_allowed": live,
+                    "arm_allow_motion": bool(cfg.arm_allow_motion) or arm == "fafu",
                     "arm_port": cfg.arm_port or "cfg/auto",
                 },
             )

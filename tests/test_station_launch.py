@@ -54,19 +54,31 @@ class StationLaunchFilesTests(unittest.TestCase):
         self.assertIn("_live_station_ready", desktop)
         self.assertIn("_existing_live_station_ok", desktop)
         self.assertIn("--camera", desktop)
-        self.assertIn("camera auto", desktop)
+        self.assertIn("--web-only", desktop)
+        self.assertIn("do not kill arm", desktop)
         self.assertIn("existing :", desktop)
         self.assertIn("host exited", desktop)
-        self.assertNotIn("--discover", desktop)
-        self.assertNotIn("FAFULabPortal", desktop)
-        self.assertNotIn("工控机", desktop)
+        self.assertIn("_guard_web", desktop)
+        self.assertIn("_station_should_outlive_window", desktop)
+        self.assertIn("never replace while motion", desktop)
+        self.assertIn("web lost, motion still up", desktop)
+        self.assertIn("replace_web", desktop)
+        self.assertIn("0x01000000", desktop)
+        service = (ROOT / "robot_station" / "service.py").read_text(encoding="utf-8")
+        self.assertIn("_serve_http_loop", service)
+        self.assertIn("replace_web_then_start", service)
         spec = (ROOT / "docs/SPEC.md").read_text(encoding="utf-8")
         self.assertIn("客户 PC", spec)
         self.assertIn("本机宿主", spec)
+        self.assertIn("不得** `--replace` 整站", spec)
+        self.assertIn("只补 `--web-only`", spec)
         self.assertNotIn("工控机", spec)
         self.assertNotIn("Jetson", spec)
         self.assertNotIn("FAFU-ARM", spec)
         self.assertNotIn("bunker-local", spec)
+        self.assertNotIn("--discover", desktop)
+        self.assertNotIn("FAFULabPortal", desktop)
+        self.assertNotIn("工控机", desktop)
         example = (ROOT / "configs/station.example.yaml").read_text(encoding="utf-8")
         self.assertNotIn("password:", example)
         self.assertNotIn("lease_s:", example)
@@ -93,7 +105,7 @@ class StationLaunchFilesTests(unittest.TestCase):
         self.assertEqual(data.get("PORT"), "9400")
         self.assertEqual(data.get("PATH"), "/")
         self.assertEqual(data.get("HOST"), "127.0.0.1")
-        self.assertFalse(sd._existing_live_station_ok({"arm": "fafu", "arm_allow_motion": True, "camera": "mock"}))
+        self.assertTrue(sd._existing_live_station_ok({"arm": "fafu", "arm_allow_motion": True, "camera": "mock"}))
         self.assertTrue(sd._existing_live_station_ok({"arm": "fafu", "arm_allow_motion": True, "camera": "auto"}))
         argv = sd._app_shell_argv("http://127.0.0.1:9400/")
         if argv is not None:
@@ -121,6 +133,70 @@ class StationLaunchFilesTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertLess(time.monotonic() - t0, 3.0)
         proc.wait(timeout=2)
+
+    def test_ensure_attaches_when_motion_up_even_if_info_is_wrong(self) -> None:
+        import sys
+        from unittest.mock import patch
+
+        if str(ROOT) not in sys.path:
+            sys.path.insert(0, str(ROOT))
+        import station_desktop as sd
+
+        def ports(_host: str, port: int, *_a: object, **_k: object) -> bool:
+            return int(port) in (9400, 9470)
+
+        with (
+            patch.object(sd, "_live_arm_wanted", return_value=True),
+            patch.object(sd, "_port_open", side_effect=ports),
+            patch.object(sd, "_station_info", return_value={"arm": "mock", "camera": "mock"}),
+            patch.object(sd, "_spawn_local_station") as spawn,
+        ):
+            ok, proc = sd._ensure_local_station(9400)
+        self.assertTrue(ok)
+        self.assertIsNone(proc)
+        spawn.assert_not_called()
+
+    def test_ensure_web_only_when_motion_up_and_http_down(self) -> None:
+        import sys
+        from unittest.mock import MagicMock, patch
+
+        if str(ROOT) not in sys.path:
+            sys.path.insert(0, str(ROOT))
+        import station_desktop as sd
+
+        def ports(_host: str, port: int, *_a: object, **_k: object) -> bool:
+            return int(port) == 9470
+
+        child = MagicMock()
+        with (
+            patch.object(sd, "_port_open", side_effect=ports),
+            patch.object(sd, "_spawn_and_wait", return_value=(True, child)) as spawn,
+        ):
+            ok, proc = sd._ensure_local_station(9400)
+        self.assertTrue(ok)
+        self.assertIs(proc, child)
+        spawn.assert_called_once_with(9400, web_only=True)
+
+    def test_station_outlives_window_when_live_or_motion_up(self) -> None:
+        import sys
+        from unittest.mock import patch
+
+        if str(ROOT) not in sys.path:
+            sys.path.insert(0, str(ROOT))
+        import station_desktop as sd
+
+        with patch.object(sd, "_live_arm_wanted", return_value=True), patch.object(
+            sd, "_motion_up", return_value=False
+        ):
+            self.assertTrue(sd._station_should_outlive_window())
+        with patch.object(sd, "_live_arm_wanted", return_value=False), patch.object(
+            sd, "_motion_up", return_value=True
+        ):
+            self.assertTrue(sd._station_should_outlive_window())
+        with patch.object(sd, "_live_arm_wanted", return_value=False), patch.object(
+            sd, "_motion_up", return_value=False
+        ):
+            self.assertFalse(sd._station_should_outlive_window())
 
     def test_motion_child_keeps_arm_sim_override(self) -> None:
         cmd = motion_argv(StationConfig(arm="sim"), None)

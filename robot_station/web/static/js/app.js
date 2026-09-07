@@ -1112,14 +1112,20 @@
     $("safeTxt").textContent = last.safety || "—";
   }
   function connectBus() {
-    if (ws) try { ws.close(); } catch (e) {}
-    ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws/cmd");
-    ws.onopen = () => setLink(true, "");
-    ws.onclose = () => {
+    const prev = ws;
+    if (prev) {
+      prev.onclose = null;
+      try { prev.close(); } catch (e) {}
+    }
+    const sock = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws/cmd");
+    ws = sock;
+    sock.onopen = () => { if (ws === sock) setLink(true, ""); };
+    sock.onclose = () => {
+      if (ws !== sock) return;
       setLink(false, "");
-      if (live) setTimeout(connectBus, 800);
+      if (live) setTimeout(() => { if (ws === sock) connectBus(); }, 800);
     };
-    ws.onmessage = (ev) => {
+    sock.onmessage = (ev) => {
       let msg;
       try { msg = JSON.parse(ev.data); } catch (e) { return; }
       if (msg.t === "pong") {
@@ -1162,11 +1168,16 @@
     };
   }
   function connectTelem() {
-    if (telemWs) try { telemWs.close(); } catch (e) {}
-    telemWs = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws");
-    telemWs.binaryType = "arraybuffer";
-    telemWs.onclose = () => { if (live) setTimeout(connectTelem, 800); };
-    telemWs.onmessage = (ev) => {
+    const prev = telemWs;
+    if (prev) {
+      prev.onclose = null;
+      try { prev.close(); } catch (e) {}
+    }
+    const sock = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws");
+    telemWs = sock;
+    sock.binaryType = "arraybuffer";
+    sock.onclose = () => { if (telemWs === sock && live) setTimeout(() => { if (telemWs === sock) connectTelem(); }, 800); };
+    sock.onmessage = (ev) => {
       if (ev.data instanceof ArrayBuffer) {
         pendingTelem = ev.data;
         if (!snapRaf) snapRaf = requestAnimationFrame(flushSnap);
@@ -1190,10 +1201,15 @@
     };
   }
   function connectRttSocket() {
-    if (rttWs) try { rttWs.close(); } catch (e) {}
-    rttWs = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws/rtt");
-    rttWs.onclose = () => { if (live && !rttWorker) setTimeout(connectRttSocket, 1000); };
-    rttWs.onmessage = (ev) => {
+    const prev = rttWs;
+    if (prev) {
+      prev.onclose = null;
+      try { prev.close(); } catch (e) {}
+    }
+    const sock = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws/rtt");
+    rttWs = sock;
+    sock.onclose = () => { if (rttWs === sock && live && !rttWorker) setTimeout(() => { if (rttWs === sock) connectRttSocket(); }, 1000); };
+    sock.onmessage = (ev) => {
       let msg;
       try { msg = JSON.parse(ev.data); } catch (e) { return; }
       if (msg.t === "pong") onPong(msg);
@@ -1228,10 +1244,15 @@
     }
   }
   function connectVideo() {
-    if (vws) try { vws.close(); } catch (e) {}
-    vws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws/video");
-    vws.binaryType = "arraybuffer";
-    vws.onmessage = (ev) => {
+    const prev = vws;
+    if (prev) {
+      prev.onclose = null;
+      try { prev.close(); } catch (e) {}
+    }
+    const sock = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws/video");
+    vws = sock;
+    sock.binaryType = "arraybuffer";
+    sock.onmessage = (ev) => {
       if (cartHeld.size) return;
       if ($("armFollow") && $("armFollow").checked) return;
       const cams = $("panel-cams");
@@ -1245,7 +1266,15 @@
       const payload = buf.slice(VID_HDR, VID_HDR + len);
       applyPng(sid, new Blob([payload], { type: "image/png" }));
     };
-    vws.onclose = () => { if (live) setTimeout(connectVideo, 1000); };
+    sock.onclose = () => { if (vws === sock && live) setTimeout(() => { if (vws === sock) connectVideo(); }, 1000); };
+  }
+
+  function nudgeSockets() {
+    if (!live) return;
+    if (!ws || ws.readyState > 1) connectBus();
+    if (!telemWs || telemWs.readyState > 1) connectTelem();
+    if (!vws || vws.readyState > 1) connectVideo();
+    if (!rttWorker && (!rttWs || rttWs.readyState > 1)) connectRttSocket();
   }
 
   async function boot() {
@@ -1253,8 +1282,13 @@
     ensureDefaultHash();
     showPage();
     syncStage();
-    const r = await fetch("/api/info");
-    if (r.ok) info = await r.json();
+    try {
+      const ac = new AbortController();
+      const timer = setTimeout(() => ac.abort(), 2000);
+      const r = await fetch("/api/info", { signal: ac.signal });
+      clearTimeout(timer);
+      if (r.ok) info = await r.json();
+    } catch (e) {}
     if (info) $("brandSub").textContent = "控制 " + info.control_hz + "Hz · 视频 " + info.video_hz + "Hz · " + info.host_ip;
     if ($("collectBanner")) {
       const liveArm = !!(info && info.live_serial_allowed);
@@ -1271,6 +1305,10 @@
     connectTelem();
     connectRtt();
     connectVideo();
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden) nudgeSockets();
+    });
+    window.addEventListener("focus", nudgeSockets);
   }
 
   $("btnEstop").onclick = () => fireEstop();
