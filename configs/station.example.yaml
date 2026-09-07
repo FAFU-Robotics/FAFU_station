@@ -1,0 +1,28 @@
+# 复制为 configs/station.yaml。本机 USB 直连，无登录密码。
+robot_id: FAFU-STATION-001
+listen_host: 127.0.0.1
+http_port: 9400
+
+control_hz: 100
+telemetry_hz: 100
+video_hz: 30
+watchdog_s: 0.20
+motion_host: 127.0.0.1
+motion_port: 9470
+
+# mock=假臂插补；sim=Fake 控制器（SDK 方法名，不开串口）；fafu=本机 USB 真串口（须 STATION_ALLOW_LIVE_ARM=1）
+arm: mock
+# auto=启动时自动认 USB 作业相机（优先 RealSense D405，跳过笔记本内置摄像头）
+camera: auto
+camera_count: 1
+camera_width: 320
+camera_height: 180
+
+arm_joints: 6
+arm_speed_deg_s: 40
+arm_has_gripper: true
+arm_sdk: ""
+arm_cfg: ""
+arm_port: ""
+arm_allow_motion: false
+arm_gripper_id: 7

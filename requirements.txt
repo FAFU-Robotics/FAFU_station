@@ -1,0 +1,9 @@
+# 13+ 有 websockets.asyncio；12 走 legacy 兼容路径。
+websockets>=12
+PyYAML>=6.0
+pywebview>=5.0
+numpy>=1.23
+pyrealsense2>=2.54
+# Optional Windows cartesian IK (Trac-IK). Not required to start the station.
+# pytracik>=0.0.3
+

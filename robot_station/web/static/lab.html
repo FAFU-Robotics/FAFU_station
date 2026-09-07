@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>FAFU 机械臂站控 · 本机状态</title>
+  <link rel="stylesheet" href="/static/css/app.css"/>
+  <style>
+    .lab { max-width: 720px; margin: 0 auto; padding: 28px 16px 48px; }
+    .lab h1 { margin: 0 0 8px; font-size: 24px; }
+    .lab .lead { color: var(--muted); margin: 0 0 20px; }
+    .lab-card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 18px 16px; }
+    .lab-card h2 { margin: 0 0 8px; font-size: 18px; }
+    .lab-card .url { font: 600 14px/1.4 ui-monospace, Menlo, monospace; word-break: break-all; color: var(--cyan); }
+    .lab-card a.big {
+      display: block; margin-top: 14px; text-align: center; text-decoration: none;
+      background: var(--cyan-dim); border: 1px solid #2d6f8f; color: #d7f3ff;
+      border-radius: 10px; padding: 12px 14px; font-weight: 700;
+    }
+    .status { margin: 16px 0; display: flex; flex-wrap: wrap; gap: 8px; }
+    .alt { margin-top: 18px; color: var(--muted); font-size: 13px; }
+    .alt code { color: var(--text); }
+  </style>
+</head>
+<body>
+  <div class="lab">
+    <h1>FAFU 机械臂站控</h1>
+    <p class="lead">本机宿主。PC 用 USB 直连机械臂。</p>
+    <div class="status">
+      <div class="led"><span class="dot off" id="dotStation"></span> <span id="txtStation">站控 —</span></div>
+      <div class="led"><span class="dot off" id="dotMotion"></span> <span id="txtMotion">运动进程 —</span></div>
+    </div>
+    <div class="lab-card">
+      <h2>机械臂 · 本机入口</h2>
+      <p class="hint" style="margin:0 0 8px">滑条、3D、相机。默认地址是本机回环。</p>
+      <div class="url" id="urlStation">http://127.0.0.1:9400/</div>
+      <a class="big" id="goStation" href="/">打开机械臂页</a>
+    </div>
+    <div class="alt">
+      <p>真机前请确认：USB 已接到这台电脑，并设置 <code>STATION_ALLOW_LIVE_ARM=1</code> 后以 <code>--arm fafu --allow-motion</code> 启动。</p>
+      <p id="ipList"></p>
+    </div>
+  </div>
+  <script>
+    function paint(d) {
+      const host = (d && d.host_ip) || location.hostname || "127.0.0.1";
+      const sp = (d && d.station_port) || 9400;
+      const station = location.protocol + "//" + location.host + "/";
+      document.getElementById("urlStation").textContent = station;
+      document.getElementById("goStation").href = "/";
+      const mUp = !!(d && d.motion_up);
+      document.getElementById("dotStation").className = "dot on";
+      document.getElementById("txtStation").textContent = "站控在线 :" + sp;
+      document.getElementById("dotMotion").className = "dot " + (mUp ? "on" : "off");
+      document.getElementById("txtMotion").textContent = mUp ? "运动进程在线" : "运动进程未起来";
+      const ips = (d && d.ips) || [];
+      if (ips.length) {
+        const lines = ips.map((ip) => "http://" + ip + ":" + sp + "/");
+        document.getElementById("ipList").innerHTML = "<b>本机地址</b><br/>" + lines.join("<br/>");
+      }
+    }
+    async function refresh() {
+      try {
+        const r = await fetch("/api/lab", { cache: "no-store" });
+        const d = r.ok ? await r.json() : {};
+        paint(d);
+      } catch (e) {
+        paint({});
+      }
+    }
+    refresh();
+    setInterval(refresh, 2000);
+  </script>
+</body>
+</html>

@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+logs/
+*.log
+configs/station.yaml
+.DS_Store
+/dist/
+packaging/windows/cache/

@@ -1,0 +1,5 @@
+python310.zip
+.
+Lib\site-packages
+..\..\app
+import site
