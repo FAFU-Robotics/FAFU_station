@@ -133,6 +133,20 @@ class Station:
     ) -> str | None:
         return self.core.on_path(cid, waypoints, speed, durations=durations)
 
+    def on_rec_start(self, cid: str, name: str | None = None, teach: str | None = None) -> str | None:
+        return self.core.on_rec_start(cid, name, teach=teach)
+
+    def on_rec_delete(self, cid: str, path: str) -> str | None:
+        return self.core.on_rec_delete(cid, path)
+
+    def on_rec_stop(self, cid: str) -> str | None:
+        return self.core.on_rec_stop(cid)
+
+    def on_replay(
+        self, cid: str, path: str, rate: float = 1.0, speed: float | None = None
+    ) -> str | None:
+        return self.core.on_replay(cid, path, rate=rate, speed=speed)
+
     def on_link(self, cid: str, action: str) -> str | None:
         return self.core.on_link(cid, action)
 
@@ -208,7 +222,7 @@ class WebFront:
         self.motion.send({"t": "park", "cid": cid})
 
     def on_arm_src(self, cid: str, kind: str) -> str | None:
-        ack = self.motion.call({"t": "arm_src", "cid": cid, "mode": kind})
+        ack = self.motion.call({"t": "arm_src", "cid": cid, "mode": kind}, timeout_s=20.0)
         if ack.get("ok"):
             return None
         return str(ack.get("error") or "切换臂源失败")
@@ -303,8 +317,42 @@ class WebFront:
             return None
         return str(ack.get("error") or "路点失败")
 
+    def on_rec_start(self, cid: str, name: str | None = None, teach: str | None = None) -> str | None:
+        msg: dict = {"t": "rec_start", "cid": cid}
+        if name:
+            msg["name"] = name
+        if teach:
+            msg["teach"] = teach
+        ack = self.motion.call(msg)
+        if ack.get("ok"):
+            return None
+        return str(ack.get("error") or "录制失败")
+
+    def on_rec_stop(self, cid: str) -> str | None:
+        ack = self.motion.call({"t": "rec_stop", "cid": cid})
+        if ack.get("ok"):
+            return None
+        return str(ack.get("error") or "停止录制失败")
+
+    def on_rec_delete(self, cid: str, path: str) -> str | None:
+        ack = self.motion.call({"t": "rec_delete", "cid": cid, "file": path})
+        if ack.get("ok"):
+            return None
+        return str(ack.get("error") or "删除失败")
+
+    def on_replay(
+        self, cid: str, path: str, rate: float = 1.0, speed: float | None = None
+    ) -> str | None:
+        msg: dict = {"t": "replay", "cid": cid, "file": path, "rate": rate}
+        if speed is not None:
+            msg["speed"] = float(speed)
+        ack = self.motion.call(msg, timeout_s=20.0)
+        if ack.get("ok"):
+            return None
+        return str(ack.get("error") or "回放失败")
+
     def on_link(self, cid: str, action: str) -> str | None:
-        ack = self.motion.call({"t": "link", "cid": cid, "action": action})
+        ack = self.motion.call({"t": "link", "cid": cid, "action": action}, timeout_s=20.0)
         if ack.get("ok"):
             return None
         return str(ack.get("error") or "连接失败")
@@ -316,7 +364,7 @@ class WebFront:
         return str(ack.get("error") or "脚本失败")
 
     def on_power(self, cid: str, on: bool) -> str | None:
-        ack = self.motion.call({"t": "power", "cid": cid, "on": on})
+        ack = self.motion.call({"t": "power", "cid": cid, "on": on}, timeout_s=20.0)
         if ack.get("ok"):
             return None
         return str(ack.get("error") or "使能失败")

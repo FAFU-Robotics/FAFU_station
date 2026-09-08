@@ -158,6 +158,7 @@ def serve_http(station: Station, cfg: StationConfig, stop_event: threading.Event
         if path == "/api/info" and method == "GET":
             snap = station.snapshot()
             arm = (snap.get("arm") or {}).get("backend") or cfg.arm
+            from robot_station.runtime import station_code_rev
             from robot_station.serial_guard import live_serial_allowed
 
             live = live_serial_allowed() or arm == "fafu"
@@ -176,6 +177,7 @@ def serve_http(station: Station, cfg: StationConfig, stop_event: threading.Event
                     "live_serial_allowed": live,
                     "arm_allow_motion": bool(cfg.arm_allow_motion) or arm == "fafu",
                     "arm_port": cfg.arm_port or "cfg/auto",
+                    "code_rev": station_code_rev(),
                 },
             )
         if path == "/api/scripts" and method == "GET":
@@ -191,6 +193,24 @@ def serve_http(station: Station, cfg: StationConfig, stop_event: threading.Event
                     ],
                 },
             )
+        if path.split("?", 1)[0] == "/api/traj" and method == "GET":
+            from robot_station.traj import list_recordings
+
+            return _json(200, {"ok": True, "files": list_recordings()})
+        if path.split("?", 1)[0] == "/api/traj" and method == "DELETE":
+            from urllib.parse import parse_qs
+
+            from robot_station.traj import delete_recording
+
+            qs = parse_qs(urlsplit(path).query)
+            name = str((qs.get("name") or qs.get("file") or [""])[0] or "")
+            try:
+                gone = delete_recording(name)
+            except FileNotFoundError as exc:
+                return _json(404, {"ok": False, "error": str(exc)})
+            except OSError as exc:
+                return _json(400, {"ok": False, "error": f"删除失败: {exc}"})
+            return _json(200, {"ok": True, "name": gone.name})
         return _http(404, b"not found", "text/plain; charset=utf-8")
 
     def process_request(connection: ServerConnection, request: Request) -> Response | None:
@@ -444,6 +464,25 @@ async def _on_text(st: Station, cid: str, raw: str, ws: ServerConnection) -> Non
         durations = [float(x) for x in dt_raw] if dt_raw else None
         err = await _rpc(st.on_path, cid, wps, speed, durations)
         await ws.send(json.dumps({"t": "ack", "ok": err is None, "error": err, "op": "path"}))
+    elif kind == "rec_start":
+        err = await _rpc(st.on_rec_start, cid, msg.get("name"), msg.get("teach"))
+        await ws.send(json.dumps({"t": "ack", "ok": err is None, "error": err, "op": "rec_start"}))
+    elif kind == "rec_stop":
+        err = await _rpc(st.on_rec_stop, cid)
+        await ws.send(json.dumps({"t": "ack", "ok": err is None, "error": err, "op": "rec_stop"}))
+    elif kind == "rec_delete":
+        err = await _rpc(st.on_rec_delete, cid, str(msg.get("file") or msg.get("path") or ""))
+        await ws.send(json.dumps({"t": "ack", "ok": err is None, "error": err, "op": "rec_delete"}))
+    elif kind == "replay":
+        speed = msg.get("speed")
+        err = await _rpc(
+            st.on_replay,
+            cid,
+            str(msg.get("file") or msg.get("path") or ""),
+            float(msg.get("rate") or 1.0),
+            None if speed is None else float(speed),
+        )
+        await ws.send(json.dumps({"t": "ack", "ok": err is None, "error": err, "op": "replay"}))
     elif kind == "link":
         err = await _rpc(st.on_link, cid, str(msg.get("action") or ""))
         await ws.send(json.dumps({"t": "ack", "ok": err is None, "error": err, "op": "link"}))

@@ -29,7 +29,14 @@ class ArmSnap:
     float_ok: bool = False
     float_reason: str = ""
     ik_err: str = ""
+    link_err: str = ""
     motors: list[dict] = field(default_factory=list)
+    recording: bool = False
+    rec_frames: int = 0
+    rec_s: float = 0.0
+    rec_teach: str = ""
+    replay_active: bool = False
+    traj_file: str = ""
 
 
 @dataclass
@@ -93,7 +100,14 @@ class World:
                 "float_ok": bool(a.float_ok),
                 "float_reason": a.float_reason or "",
                 "ik_err": a.ik_err or "",
+                "link_err": a.link_err or "",
                 "motors": list(a.motors),
+                "recording": bool(a.recording),
+                "rec_frames": int(a.rec_frames),
+                "rec_s": round(float(a.rec_s), 2),
+                "rec_teach": a.rec_teach or "",
+                "replay_active": bool(a.replay_active),
+                "traj_file": a.traj_file or "",
             },
             "camera": {
                 "online": list(cam.online),

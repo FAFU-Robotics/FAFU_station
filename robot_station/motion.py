@@ -19,6 +19,26 @@ from robot_station.world import World
 
 logger = logging.getLogger("station.motion")
 
+
+def _is_vendor_enable_noise(text: str) -> bool:
+    low = (text or "").lower()
+    return "motor_reset" in low or "enable failed" in low or "使能失败" in (text or "")
+
+
+def _live_joints_ok(arm: Any) -> bool:
+    if arm is None:
+        return False
+    if bool(getattr(arm, "enabled", False)):
+        return True
+    motors = getattr(arm, "motors", None) or []
+    n = 0
+    for row in motors:
+        if str(row.get("name") or "") == "夹爪":
+            continue
+        if row.get("online"):
+            n += 1
+    return n >= 6
+
 _WINMM = None
 _WINMM_REFS = 0
 _WINMM_LOCK = threading.Lock()
@@ -165,10 +185,21 @@ class MotionCore:
         if not live_serial_allowed():
             return
         err = self.arm.set_powered(True)
+        snap = None
+        try:
+            snap = self.arm.poll()
+        except Exception:
+            snap = None
+        motors = list(getattr(snap, "motors", None) or []) if snap is not None else []
+        offline = [str(m.get("name") or m.get("id") or "") for m in motors if not m.get("online")]
         if err:
             self._cmd_err = f"已连接真机，使能失败：{err}"
             logger.error("%s", self._cmd_err)
+        elif offline:
+            logger.warning("已使能在线轴；离线：%s", "、".join(offline))
+            self._cmd_err = ""
         else:
+            self._cmd_err = ""
             logger.info("真机已连接并使能")
 
     def _adopt_sim(self, reason: str) -> None:
@@ -269,6 +300,11 @@ class MotionCore:
                     self.cfg.arm = "sim"
                     self._seed_sim_pose(q_keep)
                     return f"真机连接失败，已留在仿真：{exc}"
+                if name == "fafu" and getattr(nxt, "_robot", None) is None:
+                    err = str(getattr(nxt, "_link_error", "") or "真机未连接")
+                    self.arm = nxt
+                    self.cfg.arm = name
+                    return err
                 self.arm = nxt
                 self.cfg.arm = name
                 if name == "sim":
@@ -470,6 +506,63 @@ class MotionCore:
         self._note()
         return None
 
+    def on_rec_start(self, cid: str, name: str | None = None, teach: str | None = None) -> str | None:
+        if not self.gate.motion_allowed():
+            return "急停锁存中"
+        fn = getattr(self.arm, "record_start", None)
+        if not callable(fn):
+            return "此后端不支持连续录制"
+        try:
+            err = fn(name, teach=teach)
+        except TypeError:
+            err = fn(name)
+        if err:
+            return err
+        self._note()
+        return None
+
+    def on_rec_delete(self, cid: str, path: str) -> str | None:
+        fn = getattr(self.arm, "delete_traj", None)
+        if not callable(fn):
+            from robot_station.traj import delete_recording
+
+            try:
+                delete_recording(path)
+            except FileNotFoundError as exc:
+                return str(exc)
+            except OSError as exc:
+                return f"删除失败: {exc}"
+            return None
+        return fn(path)
+
+    def on_rec_stop(self, cid: str) -> str | None:
+        fn = getattr(self.arm, "record_stop", None)
+        if not callable(fn):
+            return None
+        return fn()
+
+    def on_replay(
+        self,
+        cid: str,
+        path: str,
+        rate: float = 1.0,
+        speed: float | None = None,
+    ) -> str | None:
+        if not self.gate.motion_allowed():
+            return "急停锁存中"
+        blocked = self.arm.refuse_motion()
+        if blocked:
+            return blocked
+        fn = getattr(self.arm, "replay_start", None)
+        if not callable(fn):
+            return "此后端不支持轨迹回放"
+        spd = float(speed if speed is not None else self.cfg.arm_speed_deg_s)
+        err = fn(path, rate=float(rate), speed_deg_s=spd)
+        if err:
+            return err
+        self._note()
+        return None
+
     def on_home(self, cid: str, speed: float) -> str | None:
         if self.gate.state == Safety.ESTOP_LATCHED:
             self.gate.clear()
@@ -526,6 +619,14 @@ class MotionCore:
                 self.arm.start()
             except Exception as exc:
                 return str(exc)
+            if getattr(self.arm, "_robot", None) is None:
+                return str(getattr(self.arm, "_link_error", "") or "机械臂未连接")
+            snap = self.arm.poll()
+            motors = list(getattr(snap, "motors", None) or [])
+            offline = [str(m.get("name") or m.get("id") or "") for m in motors if not m.get("online")]
+            if offline:
+                logger.warning("已连接调试板，离线：%s", "、".join(offline))
+            self._cmd_err = ""
             return None
         if act == "disconnect":
             try:
@@ -567,6 +668,14 @@ class MotionCore:
         if blocked:
             return blocked
         err = self.arm.set_powered(bool(on))
+        if err and _is_vendor_enable_noise(err):
+            try:
+                snap = self.arm.poll()
+            except Exception:
+                snap = None
+            if _live_joints_ok(snap):
+                logger.warning("使能报错已忽略（J1–J6 在线）: %s", err)
+                err = None
         if err:
             return err
         self._note()
@@ -599,6 +708,8 @@ class MotionCore:
 
     def _set_cmd_err(self, err: str | None) -> None:
         text = err or ""
+        if text and _is_vendor_enable_noise(text) and _live_joints_ok(self.world.arm):
+            text = ""
         with self._lock:
             self._cmd_err = text
 
@@ -693,6 +804,28 @@ class MotionCore:
             durations = [float(x) for x in dt_raw] if dt_raw else None
             err = self.on_path(cid, wps, speed, durations=durations)
             return {"t": "ack", "ok": err is None, "error": err, "op": "path"}
+        elif kind == "rec_start":
+            teach = msg.get("teach")
+            err = self.on_rec_start(cid, msg.get("name"), None if teach is None else str(teach))
+            self._set_cmd_err(err)
+            return {"t": "ack", "ok": err is None, "error": err, "op": "rec_start"}
+        elif kind == "rec_stop":
+            err = self.on_rec_stop(cid)
+            self._set_cmd_err(err)
+            return {"t": "ack", "ok": err is None, "error": err, "op": "rec_stop"}
+        elif kind == "rec_delete":
+            err = self.on_rec_delete(cid, str(msg.get("file") or msg.get("path") or ""))
+            self._set_cmd_err(err)
+            return {"t": "ack", "ok": err is None, "error": err, "op": "rec_delete"}
+        elif kind == "replay":
+            err = self.on_replay(
+                cid,
+                str(msg.get("file") or msg.get("path") or ""),
+                float(msg.get("rate") or 1.0),
+                msg.get("speed"),
+            )
+            self._set_cmd_err(err)
+            return {"t": "ack", "ok": err is None, "error": err, "op": "replay"}
         elif kind == "link":
             err = self.on_link(cid, str(msg.get("action") or ""))
             return {"t": "ack", "ok": err is None, "error": err, "op": "link"}
@@ -775,9 +908,19 @@ class MotionCore:
                 self._ik_err = f"笛卡尔失败: {exc}"
         self.arm.servo(dt)
         writer_err = str(getattr(self.arm, "_writer_err", "") or "")
+        arm = self.arm.poll()
+        if writer_err and _is_vendor_enable_noise(writer_err) and _live_joints_ok(arm):
+            try:
+                self.arm._writer_err = ""
+            except Exception:
+                pass
+            writer_err = ""
         if writer_err:
             self._set_cmd_err(writer_err)
-        arm = self.arm.poll()
+        elif _live_joints_ok(arm):
+            stale = self._cmd_err or ""
+            if _is_vendor_enable_noise(stale):
+                self._set_cmd_err("")
         if self._ik_err:
             arm.ik_err = self._ik_err
         cam = self.camera.poll() if self.camera is not None else self.world.camera

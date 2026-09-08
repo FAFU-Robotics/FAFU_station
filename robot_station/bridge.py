@@ -67,34 +67,42 @@ class MotionClient:
         self._stream_ev = threading.Event()
         self.connected = False
 
+    def _open_socket(self) -> None:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(1.0)
+        try:
+            sock.connect((self.host, self.port))
+            sock.settimeout(0.5)
+            try:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except OSError:
+                pass
+        except Exception:
+            try:
+                sock.close()
+            except OSError:
+                pass
+            raise
+        self._sock = sock
+        self.connected = True
+
     def connect(self, timeout_s: float = 8.0) -> None:
         deadline = time.monotonic() + timeout_s
         last_err: Exception | None = None
         while time.monotonic() < deadline:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(1.0)
             try:
-                sock.connect((self.host, self.port))
-                sock.settimeout(0.5)
-                try:
-                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                except OSError:
-                    pass
-                self._sock = sock
-                self.connected = True
+                self._open_socket()
                 self._stop.clear()
-                self._rx = threading.Thread(target=self._read_loop, name="motion-rx", daemon=True)
-                self._rx.start()
-                self._tx = threading.Thread(target=self._stream_loop, name="motion-tx", daemon=True)
-                self._tx.start()
+                if self._rx is None or not self._rx.is_alive():
+                    self._rx = threading.Thread(target=self._read_loop, name="motion-rx", daemon=True)
+                    self._rx.start()
+                if self._tx is None or not self._tx.is_alive():
+                    self._tx = threading.Thread(target=self._stream_loop, name="motion-tx", daemon=True)
+                    self._tx.start()
                 logger.info("已连运动进程 %s:%s", self.host, self.port)
                 return
             except OSError as exc:
                 last_err = exc
-                try:
-                    sock.close()
-                except OSError:
-                    pass
                 time.sleep(0.15)
         raise ConnectionError(f"连不上运动进程 {self.host}:{self.port}: {last_err}")
 
@@ -226,24 +234,43 @@ class MotionClient:
                     pair[0].set()
 
     def _read_loop(self) -> None:
-        buf = b""
-        sock = self._sock
-        if sock is None:
-            return
         while not self._stop.is_set():
-            try:
-                chunk = sock.recv(16384)
-            except socket.timeout:
-                continue
-            except OSError:
-                break
-            if not chunk:
-                break
-            buf += chunk
-            buf, events = take_motion_frames(buf)
-            for kind, payload in events:
-                if kind == "telem":
-                    self._apply_telem(payload)
-                else:
-                    self._apply_json(payload)
-        self.connected = False
+            sock = self._sock
+            if sock is None:
+                try:
+                    self._open_socket()
+                    logger.info("已重连运动进程 %s:%s", self.host, self.port)
+                except OSError:
+                    time.sleep(0.4)
+                    continue
+                sock = self._sock
+                if sock is None:
+                    time.sleep(0.4)
+                    continue
+            buf = b""
+            while not self._stop.is_set():
+                try:
+                    chunk = sock.recv(16384)
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                buf += chunk
+                buf, events = take_motion_frames(buf)
+                for kind, payload in events:
+                    if kind == "telem":
+                        self._apply_telem(payload)
+                    else:
+                        self._apply_json(payload)
+            self.connected = False
+            old = self._sock
+            self._sock = None
+            if old is not None:
+                try:
+                    old.close()
+                except OSError:
+                    pass
+            if not self._stop.is_set():
+                logger.warning("运动 TCP 断开，重连 %s:%s", self.host, self.port)

@@ -445,7 +445,7 @@ class SimMotionTests(unittest.TestCase):
         finally:
             arm.stop()
 
-    def test_ensure_enabled_surfaces_sdk_error(self) -> None:
+    def test_ensure_enabled_ignores_vendor_enable_error(self) -> None:
         arm = FafuArm(allow_motion=True, controller_cls=FakeFafuController, required=True)
         arm.start()
         try:
@@ -453,13 +453,39 @@ class SimMotionTests(unittest.TestCase):
             assert fake is not None
 
             def boom(*_a: object, **_k: object) -> None:
-                raise RuntimeError("usb busy")
+                raise RuntimeError(
+                    "enable failed even after motor_reset; check the diagnostic above. "
+                    "Likely causes: (a) motor controller in latched FAULT state -> hard power-cycle; "
+                    "(b) USB-CAN bus disconnected / wrong COM port; "
+                    "(c) mechanical jam holding the joint outside soft limits."
+                )
 
             fake.is_enabled = False
             fake.enable = boom  # type: ignore[method-assign]
             err = arm._ensure_enabled()
+            self.assertIsNone(err, err)
+            self.assertTrue(fake.is_enabled)
+        finally:
+            arm.stop()
+
+    def test_ensure_enabled_surfaces_present_motor_error(self) -> None:
+        from unittest.mock import patch
+
+        arm = FafuArm(allow_motion=True, controller_cls=FakeFafuController, required=True)
+        arm.start()
+        try:
+            fake = FakeFafuController.last
+            assert fake is not None
+            fake.is_enabled = False
+
+            def boom(*_a: object, **_k: object) -> None:
+                raise RuntimeError("usb busy")
+
+            with patch("robot_station.adapters.fafu_arm._enable_present_motors", side_effect=boom):
+                err = arm._ensure_enabled()
             self.assertIsNotNone(err)
             self.assertIn("使能失败", err or "")
+            self.assertIn("usb busy", err or "")
         finally:
             arm.stop()
 
@@ -586,10 +612,19 @@ class SimMotionTests(unittest.TestCase):
             fake.sim_teach = False
             arm._dyn_ready = False
             snap = arm.poll()
+            self.assertTrue(snap.float_ok)
+            self.assertEqual(snap.float_reason, "")
+            self.assertIsNone(arm.set_ctrl_mode("Gravity"))
+            self.assertEqual(arm._ctrl_mode, "Gravity")
+            self.assertIsNone(arm.set_ctrl_mode("Position"))
+            send = fake.apply_compensation_torque
+            fake.apply_compensation_torque = None  # type: ignore[method-assign]
+            snap = arm.poll()
             self.assertFalse(snap.float_ok)
-            self.assertIn("pinocchio", snap.float_reason)
-            self.assertIn("pinocchio", arm.set_ctrl_mode("Gravity") or "")
+            self.assertIn("力矩环", snap.float_reason)
+            self.assertIsNotNone(arm.set_ctrl_mode("Gravity"))
             self.assertEqual(arm._ctrl_mode, "Position")
+            fake.apply_compensation_torque = send
             arm._dyn_ready = True
             snap = arm.poll()
             self.assertTrue(snap.float_ok)
@@ -623,6 +658,130 @@ class SimMotionTests(unittest.TestCase):
         fake = FakeFafuController.last
         assert fake is not None
         self.assertTrue(fake.closed)
+
+    def test_station_gravity_loop_without_pinocchio(self) -> None:
+        arm = FafuArm(allow_motion=True, controller_cls=FakeFafuController, required=True)
+        arm.start()
+        try:
+            fake = FakeFafuController.last
+            assert fake is not None
+            fake.sim_teach = False
+            fake.enable()
+            arm._dyn_ready = False
+            self.assertIsNone(arm.set_ctrl_mode("Gravity"))
+            deadline = time.monotonic() + 1.0
+            while time.monotonic() < deadline:
+                if "apply_compensation_torque" in fake.calls:
+                    break
+                time.sleep(0.02)
+            self.assertIn("apply_compensation_torque", fake.calls)
+            self.assertNotIn("start_gravity_compensation", fake.calls)
+            self.assertTrue(arm.poll().grav_active)
+            self.assertGreater(max(abs(x) for x in fake.last_tau_nm), 0.05)
+            blocked = arm.apply_cartesian([0.01, 0.0, 0.0], [0.0, 0.0, 0.0])
+            self.assertIsNotNone(blocked)
+            self.assertIn("Position", blocked or "")
+            self.assertIsNone(arm.set_ctrl_mode("Position"))
+            self.assertEqual(arm._ctrl_mode, "Position")
+            err = arm.apply_cartesian([0.01, 0.0, 0.0], [0.0, 0.0, 0.0])
+            self.assertIsNone(err, err)
+            self.assertTrue(arm._servo_intent)
+        finally:
+            arm.stop()
+
+    def test_gravity_refused_when_arm_joint_offline(self) -> None:
+        arm = FafuArm(allow_motion=True, controller_cls=FakeFafuController, required=True)
+        arm.start()
+        try:
+            fake = FakeFafuController.last
+            assert fake is not None
+            fake.sim_teach = False
+            fake.enable()
+            fake._missing_motors = [3]
+            arm._dyn_ready = False
+            err = arm.set_ctrl_mode("Gravity")
+            self.assertIsNotNone(err)
+            self.assertIn("J1", err or "")
+            self.assertEqual(arm._ctrl_mode, "Position")
+            self.assertFalse(arm.poll().float_ok)
+        finally:
+            arm.stop()
+
+    def test_station_gravity_ok_without_gripper(self) -> None:
+        arm = FafuArm(allow_motion=True, controller_cls=FakeFafuController, required=True)
+        arm.start()
+        try:
+            fake = FakeFafuController.last
+            assert fake is not None
+            fake.sim_teach = False
+            fake._missing_motors = [7]
+            fake.enable()
+            arm._dyn_ready = False
+            self.assertIsNone(arm.set_ctrl_mode("Gravity"))
+            deadline = time.monotonic() + 1.0
+            while time.monotonic() < deadline:
+                if "apply_compensation_torque" in fake.calls:
+                    break
+                time.sleep(0.02)
+            self.assertIn("apply_compensation_torque", fake.calls)
+            self.assertEqual(len(fake.last_tau_nm), 6)
+            self.assertGreater(max(abs(x) for x in fake.last_tau_nm), 0.05)
+            self.assertIsNone(arm.set_ctrl_mode("Position"))
+        finally:
+            arm.stop()
+
+    def test_dead_gravity_thread_holds_position_not_servo_j(self) -> None:
+        arm = FafuArm(allow_motion=True, controller_cls=FakeFafuController, required=True)
+        arm.start()
+        try:
+            fake = FakeFafuController.last
+            assert fake is not None
+            fake.sim_teach = False
+            fake.enable()
+            arm._dyn_ready = False
+            n = {"n": 0}
+
+            def boom(tau, **_kwargs):
+                n["n"] += 1
+                fake.calls.append("apply_compensation_torque")
+                if n["n"] > 40:
+                    raise ValueError("tau must have 5 elements, got (6,)")
+                fake.last_tau_nm = [float(x) for x in tau][:6]
+
+            fake.apply_compensation_torque = boom  # type: ignore[method-assign]
+            self.assertIsNone(arm.set_ctrl_mode("Gravity"))
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                th = arm._grav_th
+                if th is None or not th.is_alive():
+                    break
+                time.sleep(0.02)
+            self.assertTrue(arm._grav_err)
+            before = list(fake.calls)
+            for _ in range(10):
+                arm.servo(0.01)
+                time.sleep(0.005)
+            self.assertEqual(arm._ctrl_mode, "Position")
+            self.assertFalse(arm._float_writer_active())
+            self.assertNotIn("servo_j", fake.calls[len(before) :])
+            self.assertIsNone(arm.apply_targets([12.0, 40.0, 40.0, 0.0, 0.0, 0.0], 40.0, stream=True))
+        finally:
+            arm.stop()
+
+    def test_tau_maps_onto_live_joint_ids(self) -> None:
+        arm = FafuArm(allow_motion=True, controller_cls=FakeFafuController, required=True)
+        arm.start()
+        try:
+            fake = FakeFafuController.last
+            assert fake is not None
+            fake.joint_motor_ids = [1, 2, 4, 5, 6]
+            fake._joint_motor_ids = [1, 2, 4, 5, 6]
+            fake.num_joints = 5
+            tau = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]
+            mapped = arm._vec_to_sdk(tau, fake)
+            self.assertEqual(mapped, [0.1, 0.2, 0.4, 0.5, 0.6])
+        finally:
+            arm.stop()
 
     def test_arm_src_sim_refuses_live_without_serial_flag(self) -> None:
         os.environ.pop("STATION_ALLOW_LIVE_ARM", None)
@@ -927,6 +1086,336 @@ class SdkContractHelpersTests(unittest.TestCase):
         rpy = rotation_to_rpy(yaw90)
         assert rpy is not None
         self.assertAlmostEqual(rpy[2], math.pi / 2.0, places=5)
+
+
+class TrajMotionTests(unittest.TestCase):
+    """Continuous record / timestamp playback. Waypoint panel path is unchanged."""
+
+    def test_record_position_then_timestamp_replay(self) -> None:
+        from tests.test_traj import recordings_tmpdir
+
+        with recordings_tmpdir() as tmp:
+            core = MotionCore(
+                StationConfig(arm="sim", open_browser=False, control_hz=80, watchdog_s=2.0)
+            )
+            core.start()
+            try:
+                self.assertIsNone(core.on_rec_start("a"))
+                deadline = time.monotonic() + 0.8
+                while time.monotonic() < deadline:
+                    if core.snapshot()["arm"]["recording"]:
+                        break
+                    time.sleep(0.02)
+                self.assertTrue(core.snapshot()["arm"]["recording"])
+                err = core.on_arm_targets("a", [14.0, 40.0, 40.0, 0.0, 0.0, 0.0], 80.0, stream=True)
+                self.assertIsNone(err, err)
+                deadline = time.monotonic() + 1.2
+                while time.monotonic() < deadline:
+                    if core.snapshot()["arm"]["rec_frames"] >= 12:
+                        break
+                    time.sleep(0.03)
+                self.assertGreaterEqual(core.snapshot()["arm"]["rec_frames"], 12)
+                self.assertIsNone(core.on_rec_stop("a"))
+                deadline = time.monotonic() + 0.8
+                snap = core.snapshot()["arm"]
+                while time.monotonic() < deadline:
+                    snap = core.snapshot()["arm"]
+                    if not snap["recording"] and snap.get("traj_file"):
+                        break
+                    time.sleep(0.02)
+                self.assertFalse(snap["recording"])
+                name = snap["traj_file"]
+                self.assertTrue(name)
+                self.assertTrue((tmp / name).is_file())
+                self.assertIsNone(core.on_replay("a", name, 1.0, 80.0))
+                deadline = time.monotonic() + 3.0
+                saw_replay = False
+                while time.monotonic() < deadline:
+                    arm = core.snapshot()["arm"]
+                    if arm.get("replay_active"):
+                        saw_replay = True
+                    if saw_replay and not arm.get("replay_active") and arm["q_deg"][0] > 6.0:
+                        break
+                    time.sleep(0.04)
+                arm = core.snapshot()["arm"]
+                self.assertGreater(arm["q_deg"][0], 6.0)
+                fake = FakeFafuController.last
+                assert fake is not None
+                self.assertIn("servo_j", fake.calls)
+                self.assertNotIn("move_MIT", fake.calls)
+            finally:
+                core.stop()
+
+    def test_record_gravity_teach_and_path_still_refused(self) -> None:
+        from tests.test_traj import recordings_tmpdir
+
+        with recordings_tmpdir():
+            core = MotionCore(
+                StationConfig(arm="sim", open_browser=False, control_hz=80, watchdog_s=2.0)
+            )
+            core.start()
+            try:
+                self.assertIsNone(core.on_mode("a", "Gravity"))
+                self.assertIsNone(core.on_rec_start("a"))
+                self.assertIsNone(core.on_teach("a", [22.0, 40.0, 40.0, 0.0, 0.0, 0.0]))
+                deadline = time.monotonic() + 1.0
+                while time.monotonic() < deadline:
+                    if core.snapshot()["arm"]["rec_frames"] >= 8:
+                        break
+                    time.sleep(0.03)
+                self.assertGreaterEqual(core.snapshot()["arm"]["rec_frames"], 8)
+                self.assertEqual(core.snapshot()["arm"]["rec_teach"], "drag")
+                blocked = core.on_path("a", [[0.0, 40.0, 40.0, 0.0, 0.0, 0.0]], 80.0)
+                self.assertIsNotNone(blocked)
+                self.assertIn("Position", blocked or "")
+                self.assertIsNone(core.on_rec_stop("a"))
+            finally:
+                core.stop()
+
+    def test_station_gravity_records_without_pinocchio(self) -> None:
+        from tests.test_traj import recordings_tmpdir
+
+        with recordings_tmpdir() as tmp:
+            arm = FafuArm(allow_motion=True, controller_cls=FakeFafuController, required=True)
+            arm.start()
+            try:
+                fake = FakeFafuController.last
+                assert fake is not None
+                fake.sim_teach = False
+                fake.enable()
+                arm._dyn_ready = False
+                self.assertIsNone(arm.set_ctrl_mode("Gravity"))
+                self.assertIsNone(arm.record_start())
+                for _ in range(30):
+                    arm.servo(0.01)
+                    time.sleep(0.005)
+                self.assertGreater(arm.poll().rec_frames, 8)
+                self.assertIsNone(arm.record_stop())
+                self.assertTrue(list(tmp.glob("*.jsonl")))
+                self.assertIn("apply_compensation_torque", fake.calls)
+                self.assertNotIn("start_gravity_compensation", fake.calls)
+                blocked = arm.apply_cartesian([0.01, 0.0, 0.0], [0.0, 0.0, 0.0])
+                self.assertIsNotNone(blocked)
+                self.assertIn("Position", blocked or "")
+            finally:
+                arm.stop()
+
+    def test_estop_stops_recording_and_keeps_file(self) -> None:
+        from tests.test_traj import recordings_tmpdir
+
+        with recordings_tmpdir() as tmp:
+            core = MotionCore(
+                StationConfig(arm="sim", open_browser=False, control_hz=80, watchdog_s=2.0)
+            )
+            core.start()
+            try:
+                self.assertIsNone(core.on_rec_start("a", "keepme"))
+                core.on_arm_targets("a", [8.0, 40.0, 40.0, 0.0, 0.0, 0.0], 80.0, stream=True)
+                deadline = time.monotonic() + 1.0
+                while time.monotonic() < deadline:
+                    if core.snapshot()["arm"]["rec_frames"] >= 6:
+                        break
+                    time.sleep(0.03)
+                self.assertGreaterEqual(core.snapshot()["arm"]["rec_frames"], 6)
+                core.on_estop("sim")
+                deadline = time.monotonic() + 0.8
+                while time.monotonic() < deadline:
+                    if not core.snapshot()["arm"]["recording"]:
+                        break
+                    time.sleep(0.02)
+                self.assertFalse(core.snapshot()["arm"]["recording"])
+                files = list(tmp.glob("*.jsonl"))
+                self.assertTrue(files)
+                from robot_station.traj import load_traj
+
+                _header, frames = load_traj(files[0])
+                self.assertGreaterEqual(len(frames), 6)
+            finally:
+                core.stop()
+
+    def test_replay_keeps_session_when_servo_j_false(self) -> None:
+        from robot_station.traj import TrajectoryWriter
+        from tests.test_traj import recordings_tmpdir
+
+        with recordings_tmpdir() as tmp:
+            arm = FafuArm(allow_motion=True, controller_cls=FakeFafuController, required=True)
+            arm.start()
+            try:
+                fake = FakeFafuController.last
+                assert fake is not None
+                fake.enable()
+                path = tmp / "replay_false.jsonl"
+                writer = TrajectoryWriter(path, teach="soft", mode="Position", n=6)
+                for i in range(25):
+                    writer.log(
+                        [0.15 + 0.01 * i, 0.70, 0.70, 0.0, 0.0, 0.0],
+                        [0.0] * 6,
+                        0.5,
+                        0.0,
+                    )
+                    time.sleep(0.012)
+                writer.close()
+                n = {"n": 0}
+                orig = fake.servo_j
+
+                def flaky(target_angles):
+                    n["n"] += 1
+                    if n["n"] == 4:
+                        fake._servo_aborted_reason = "gripper hold"
+                        return False
+                    return orig(target_angles)
+
+                fake.servo_j = flaky  # type: ignore[method-assign]
+                self.assertIsNone(arm.replay_start(str(path), 1.0, 80.0))
+                for _ in range(50):
+                    arm.servo(0.01)
+                    time.sleep(0.008)
+                self.assertGreaterEqual(n["n"], 5)
+                self.assertTrue(fake.is_servoing)
+            finally:
+                arm.stop()
+
+    def test_replay_offline_gripper_does_not_fault_writer(self) -> None:
+        from robot_station.traj import TrajectoryWriter
+        from tests.test_traj import recordings_tmpdir
+
+        with recordings_tmpdir() as tmp:
+            arm = FafuArm(allow_motion=True, controller_cls=FakeFafuController, required=True)
+            arm.start()
+            try:
+                fake = FakeFafuController.last
+                assert fake is not None
+                fake._missing_motors = [7]
+                fake.enable()
+                path = tmp / "replay_grip.jsonl"
+                writer = TrajectoryWriter(path, teach="soft", mode="Position", n=6)
+                for i in range(20):
+                    writer.log(
+                        [0.12 + 0.008 * i, 0.70, 0.70, 0.0, 0.0, 0.0],
+                        [0.0] * 6,
+                        0.2 if i < 8 else 1.4,
+                        0.0,
+                    )
+                    time.sleep(0.012)
+                writer.close()
+                self.assertIsNone(arm.replay_start(str(path), 1.0, 80.0))
+                for _ in range(40):
+                    arm.servo(0.01)
+                    time.sleep(0.008)
+                err = str(arm._writer_err or "")
+                self.assertNotIn("夹爪", err)
+                self.assertTrue(fake.is_servoing or not arm._replay_frames)
+            finally:
+                arm.stop()
+
+    def test_drag_record_enters_gravity(self) -> None:
+        from tests.test_traj import recordings_tmpdir
+
+        with recordings_tmpdir():
+            core = MotionCore(
+                StationConfig(arm="sim", open_browser=False, control_hz=80, watchdog_s=2.0)
+            )
+            core.start()
+            try:
+                self.assertEqual(core.arm_mode(), "Position")
+                self.assertIsNone(core.on_rec_start("a", teach="drag"))
+                self.assertIn(core.arm_mode(), ("Gravity", "Gra+Fri"))
+                deadline = time.monotonic() + 0.8
+                while time.monotonic() < deadline:
+                    if core.snapshot()["arm"]["recording"]:
+                        break
+                    time.sleep(0.02)
+                self.assertTrue(core.snapshot()["arm"]["recording"])
+                self.assertEqual(core.snapshot()["arm"]["rec_teach"], "drag")
+                blocked = core.on_arm_targets("a", [0, 40, 40, 0, 0, 0], 40)
+                self.assertIn("Position", blocked or "")
+                self.assertIsNone(core.on_rec_stop("a"))
+                self.assertEqual(core.arm_mode(), "Position")
+            finally:
+                core.stop()
+
+    def test_delete_traj_removes_file(self) -> None:
+        from robot_station.traj import TrajectoryWriter, list_recordings
+        from tests.test_traj import recordings_tmpdir
+
+        with recordings_tmpdir() as tmp:
+            path = tmp / "dropme.jsonl"
+            TrajectoryWriter(path, teach="soft", mode="Position", n=6).close()
+            core = MotionCore(
+                StationConfig(arm="sim", open_browser=False, control_hz=50, watchdog_s=2.0)
+            )
+            core.start()
+            try:
+                self.assertTrue(path.is_file())
+                self.assertIsNone(core.on_rec_delete("a", path.name))
+                self.assertFalse(path.is_file())
+                self.assertFalse(any(it["name"] == path.name for it in list_recordings()))
+            finally:
+                core.stop()
+
+    def test_replay_holds_start_before_timestamp(self) -> None:
+        from robot_station.traj import TrajectoryWriter
+        from tests.test_traj import recordings_tmpdir
+
+        with recordings_tmpdir() as tmp:
+            arm = FafuArm(allow_motion=True, controller_cls=FakeFafuController, required=True)
+            arm.start()
+            try:
+                fake = FakeFafuController.last
+                assert fake is not None
+                fake.enable()
+                path = tmp / "settle.jsonl"
+                writer = TrajectoryWriter(path, teach="soft", mode="Position", n=6)
+                for i in range(30):
+                    writer.log(
+                        [0.25 + 0.01 * i, 0.70, 0.70, 0.0, 0.0, 0.0],
+                        [0.0] * 6,
+                        0.5,
+                        0.0,
+                    )
+                    time.sleep(0.012)
+                writer.close()
+                self.assertIsNone(arm.replay_start(str(path), 1.0, 80.0))
+                self.assertIsNone(arm._replay_t0)
+                for _ in range(8):
+                    arm.servo(0.01)
+                self.assertIsNone(arm._replay_t0)
+                deadline = time.monotonic() + 1.2
+                while time.monotonic() < deadline:
+                    arm.servo(0.01)
+                    time.sleep(0.01)
+                    if arm._replay_t0 is not None:
+                        break
+                self.assertIsNotNone(arm._replay_t0)
+            finally:
+                arm.stop()
+
+    def test_replay_approach_keeps_wrists(self) -> None:
+        arm = FafuArm(allow_motion=True, controller_cls=FakeFafuController, required=True)
+        now = [10.0, 80.0, 90.0, 0.0, 35.0, 20.0]
+        goal = [12.0, 40.0, 40.0, 0.0, 25.0, 15.0]
+        wps = arm._replay_approach_waypoints(now, goal)
+        for wp in wps[:-1]:
+            self.assertGreater(abs(wp[4]), 1.0)
+            self.assertGreater(abs(wp[5]), 1.0)
+        self.assertAlmostEqual(wps[-1][4], 25.0, places=1)
+        self.assertAlmostEqual(wps[-1][5], 15.0, places=1)
+        arm.stop()
+
+    def test_waypoint_path_still_uses_existing_channel(self) -> None:
+        core = MotionCore(
+            StationConfig(arm="sim", open_browser=False, control_hz=80, watchdog_s=2.0)
+        )
+        core.start()
+        try:
+            start = [0.0, 40.0, 40.0, 0.0, 0.0, 0.0]
+            goal = [16.0, 40.0, 40.0, 0.0, 0.0, 0.0]
+            self.assertIsNone(core.on_path("a", [start, goal], 80.0))
+            fake = FakeFafuController.last
+            assert fake is not None
+            self.assertIn("move_jntspace_path", fake.calls)
+        finally:
+            core.stop()
 
 
 if __name__ == "__main__":

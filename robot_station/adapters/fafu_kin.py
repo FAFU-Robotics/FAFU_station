@@ -8,8 +8,8 @@ cartesian and the End Effector readout match live pinocchio FK at the same q.
 Live hardware uses SDK ``setup_dynamics`` (pinocchio) for cartesian when it is
 installed. If pinocchio is missing (typical Windows), WASD / 笛卡尔 use this
 module on the 100 Hz writer. Optional ``pytracik`` is only a ``cart_go``
-fallback, never inside the servo tick. Gravity / impedance still need a
-dynamics model, not Trac-IK.
+fallback, never inside the servo tick. Gravity / impedance use ``fafu_dyn``
+(``G(q)`` from URDF masses/CoMs), not Trac-IK and not Pinocchio.
 """
 from __future__ import annotations
 

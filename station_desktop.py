@@ -220,6 +220,22 @@ def _station_info(port: int) -> dict:
     return data if isinstance(data, dict) else {}
 
 
+def _running_code_matches(port: int | None = None) -> bool:
+    """True when the listening station imported the same control files as this tree."""
+    try:
+        from robot_station.runtime import station_code_rev
+    except Exception:
+        return False
+    running = str(_station_info(port or DEFAULT_PORT).get("code_rev") or "").strip()
+    if not running:
+        return False
+    try:
+        disk = station_code_rev(_repo_root())
+    except Exception:
+        return False
+    return running == disk
+
+
 def _station_http_ok(port: int) -> bool:
     info = _station_info(port)
     if isinstance(info, dict) and info.get("ok"):
@@ -349,6 +365,12 @@ def _ensure_local_station(port: int) -> tuple[bool, subprocess.Popen | None]:
     http_up = _port_open("127.0.0.1", port)
     motion_up = _motion_up()
     if http_up and motion_up:
+        if _live_arm_wanted() and not _running_code_matches(port):
+            _log(
+                f"motion :{MOTION_PORT} is up but code_rev != disk; "
+                "--replace so enable/servo patches actually load"
+            )
+            return _spawn_and_wait(port, web_only=False)
         _log(f"attach existing :{port} (motion :{MOTION_PORT} up, never replace while motion)")
         return True, None
     if http_up and _live_arm_wanted():

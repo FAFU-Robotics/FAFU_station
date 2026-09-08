@@ -61,6 +61,8 @@ class StationLaunchFilesTests(unittest.TestCase):
         self.assertIn("_guard_web", desktop)
         self.assertIn("_station_should_outlive_window", desktop)
         self.assertIn("never replace while motion", desktop)
+        self.assertIn("_running_code_matches", desktop)
+        self.assertIn("code_rev", desktop)
         self.assertIn("web lost, motion still up", desktop)
         self.assertIn("replace_web", desktop)
         self.assertIn("0x01000000", desktop)
@@ -71,6 +73,7 @@ class StationLaunchFilesTests(unittest.TestCase):
         self.assertIn("客户 PC", spec)
         self.assertIn("本机宿主", spec)
         self.assertIn("不得** `--replace` 整站", spec)
+        self.assertIn("code_rev", spec)
         self.assertIn("只补 `--web-only`", spec)
         self.assertNotIn("工控机", spec)
         self.assertNotIn("Jetson", spec)
@@ -148,6 +151,7 @@ class StationLaunchFilesTests(unittest.TestCase):
         with (
             patch.object(sd, "_live_arm_wanted", return_value=True),
             patch.object(sd, "_port_open", side_effect=ports),
+            patch.object(sd, "_running_code_matches", return_value=True),
             patch.object(sd, "_station_info", return_value={"arm": "mock", "camera": "mock"}),
             patch.object(sd, "_spawn_local_station") as spawn,
         ):
@@ -155,6 +159,29 @@ class StationLaunchFilesTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertIsNone(proc)
         spawn.assert_not_called()
+
+    def test_ensure_replaces_motion_when_code_rev_stale(self) -> None:
+        import sys
+        from unittest.mock import MagicMock, patch
+
+        if str(ROOT) not in sys.path:
+            sys.path.insert(0, str(ROOT))
+        import station_desktop as sd
+
+        def ports(_host: str, port: int, *_a: object, **_k: object) -> bool:
+            return int(port) in (9400, 9470)
+
+        child = MagicMock()
+        with (
+            patch.object(sd, "_live_arm_wanted", return_value=True),
+            patch.object(sd, "_port_open", side_effect=ports),
+            patch.object(sd, "_running_code_matches", return_value=False),
+            patch.object(sd, "_spawn_and_wait", return_value=(True, child)) as spawn,
+        ):
+            ok, proc = sd._ensure_local_station(9400)
+        self.assertTrue(ok)
+        self.assertIs(proc, child)
+        spawn.assert_called_once_with(9400, web_only=False)
 
     def test_ensure_web_only_when_motion_up_and_http_down(self) -> None:
         import sys

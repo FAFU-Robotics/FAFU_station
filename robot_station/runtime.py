@@ -2,10 +2,35 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
+from pathlib import Path
 
 from robot_station.config import StationConfig
 from robot_station.lock import MOTION_LOCK, lock_held, port_open
+
+# 9470 把这些文件 import 进内存。磁盘 hash 变了必须换运动进程，否则改使能/伺服不生效。
+CODE_REV_FILES = (
+    "robot_station/adapters/fafu_arm.py",
+    "robot_station/vendor_fafu/fafu_robot_controller.py",
+    "robot_station/motion.py",
+)
+
+
+def station_code_rev(root: Path | None = None) -> str:
+    """Short content hash of the live-arm control path."""
+    base = Path(root) if root is not None else Path(__file__).resolve().parent.parent
+    digest = hashlib.sha256()
+    for rel in CODE_REV_FILES:
+        path = base / rel
+        digest.update(rel.encode("utf-8"))
+        digest.update(b"\0")
+        try:
+            digest.update(path.read_bytes())
+        except OSError:
+            digest.update(b"missing")
+        digest.update(b"\0")
+    return digest.hexdigest()[:12]
 
 
 @dataclass(frozen=True)

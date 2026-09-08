@@ -38,6 +38,7 @@ MOTION_METHODS = frozenset(
         "emergency_stop",
         "set_pos_vel_acc",
         "start_gravity_compensation",
+        "apply_compensation_torque",
         "grasp",
         "recover",
     }
@@ -103,12 +104,19 @@ class FakeFafuController:
         self._grip_tgt_deg = float(self.gripper_deg)
         self.last_gripper_effort = None
         self.tau_raw = [0] * 6
+        self.last_tau_nm: list[float] = [0.0] * 6
+        self._dyn_motor_models: list[str] | None = None
         self.limits_deg = [DEFAULT_LIMITS[i] for i in range(6)]
         self.gripper_limits_deg = DEFAULT_GRIPPER_LIMITS
+        self._cfg = SimpleNamespace(motor_ids=[1, 2, 3, 4, 5, 6, 7], max_torque_raw=300)
+        self._missing_motors: list[int] = []
+        self._has_gripper = bool(kwargs.get("has_gripper", True))
+        self._gripper_motor_id = int(kwargs.get("gripper_motor_id") or 7)
+        self._joint_motor_ids = [1, 2, 3, 4, 5, 6]
         if self.allow_motion:
             self.q_rad = list(_READY_Q_RAD)
             self._tgt_rad = list(self.q_rad)
-        type(self).last = self
+        FakeFafuController.last = self
         if kwargs.get("auto_enable", True):
             raise AssertionError(
                 f"模拟调试板要求 auto_enable=False，收到 {kwargs.get('auto_enable')!r}"
@@ -136,7 +144,11 @@ class FakeFafuController:
             return list(self.v_rad_s)
 
     def get_motor_states(self, *, prefer_cache: bool = True) -> dict[int, FakeMotorState]:
-        mode = 0x0A if self.is_enabled else 0x00
+        try:
+            enabled = bool(vars(self).get("is_enabled", False))
+        except Exception:
+            enabled = bool(self.is_enabled)
+        mode = 0x0A if enabled else 0x00
         states = {
             mid: FakeMotorState(
                 fault=self.faults[i] if i < len(self.faults) else 0,
@@ -147,6 +159,10 @@ class FakeFafuController:
             for i, mid in enumerate(self.joint_motor_ids)
         }
         states[7] = FakeMotorState(position=self.gripper_deg / 360.0, torque=0, mode=mode)
+        missing = {int(x) for x in (getattr(self, "_missing_motors", None) or [])}
+        for mid in list(states):
+            if int(mid) in missing:
+                states.pop(mid, None)
         return states
 
     def close_connection(self, **kwargs: Any) -> None:
@@ -157,6 +173,16 @@ class FakeFafuController:
         self._require_motion("enable")
         if self.is_servoing:
             raise RuntimeError("enable 被拒绝: 机械臂正忙 (state=servoing)。")
+        ids = [int(m) for m in list(getattr(getattr(self, "_cfg", None), "motor_ids", []) or [1, 2, 3, 4, 5, 6, 7])]
+        missing = {int(x) for x in (getattr(self, "_missing_motors", None) or [])}
+        extra = {int(x) for x in (getattr(self, "_station_offline_ids", None) or [])}
+        skip = missing | extra
+        live = [mid for mid in ids if mid not in skip]
+        grip = int(getattr(self, "_gripper_motor_id", 7) or 7)
+        if self._has_gripper:
+            live = [mid for mid in live if mid != grip]
+        if not live:
+            raise RuntimeError("没有在线关节电机，无法使能")
         self._estopped = False
         self.is_enabled = True
         with self._mlock:
@@ -355,6 +381,19 @@ class FakeFafuController:
             self.is_enabled = False
             self.state = SimpleNamespace(value="braked")
             self.is_gravity_compensating = False
+
+    def set_torque_scale(self, scale: float | Iterable[float] = 1.0) -> None:
+        self._note("set_torque_scale")
+        self._torque_scale = scale
+
+    def apply_compensation_torque(self, tau: Iterable[float], *, damping_kd: float = 0.0) -> None:
+        self._require_motion("apply_compensation_torque")
+        vals = [float(x) for x in tau]
+        n = int(getattr(self, "num_joints", 6) or 6)
+        if len(vals) != n:
+            raise ValueError(f"tau must have {n} elements, got ({len(vals)},)")
+        self.last_tau_nm = vals[:6] + [0.0] * max(0, 6 - len(vals))
+        self.tau_raw = [int(round(x * 100.0)) for x in self.last_tau_nm]
 
     def get_limit(self, motor_id: int, *, is_radians: bool = True) -> tuple[float, float] | None:
         self._note("get_limit")

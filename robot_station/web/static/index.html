@@ -104,6 +104,7 @@
           <button type="button" class="on" data-panel="conn">连接</button>
           <button type="button" class="on" data-panel="ee">末端</button>
           <button type="button" class="on" data-panel="wp">路点</button>
+          <button type="button" class="on" data-panel="traj">示教</button>
           <button type="button" class="on" data-panel="kb">键盘</button>
           <button type="button" data-panel="scripts">脚本</button>
         </div>
@@ -166,6 +167,29 @@
             </div>
             <ul class="wp-list" id="wpList"></ul>
             <p class="hint">记录当前关节；可改每点时长。Position 模式下运行。后端按路径插补。</p>
+          </div>
+          <div class="card" id="panel-traj">
+            <h2>示教轨迹</h2>
+            <div class="mode-btns" id="trajTeachBtns">
+              <button type="button" class="mode-btn active" data-traj-teach="drag">拖臂录制</button>
+              <button type="button" class="mode-btn" data-traj-teach="soft">软件录制</button>
+            </div>
+            <p class="hint" id="trajTeachHint">默认：开始录制会切入重力补偿，扶稳后徒手拖臂（与 SDK 示教一致）。仿真用滑条。</p>
+            <div class="row">
+              <button type="button" id="btnRecStart" data-idle="开始录制">开始录制</button>
+              <button type="button" id="btnRecStop" data-idle="停止录制">停止录制</button>
+              <button class="primary" type="button" id="btnReplay" data-idle="回放">回放</button>
+              <button type="button" id="btnRecDelete" data-idle="删除文件">删除文件</button>
+            </div>
+            <p class="hint" id="trajStatus">未录制。先选「拖臂录制」或「软件录制」。</p>
+            <div class="speed-row">
+              <span>回放</span>
+              <input id="trajRateRange" type="range" min="0.5" max="1" step="0.05" value="1"/>
+              <input id="trajRate" type="number" value="1" min="0.5" max="1" step="0.05"/>
+              <span>× 速度</span>
+            </div>
+            <select id="trajFile"></select>
+            <p class="hint">文件在本机 recordings 目录。回放先慢速走到起点再按时间戳 servo_j，不是 MIT。路点面板仍是稀疏关键帧。</p>
           </div>
           <div class="card" id="panel-kb">
             <h2>Keyboard · 笛卡尔</h2>
@@ -240,7 +264,7 @@
               <button type="button" class="mode-btn" data-mode="Gra+Fri" disabled title="Gra+Fri：需 pinocchio（真机力矩环未加载）">Gra+Fri</button>
               <button type="button" class="mode-btn" data-mode="Impedance" disabled title="Impedance：需 pinocchio（真机力矩环未加载）">Impedance</button>
             </div>
-            <p class="hint" id="modeHint">Position：滑条 + 发送位置 + 键盘。Gravity：真机力矩环可手拖；仿真用滑条示教。Impedance：真机柔顺保持进入时的姿态。</p>
+            <p class="hint" id="modeHint">Position：滑条 + 发送位置 + 键盘。Gravity：真机力矩环可手拖（无 pinocchio 时用站控 G(q)）；仿真用滑条示教。Impedance：真机柔顺保持进入时的姿态。</p>
             <p class="hint tone-warn" id="modeCapHint">Gravity / Gra+Fri / Impedance 需 pinocchio（真机力矩环未加载）。</p>
           </div>
           <div class="card" id="panel-ee">

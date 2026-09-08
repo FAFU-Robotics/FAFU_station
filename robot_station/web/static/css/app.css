@@ -215,6 +215,7 @@ button.danger.busy { box-shadow: 0 0 0 2px rgba(255,77,90,.45); }
 }
 .wp-list { list-style: none; margin: 10px 0 0; padding: 0; color: var(--muted); font-size: 12px; font-family: ui-monospace, Menlo, monospace; }
 .wp-list li { padding: 4px 0; border-bottom: 1px solid var(--line); }
+#trajFile { margin-top: 10px; }
 .cam-stage { position: relative; background: #000; }
 .cam-overlay {
   position: absolute; left: 10px; bottom: 10px;
@@ -238,6 +239,7 @@ button.danger.busy { box-shadow: 0 0 0 2px rgba(255,77,90,.45); }
 }
 .status-dot.connected { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
 .status-dot.live { background: var(--cyan); }
+.status-dot.warn { background: var(--warn); }
 .status-dot.off { background: var(--bad); }
 .conn-table { width: 100%; border-collapse: collapse; margin-bottom: 14px; }
 .conn-table td { padding: 4px 0; }

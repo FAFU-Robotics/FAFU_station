@@ -68,6 +68,20 @@ class ArmAdapter:
     ) -> str | None:
         return "此后端不支持路点路径（配置 arm: sim）"
 
+    def record_start(self, name: str | None = None, teach: str | None = None) -> str | None:
+        return "此后端不支持连续录制"
+
+    def delete_traj(self, path: str) -> str | None:
+        return "此后端不支持删除轨迹"
+
+    def record_stop(self) -> str | None:
+        return None
+
+    def replay_start(
+        self, path: str, rate: float = 1.0, speed_deg_s: float = 40.0
+    ) -> str | None:
+        return "此后端不支持轨迹回放"
+
     def emergency_stop(self) -> None:
         self.hold()
 

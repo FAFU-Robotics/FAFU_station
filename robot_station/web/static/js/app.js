@@ -19,6 +19,7 @@
   const GRIP_EFFORT_MAX = 800;
   const GRIP_EFFORT_NM = 0.0053;
   let waypoints = [];
+  let trajTeach = "drag";
   const VID_HDR = 12;
   let ws = null;
   let vws = null;
@@ -279,13 +280,35 @@
       el.className = cls;
     });
   }
+  function vendorEnableNoise(text, arm) {
+    const t = String(text || "");
+    if (!/motor_reset|enable failed|使能失败/.test(t)) return false;
+    if (arm && arm.enabled) return true;
+    const motors = (arm && arm.motors) || [];
+    let n = 0;
+    for (let i = 0; i < motors.length; i += 1) {
+      const m = motors[i];
+      if (!m || m.name === "夹爪") continue;
+      if (m.online) n += 1;
+    }
+    return n >= 6;
+  }
+  function paintCmdErr(d, a) {
+    const err = (d && d.cmd_err) || "";
+    const cur = ($("armAck") && $("armAck").textContent) || "";
+    if (vendorEnableNoise(err, a) || (a && a.enabled && vendorEnableNoise(cur, a))) {
+      if (vendorEnableNoise(cur, a)) setAck("", true);
+      return;
+    }
+    if (err) setAck(err, false);
+  }
 
   const pendingCmd = Object.create(null);
   const pulseTimers = new WeakMap();
 
   function pendingMs(op) {
-    if (op === "power" || op === "link") return 12000;
-    if (op === "home" || op === "path") return 20000;
+    if (op === "power" || op === "link" || op === "arm_src") return 25000;
+    if (op === "home" || op === "path" || op === "replay") return 20000;
     return 8000;
   }
   function pulseBtn(el) {
@@ -365,6 +388,10 @@
     if (op === "home") return "复位已下发";
     if (op === "arm" || op === "cart_go") return "位置已下发";
     if (op === "path") return "轨迹已下发";
+    if (op === "rec_start") return "已开始录制";
+    if (op === "rec_stop") return "已停止录制";
+    if (op === "rec_delete") return "已删除轨迹";
+    if (op === "replay") return "回放已下发";
     if (op === "grip") return "夹爪指令已下发";
     if (op === "arm_src") return "臂源已切换";
     if (op === "clear") return "已解除急停";
@@ -380,6 +407,12 @@
     if (!pendingCmd.link) {
       setBtnOn("btnArmConnect", online);
       setBtnOn("btnArmDisconnect", !online);
+    }
+    if (pendingCmd.power) {
+      const p = pendingCmd.power;
+      if (p && online && !!p.want === enabled) {
+        endCmd("power", true, ackText("power", true, "", p.want));
+      }
     }
     if (!pendingCmd.power) {
       setBtnOn("btnArmEnable", enabled);
@@ -797,6 +830,33 @@
     });
   }
 
+  function paintTrajTeach() {
+    document.querySelectorAll("#trajTeachBtns [data-traj-teach]").forEach((btn) => {
+      btn.classList.toggle("active", btn.getAttribute("data-traj-teach") === trajTeach);
+    });
+    const hint = $("trajTeachHint");
+    if (!hint) return;
+    hint.textContent = trajTeach === "soft"
+      ? "软件录制：留在 Position，用跟随 / 键盘 / 发送位置记录连续曲线。"
+      : "拖臂录制（默认）：开始后切入重力补偿，扶稳再徒手拖。仿真用滑条示教。";
+  }
+
+  function paintTraj(a) {
+    const st = $("trajStatus");
+    if (!st || !a) return;
+    const teachLabel = a.rec_teach === "drag" ? "拖臂" : (a.rec_teach === "soft" ? "软件" : (a.rec_teach || ""));
+    if (a.recording) {
+      st.textContent = "录制中 · " + (a.rec_frames || 0) + " 帧 · " + Number(a.rec_s || 0).toFixed(1) + " s"
+        + (teachLabel ? (" · " + teachLabel) : "");
+    } else if (a.replay_active) {
+      st.textContent = "回放中 · 先走到起点再按时间戳 · " + (a.traj_file || "");
+    } else {
+      st.textContent = a.traj_file
+        ? ("上次：" + a.traj_file)
+        : (trajTeach === "drag" ? "未录制。点开始后扶稳再拖臂。" : "未录制。Position 下软件操控。");
+    }
+  }
+
   function render(d) {
     last = d;
     const a = d.arm || {};
@@ -821,7 +881,7 @@
     const estop = d.safety === "ESTOP_LATCHED";
     $("estopBanner").classList.toggle("on", estop);
     $("safeTxt").textContent = d.safety || "—";
-    if (d.cmd_err) setAck(d.cmd_err, false);
+    paintCmdErr(d, a);
     if ($("kbAck")) {
       if (a.ik_err) {
         $("kbAck").textContent = a.ik_err;
@@ -843,6 +903,7 @@
     if (now - lastDom < 50) return;
     lastDom = now;
     paintHud(d, a, estop);
+    paintTraj(a);
   }
 
   function floatModeNeedsDynamics(mode) {
@@ -857,7 +918,7 @@
   function paintCtrlMode(arm) {
     const a = arm || {};
     const ok = floatModesOk(a);
-    const reason = a.float_reason || "需 pinocchio";
+    const reason = a.float_reason || "真机力矩环未加载";
     const box = $("modeBtns");
     if (box) {
       box.querySelectorAll("[data-mode]").forEach((btn) => {
@@ -872,7 +933,7 @@
     if ($("armCtrlMode")) $("armCtrlMode").textContent = ctrlMode;
     const hints = {
       Position: "Position：关节/笛卡尔滑条 + 发送位置。实时跟随与键盘走 servo。",
-      Gravity: "Gravity：真机为可手拖力矩环。仿真用滑条改当前角。夹爪打开。",
+      Gravity: "Gravity：真机为可手拖力矩环（无 pinocchio 时用站控 G(q)）。仿真用滑条改当前角。夹爪打开。",
       "Gra+Fri": "Gra+Fri：真机重力+摩擦补偿。仿真与 Gravity 相同示教语义。",
       Impedance: "Impedance：真机柔顺保持进入时的姿态。仿真为较慢跟随。",
     };
@@ -911,8 +972,9 @@
     if (!table) return;
     const motors = (a && a.motors) || [];
     if (!motors.length) {
-      table.innerHTML = "<tr><td colspan='4'>未读到电机（先 Connect，再点使能）</td></tr>";
-      if (hint) hint.textContent = "点「使能」后查看各轴是否在线、有无故障、当前模式。";
+      const why = (a && a.link_err) ? String(a.link_err) : "";
+      table.innerHTML = "<tr><td colspan='4'>" + (why ? ("未读到电机：" + why) : "未读到电机（先 Connect，再点使能）") + "</td></tr>";
+      if (hint) hint.textContent = why || "点「使能」后查看各轴是否在线、有无故障、当前模式。";
       return;
     }
     const head = "<tr><td>轴</td><td>通信</td><td>故障</td><td>模式</td></tr>";
@@ -937,6 +999,10 @@
         : ("未使能 · " + nOk + "/" + motors.length + " 轴有通信。点「使能」切入位置环。");
     }
   }
+  function motorOnlineCounts(a) {
+    const motors = (a && a.motors) || [];
+    return { n: motors.length, nOn: motors.filter((m) => m.online).length };
+  }
   function paintHud(d, a, estop) {
     const cam = d.camera || {};
     $("cliTxt").textContent = String(d.clients || 0);
@@ -955,14 +1021,22 @@
     }
     if ($("armModeBadge")) {
       const demo = (a.backend || "mock") === "mock" || a.backend === "sim";
-      const online = a.online !== false;
-      $("armModeBadge").textContent = !online
+      const { n, nOn } = motorOnlineCounts(a);
+      const linkUp = !!a.online;
+      const partial = linkUp && n > 0 && nOn < n;
+      $("armModeBadge").textContent = !linkUp
         ? "已断开"
-        : (demo ? (a.backend === "sim" ? "Sim Mode" : "Demo Mode") : "Live Robot");
-      $("armDot").className = "status-dot" + (online ? (demo ? " connected" : " live") : " off");
+        : (partial ? ("部分轴离线 " + nOn + "/" + n) : (demo ? (a.backend === "sim" ? "Sim Mode" : "Demo Mode") : "Live Robot"));
+      $("armDot").className = "status-dot" + (!linkUp ? " off" : (partial ? " warn" : (demo ? " connected" : " live")));
     }
     if ($("armBackend")) $("armBackend").textContent = a.backend || "—";
-    if ($("armLinkTxt")) $("armLinkTxt").textContent = a.online ? "已连接" : "已断开";
+    if ($("armLinkTxt")) {
+      const { n, nOn } = motorOnlineCounts(a);
+      if (!a.online) $("armLinkTxt").textContent = "已断开";
+      else if (n && nOn < n) $("armLinkTxt").textContent = "已连接 · " + nOn + "/" + n + " 轴在线";
+      else $("armLinkTxt").textContent = "已连接";
+    }
+    if (a.link_err && a.online && String(a.link_err).indexOf("离线：") !== 0) setAck(a.link_err, false);
     if ($("armEnabled")) $("armEnabled").textContent = a.enabled ? "是" : "否";
     if ($("armGripTxt")) $("armGripTxt").textContent = a.gripper_open ? "Open" : "Close";
     if ($("armRobotName")) $("armRobotName").textContent = "FAFU";
@@ -1006,9 +1080,10 @@
         ["R P Y", rpy],
         ["外力", "无腕部 F/T"],
         ["关节力矩 raw", tau],
-        ["动力学", a.dyn_ready ? "URDF 同链" : "无 pinocchio（笛卡尔走站控 IK；重力不可用）"],
-        ["力矩模式", a.float_ok ? "可用" : ((a.float_reason || "需 pinocchio") + "（已禁用）")],
+        ["动力学", a.dyn_ready ? "pinocchio URDF" : "站控 URDF（笛卡尔 IK；重力 G(q)）"],
+        ["力矩模式", a.float_ok ? "可用" : ((a.float_reason || "真机力矩环未加载") + "（已禁用）")],
         ["重力环", a.grav_active ? "运行中" : "关"],
+        ["录制", a.recording ? ((a.rec_frames || 0) + " 帧") : (a.replay_active ? "回放中" : "关")],
       ]);
     }
     const roles = cam.roles || ["作业相机"];
@@ -1146,7 +1221,7 @@
             $("scriptAck").className = "hint " + (msg.ok ? "tone-ok" : "tone-bad");
           }
         } else if (msg.op === "cart" || msg.op === "teach") {
-          if (!msg.ok) {
+          if (!msg.ok && !vendorEnableNoise(msg.error, last && last.arm)) {
             setAck("失败：" + (msg.error || ""), false);
             if ($("kbAck") && msg.op === "cart") {
               $("kbAck").textContent = msg.error || "键盘失败";
@@ -1157,12 +1232,17 @@
             $("kbAck").className = "hint tone-ok";
           }
         } else if (msg.op === "power") {
-          endCmd("power", !!msg.ok, ackText("power", !!msg.ok, msg.error, want));
-          if (msg.ok && last && last.arm) paintMotorStatus(last.arm);
+          const arm = last && last.arm;
+          const ok = !!msg.ok || vendorEnableNoise(msg.error, arm);
+          endCmd("power", ok, ackText("power", ok, ok ? "" : msg.error, want));
+          if (ok && arm) paintMotorStatus(arm);
         } else if (msg.op === "arm_src") {
           endCmd("arm_src", !!msg.ok, ackText("arm_src", !!msg.ok, msg.error, want));
         } else {
-          endCmd(msg.op, !!msg.ok, ackText(msg.op, !!msg.ok, msg.error, want));
+          const arm = last && last.arm;
+          const ok = !!msg.ok || vendorEnableNoise(msg.error, arm);
+          endCmd(msg.op, ok, ackText(msg.op, ok, ok ? "" : msg.error, want));
+          if (ok && (msg.op === "rec_start" || msg.op === "rec_stop" || msg.op === "rec_delete")) loadTrajList();
         }
       }
     };
@@ -1188,7 +1268,7 @@
       if (msg.t === "hud" && msg.d) {
         if (teleopHot()) {
           last = mergeSnap(msg.d);
-          if (msg.d.cmd_err) setAck(msg.d.cmd_err, false);
+          paintCmdErr(msg.d, last.arm || {});
           const a = last.arm || {};
           if (a.ik_err && $("kbAck")) {
             $("kbAck").textContent = a.ik_err;
@@ -1300,6 +1380,7 @@
       if (liveArm && motion) $("collectBanner").classList.remove("on");
     }
     await loadScripts();
+    await loadTrajList();
     startControlLoop(info && info.control_hz);
     connectBus();
     connectTelem();
@@ -1535,7 +1616,7 @@
     const next = btn.dataset.mode;
     const arm = (last && last.arm) || {};
     if (floatModeNeedsDynamics(next) && !floatModesOk(arm)) {
-      setAck(next + "：" + (arm.float_reason || "需 pinocchio") + "（真机力矩环未加载）", false);
+      setAck(next + "：" + (arm.float_reason || "真机力矩环未加载"), false);
       return;
     }
     ctrlMode = next;
@@ -1574,6 +1655,73 @@
       speed: Number($("armSpeed").value || 40),
     });
   };
+  async function loadTrajList() {
+    const sel = $("trajFile");
+    if (!sel) return;
+    const cur = sel.value;
+    try {
+      const r = await fetch("/api/traj");
+      if (!r.ok) return;
+      const body = await r.json();
+      const items = body.files || [];
+      sel.innerHTML = items.length
+        ? items.map((it) => {
+            const name = it.name || "";
+            const frames = it.frames != null ? it.frames : "";
+            const teach = it.teach ? (" · " + it.teach) : "";
+            return "<option value='" + name + "'>" + name + " · " + frames + " 帧" + teach + "</option>";
+          }).join("")
+        : "<option value=''>还没有轨迹文件</option>";
+      if (cur && Array.from(sel.options).some((o) => o.value === cur)) sel.value = cur;
+    } catch (e) {}
+  }
+  document.querySelectorAll("#trajTeachBtns [data-traj-teach]").forEach((btn) => {
+    btn.onclick = () => {
+      trajTeach = btn.getAttribute("data-traj-teach") || "drag";
+      paintTrajTeach();
+      if (last) paintTraj(last.arm || {});
+    };
+  });
+  paintTrajTeach();
+  if ($("btnRecStart")) $("btnRecStart").onclick = () => {
+    pulseBtn($("btnRecStart"));
+    if (!beginCmd("rec_start", { id: "btnRecStart", busy: "录制中…", ack: "开始录制…" })) return;
+    send({ t: "rec_start", teach: trajTeach });
+  };
+  if ($("btnRecStop")) $("btnRecStop").onclick = () => {
+    pulseBtn($("btnRecStop"));
+    if (!beginCmd("rec_stop", { id: "btnRecStop", busy: "停止中…", ack: "停止录制…" })) return;
+    send({ t: "rec_stop" });
+  };
+  if ($("btnRecDelete")) $("btnRecDelete").onclick = () => {
+    pulseBtn($("btnRecDelete"));
+    const file = $("trajFile") && $("trajFile").value;
+    if (!file) { setAck("还没有轨迹文件", false); return; }
+    if (!window.confirm("删除本机轨迹 " + file + " ？此操作不能恢复。")) return;
+    if (!beginCmd("rec_delete", { id: "btnRecDelete", busy: "删除中…", ack: "正在删除…" })) return;
+    send({ t: "rec_delete", file: file });
+  };
+  if ($("btnReplay")) $("btnReplay").onclick = async () => {
+    pulseBtn($("btnReplay"));
+    const file = $("trajFile") && $("trajFile").value;
+    if (!file) { setAck("还没有轨迹文件", false); return; }
+    if (!beginCmd("replay", { id: "btnReplay", busy: "回放中…", ack: "回放已交给后端…" })) return;
+    send({
+      t: "replay",
+      file: file,
+      rate: Number(($("trajRate") && $("trajRate").value) || 1),
+      speed: Number($("armSpeed").value || 40),
+    });
+  };
+  function syncTrajRate(fromRange) {
+    const r = $("trajRateRange");
+    const n = $("trajRate");
+    if (!r || !n) return;
+    if (fromRange) n.value = r.value;
+    else r.value = n.value;
+  }
+  if ($("trajRateRange")) $("trajRateRange").addEventListener("input", () => syncTrajRate(true));
+  if ($("trajRate")) $("trajRate").addEventListener("change", () => syncTrajRate(false));
   async function loadScripts() {
     const sel = $("scriptSel");
     if (!sel) return;
