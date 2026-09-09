@@ -1009,9 +1009,17 @@
     if (rtt == null && d.rtt_ms != null) $("rttTxt").textContent = Number(d.rtt_ms).toFixed(1) + " ms";
     const demo = (a.backend || "mock") === "mock" || a.backend === "sim";
     const camLive = (cam.backend || "mock") !== "mock";
-    const bits = [demo ? (a.backend === "sim" ? "仿真臂" : "假臂") : "真臂", camLive ? "真相机" : "假相机"];
+    const camOnline = !!(cam.online || [])[0];
+    const camOk = camLive && camOnline;
+    setLink(!!a.online);
+    const armLabel = demo
+      ? (a.backend === "sim" ? "仿真臂" : "假臂")
+      : (a.online ? "真机" : "真机未连接");
+    let camLabel = "假相机";
+    if (camLive) camLabel = camOnline ? "真相机" : "相机掉线";
+    const bits = [armLabel, camLabel];
     if ($("mockTxt")) $("mockTxt").textContent = bits.join(" · ");
-    if ($("mockDot")) $("mockDot").className = "dot " + ((demo || !camLive) ? "warn" : "on");
+    if ($("mockDot")) $("mockDot").className = "dot " + ((demo || !camOk || !a.online) ? "warn" : "on");
     if (info && $("homeHint")) {
       const ip = info.host_ip + ":" + info.http_port;
       const guard = info.live_serial_allowed ? "" : "　未允许真机串口。";
@@ -1057,7 +1065,7 @@
     $("homeMetrics").innerHTML =
       metric("臂", (a.q_deg || []).map((x) => Number(x).toFixed(0) + "°").join("  ") || "—", a.moving ? "运动中" : (a.gripper_open ? "夹爪开" : "夹爪合")) +
       metric("安全", d.safety || "—", estop ? "需解除" : "可运动") +
-      metric("相机", camLive ? shortCamName(cam.device || "USB") : "—", camLive ? "已自动识别" : (cam.reason || "未连接"));
+      metric("相机", camLive ? shortCamName(cam.device || "USB") : "—", camOk ? "已自动识别" : (cam.reason || "未连接"));
     const rows = (a.q_deg || []).map((q, i) => [
       "J" + (i + 1),
       Number(q).toFixed(2) + "°  →  " + Number((a.target_deg || [])[i] || 0).toFixed(2) + "°",
@@ -1099,7 +1107,6 @@
         if (f) f.textContent = fpsTxt;
       });
     });
-    const camOk = camLive && (cam.online || [])[0];
     document.querySelectorAll(".js-cam-overlay").forEach((ov) => {
       if (camOk) ov.style.display = "none";
       else {
@@ -1194,7 +1201,6 @@
     }
     const sock = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws/cmd");
     ws = sock;
-    sock.onopen = () => { if (ws === sock) setLink(true, ""); };
     sock.onclose = () => {
       if (ws !== sock) return;
       setLink(false, "");

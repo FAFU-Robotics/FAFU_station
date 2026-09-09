@@ -634,22 +634,69 @@ def _lift_false_dead(robot: Any) -> bool:
     return False
 
 
+def _live_rx_age_ms(robot: Any) -> float | None:
+    ht = getattr(robot, "_ht", None)
+    if ht is None or not hasattr(ht, "get_stats"):
+        return None
+    try:
+        return float(getattr(ht.get_stats(), "last_rx_age_ms", 0.0) or 0.0)
+    except Exception:
+        return None
+
+
+def _hardware_link_up(robot: Any) -> bool:
+    """True while the USB-CAN link is actually exchanging frames.
+
+    A leftover MotorState cache after unplug must not keep the arm "connected".
+    """
+    if robot is None:
+        return False
+    name = _robot_state_name(robot)
+    if name in ("dead", "disconnected"):
+        return False
+    ht = getattr(robot, "_ht", None)
+    if ht is None:
+        # Fake plant and live test doubles have no serial. Unplug is detected
+        # only when a real _ht still exists but RX has gone stale.
+        return True
+    try:
+        opened = getattr(ht, "is_open", None)
+        if callable(opened) and not bool(opened()):
+            return False
+        if isinstance(opened, bool) and not opened:
+            return False
+    except Exception:
+        return False
+    stream = getattr(robot, "_stream_link_ok", None)
+    if callable(stream):
+        try:
+            if not bool(stream()):
+                return False
+        except Exception:
+            return False
+    timeout = float(getattr(robot, "_dead_rx_timeout_ms", 500.0) or 500.0)
+    age = _live_rx_age_ms(robot)
+    if age is not None and age > timeout:
+        return False
+    return True
+
+
 def _station_stream_link_ok(robot: Any, orig: Any = None) -> bool:
-    """Missing gripper must not latch DEAD when joints still reply."""
+    """Keep the link when joints still RX. USB unplug / bus silence is a real drop.
+
+    A silent gripper must not latch DEAD (joints still produce RX, age stays low).
+    Stale cached joint states after the cable is gone must not keep the link up.
+    """
     ht = getattr(robot, "_ht", None)
     try:
         if ht is None or not hasattr(ht, "is_async_rx") or not ht.is_async_rx():
             return True
         age = float(getattr(ht.get_stats(), "last_rx_age_ms", 0.0) or 0.0)
     except Exception:
-        return True
+        return False
     timeout = float(getattr(robot, "_dead_rx_timeout_ms", 500.0) or 500.0)
     if age <= timeout:
         return True
-    if _live_joints_have_rx(robot):
-        return True
-    if callable(orig):
-        return bool(orig())
     enter = getattr(robot, "_enter_dead", None)
     if callable(enter):
         try:
@@ -658,7 +705,6 @@ def _station_stream_link_ok(robot: Any, orig: Any = None) -> bool:
             )
         except Exception:
             pass
-        return False
     return False
 
 
@@ -1569,6 +1615,45 @@ class FafuArm(ArmAdapter):
                 logger.exception("关闭 FAFU 臂串口失败")
         except Exception:
             logger.exception("关闭 FAFU 臂串口失败")
+
+    def _drop_lost_live_link(self) -> None:
+        """USB/bus gone: mark disconnected and free the serial for Connect.
+
+        Do not call stop() from poll() — that waits for the 100 Hz writer and
+        can stall the tick that invoked poll.
+        """
+        if self._is_fake():
+            return
+        robot = self._robot
+        if robot is None:
+            return
+        logger.warning("真机 USB/总线已断开，标为未连接")
+        if not self._link_error:
+            self._link_error = "USB/总线已断开"
+        self._servo_intent = False
+        self._servoing = False
+        self._writer_busy = False
+        try:
+            self._grav_stop.set()
+        except Exception:
+            pass
+        try:
+            self._servo_idle.set()
+        except Exception:
+            pass
+        with self._lock:
+            if self._robot is robot:
+                self._robot = None
+                self._offline_ids = []
+        try:
+            robot.close_connection(joint_release="hold", gripper_release="hold")
+        except TypeError:
+            try:
+                robot.close_connection()
+            except Exception:
+                logger.exception("拔线后关闭串口失败")
+        except Exception:
+            logger.exception("拔线后关闭串口失败")
 
     def _use_live_servo_envelope(self) -> bool:
         """Real USB arm, not FakeFafuController."""
@@ -3606,14 +3691,14 @@ class FafuArm(ArmAdapter):
             return True
         return self._flag_enabled(robot)
 
-    def _motor_rows(self, states: dict, ids: list[int], ok: list[bool]) -> list[dict]:
+    def _motor_rows(self, states: dict, ids: list[int], ok: list[bool], *, link_up: bool = True) -> list[dict]:
         rows: list[dict] = []
         mids = list(ids) if ids else list(range(1, self.n + 1))
         for i in range(self.n):
             mid = int(mids[i]) if i < len(mids) else i + 1
-            st = states.get(mid)
-            online = st is not None and bool(getattr(st, "online", True))
-            fault = int(getattr(st, "fault", 0) or 0) if st is not None else 1
+            st = states.get(mid) if link_up else None
+            online = bool(link_up) and st is not None and bool(getattr(st, "online", True))
+            fault = int(getattr(st, "fault", 0) or 0) if st is not None else (0 if not link_up else 1)
             mode = int(getattr(st, "mode", 0) or 0) if st is not None else 0
             rows.append(
                 {
@@ -3626,12 +3711,12 @@ class FafuArm(ArmAdapter):
                 }
             )
         if self.has_gripper:
-            gst = states.get(self.gripper_id)
+            gst = states.get(self.gripper_id) if link_up else None
             rows.append(
                 {
                     "id": int(self.gripper_id),
                     "name": "夹爪",
-                    "online": gst is not None and bool(getattr(gst, "online", True)),
+                    "online": bool(link_up) and gst is not None and bool(getattr(gst, "online", True)),
                     "ok": gst is not None and not bool(getattr(gst, "fault", 0)),
                     "fault": int(getattr(gst, "fault", 0) or 0) if gst is not None else 1,
                     "mode": _motor_mode_name(int(getattr(gst, "mode", 0) or 0) if gst is not None else 0),
@@ -3653,6 +3738,7 @@ class FafuArm(ArmAdapter):
                 "link_err": self._link_error if robot is None else "",
             }
             extra.update(self._traj_snap())
+        drop_live = False
         if robot is None:
             snap = ArmSnap(
                 online=False,
@@ -3731,7 +3817,8 @@ class FafuArm(ArmAdapter):
                             self._gripper_deg = motor_position_to_deg(float(pos))
             except Exception:
                 pass
-            motors = self._motor_rows(states, ids, ok)
+            link_up = bool(self._is_fake() or _hardware_link_up(robot))
+            motors = self._motor_rows(states, ids, ok, link_up=link_up)
             online_ids = [int(m["id"]) for m in motors if m.get("online")]
             if online_ids:
                 self._offline_ids = [int(m["id"]) for m in motors if not m.get("online")]
@@ -3748,16 +3835,22 @@ class FafuArm(ArmAdapter):
                     robot._gripper_online = False
                 except Exception:
                     pass
-            extra["link_err"] = ""
-            if self._q_fb_err:
-                extra["link_err"] = self._q_fb_err
-            # Prefer cached joint modes. SDK is_enabled() may block-read every
-            # motor (including gripper) and stall the 100 Hz servo watchdog.
-            # Missing axes must not force enabled=false for the ones that are up.
-            if ids and states:
-                enabled = self._joints_enabled(states, ids, robot)
+            if not link_up:
+                extra["link_err"] = extra.get("link_err") or "USB/总线已断开"
+                ok = [False] * self.n
+                enabled = False
+                moving = False
             else:
-                enabled = self._flag_enabled(robot)
+                extra["link_err"] = ""
+                if self._q_fb_err:
+                    extra["link_err"] = self._q_fb_err
+                # Prefer cached joint modes. SDK is_enabled() may block-read every
+                # motor (including gripper) and stall the 100 Hz servo watchdog.
+                # Missing axes must not force enabled=false for the ones that are up.
+                if ids and states:
+                    enabled = self._joints_enabled(states, ids, robot)
+                else:
+                    enabled = self._flag_enabled(robot)
             tgt = list(self._target_deg) if self.allow_motion else list(q_deg)
             extra_tgt = getattr(robot, "_tgt_rad", None)
             if extra_tgt is not None:
@@ -3791,8 +3884,9 @@ class FafuArm(ArmAdapter):
                     ee_rpy = [math.degrees(x) for x in rpy]
                 except Exception:
                     pass
+            drop_live = not self._is_fake() and not link_up
             snap = ArmSnap(
-                online=True,
+                online=link_up,
                 backend=self.backend,
                 enabled=enabled,
                 n=self.n,
@@ -3811,11 +3905,20 @@ class FafuArm(ArmAdapter):
                 **extra,
             )
             self._last = snap
-            return snap
         except Exception as exc:
             logger.warning("读取臂状态失败: %s", exc)
+            link_up = bool(self._is_fake() or _hardware_link_up(robot))
+            drop_live = not self._is_fake() and not link_up
+            extra["link_err"] = extra.get("link_err") or (
+                str(exc) if link_up else "USB/总线已断开"
+            )
+            motors = (
+                list(self._last.motors)
+                if link_up
+                else self._motor_rows({}, [], [False] * self.n, link_up=False)
+            )
             snap = ArmSnap(
-                online=True,
+                online=link_up,
                 backend=self.backend,
                 enabled=False,
                 n=self.n,
@@ -3830,11 +3933,13 @@ class FafuArm(ArmAdapter):
                 ctrl_mode=self._ctrl_mode,
                 gripper_deg=self._last.gripper_deg,
                 tau_raw=list(self._last.tau_raw),
-                motors=list(self._last.motors),
+                motors=motors,
                 **extra,
             )
             self._last = snap
-            return snap
+        if drop_live:
+            self._drop_lost_live_link()
+        return snap
 
 
 def probe_link(

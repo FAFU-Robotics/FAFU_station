@@ -123,6 +123,50 @@ def pick_work_camera(candidates: list[CamInfo]) -> CamInfo | None:
     return ranked[0][1]
 
 
+def pyrealsense_available() -> bool:
+    try:
+        import pyrealsense2 as rs  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
+def describe_camera_choice(found: list[CamInfo], *, rs_ok: bool) -> tuple[CamInfo | None, str]:
+    """How to treat the current USB set. Empty reason means the work camera can open."""
+    picked = pick_work_camera(found)
+    skipped = [c.name for c in found if score_camera(c) <= 0]
+    if picked is None:
+        if skipped:
+            return (
+                None,
+                "未接入作业相机 USB（已忽略笔记本内置摄像头："
+                + "、".join(skipped)
+                + "）。接入后将自动出画",
+            )
+        return None, "未接入作业相机 USB，接入后将自动出画"
+    if picked.kind != "realsense":
+        return picked, f"已识别 {picked.name}，当前只支持 RealSense 作业相机"
+    if not rs_ok:
+        return picked, f"已识别 {picked.name}，但未安装 pyrealsense2"
+    return picked, ""
+
+
+def clarify_camera_error(exc: BaseException) -> str:
+    """Turn SDK/OS errors into a short overlay string. Do not invent USB details."""
+    msg = str(exc) or exc.__class__.__name__
+    low = msg.lower()
+    if any(s in low for s in ("permission", "access denied", "denied", "隐私")):
+        return "无法打开作业相机：请在 Windows「隐私和安全性 → 相机」中允许桌面应用"
+    if any(s in low for s in ("busy", "in use", "occupied", "being used")):
+        return "作业相机被其它程序占用"
+    if any(
+        s in low
+        for s in ("no device", "not found", "disconnect", "unplug", "removed", "拔")
+    ):
+        return "作业相机已拔出，等待重新接入"
+    return f"打开作业相机失败：{msg}"
+
+
 def list_realsense_devices() -> list[CamInfo]:
     try:
         import pyrealsense2 as rs  # type: ignore
@@ -199,7 +243,7 @@ def list_windows_cameras() -> list[CamInfo]:
     return out
 
 
-def discover_cameras() -> list[CamInfo]:
+def discover_cameras(*, include_pnp: bool = True) -> list[CamInfo]:
     """RealSense SDK first. Windows Camera class is a fallback if SDK sees nothing."""
     found: list[CamInfo] = []
     seen_id: set[str] = set()
@@ -218,7 +262,7 @@ def discover_cameras() -> list[CamInfo]:
     rs = list_realsense_devices()
     for info in rs:
         _add(info)
-    if not any(score_camera(c) > 0 for c in found):
+    if include_pnp and not any(score_camera(c) > 0 for c in found):
         for info in list_windows_cameras():
             _add(info)
     return found
@@ -257,6 +301,9 @@ class CameraBank:
 
     def set_paused(self, paused: bool) -> None:
         return None
+
+    def capture_alive(self) -> bool:
+        return False
 
 
 class MockCameraBank(CameraBank):
@@ -302,6 +349,10 @@ class MockCameraBank(CameraBank):
             self._paused.set()
         else:
             self._paused.clear()
+
+    def set_reason(self, reason: str) -> None:
+        with self._lock:
+            self.pick_reason = reason
 
     def stream_ids(self) -> list[int]:
         return list(range(self.count))
@@ -406,6 +457,10 @@ class RealSenseCameraBank(CameraBank):
         else:
             self._paused.clear()
 
+    def capture_alive(self) -> bool:
+        th = self._thread
+        return th is not None and th.is_alive()
+
     def stream_ids(self) -> list[int]:
         return [0]
 
@@ -485,26 +540,58 @@ class RealSenseCameraBank(CameraBank):
             raise last_err
         raise RuntimeError("RealSense 无法打开彩色流")
 
-    def _run(self) -> None:
+    def _realsense_still_listed(self) -> bool | None:
+        """True if SDK still sees this camera, False if gone, None if enum failed."""
         try:
-            self._pipeline = self._open_pipeline()
-        except Exception as exc:
-            logger.exception("打开 RealSense 失败")
-            with self._lock:
-                self._online = False
-                self._err = str(exc)
-            return
+            found = list_realsense_devices()
+        except Exception:
+            return None
+        serial = (self.info.serial or "").strip()
+        if serial:
+            return any((c.serial or "").strip() == serial for c in found)
+        if not found:
+            return False
+        return any(score_camera(c) > 0 and c.kind == "realsense" for c in found)
+
+    def _mark_offline(self, reason: str) -> None:
+        with self._lock:
+            self._online = False
+            self._err = reason
+            self._fps = 0.0
+
+    def _run(self) -> None:
         period = 1.0 / min(30.0, max(5.0, self.hz))
         next_enc = time.monotonic()
+        misses = 0
         while not self._stop.is_set():
+            if self._pipeline is None:
+                present = self._realsense_still_listed()
+                if present is False:
+                    self._mark_offline("作业相机已拔出，等待重新接入")
+                    break
+                try:
+                    self._pipeline = self._open_pipeline()
+                    misses = 0
+                except Exception as exc:
+                    logger.warning("打开 RealSense 失败，将重试: %s", exc)
+                    self._mark_offline(clarify_camera_error(exc) + "（正在重试）")
+                    if self._stop.wait(1.5):
+                        break
+                    continue
             pipe = self._pipeline
             if pipe is None:
                 break
             try:
                 frames = pipe.wait_for_frames(timeout_ms=1000)
             except Exception:
-                with self._lock:
-                    self._online = False
+                misses += 1
+                self._mark_offline("作业相机掉线，正在重连")
+                if misses >= 2:
+                    self._close_pipeline()
+                    present = self._realsense_still_listed()
+                    if present is False:
+                        self._mark_offline("作业相机已拔出，等待重新接入")
+                        break
                 continue
             color = frames.get_color_frame()
             if not color:
@@ -519,6 +606,7 @@ class RealSenseCameraBank(CameraBank):
                     self._fps = self._hits / elapsed
                     self._hits = 0
                     self._hit_t = now
+            misses = 0
             if self._paused.is_set() or now < next_enc:
                 continue
             next_enc = now + period
@@ -536,80 +624,200 @@ class RealSenseCameraBank(CameraBank):
 
 
 class AutoCameraBank(CameraBank):
-    """Pick the delivered USB work camera at start; skip the laptop webcam."""
+    """USB work camera with hotplug. Skip the laptop webcam.
+
+    No RealSense pipeline until a scored work camera is present. Mock colorbars
+    stay as the unplugged placeholder (same page protocol as before).
+    """
 
     def __init__(self, count: int, width: int, height: int, hz: float) -> None:
         self.count = max(1, int(count))
         self.width = int(width)
         self.height = int(height)
         self.hz = float(hz)
-        self._inner: CameraBank = MockCameraBank(self.count, self.width, self.height, self.hz)
+        self._inner: CameraBank = MockCameraBank(
+            self.count,
+            self.width,
+            self.height,
+            self.hz,
+            reason="未接入作业相机 USB，接入后将自动出画",
+        )
+        self._lock = threading.Lock()
+        self._paused = False
+        self._watch_stop = threading.Event()
+        self._watch_th: threading.Thread | None = None
+        self._watch_s = 1.0
+        self.discover_fn = discover_cameras
+        self.live_factory = None
+        self.rs_ok_fn = pyrealsense_available
 
     def start(self) -> None:
         try:
-            picked = self._choose()
+            picked = self._bank_for(self._discover(), log=True)
         except Exception:
             logger.exception("识别作业相机失败")
             picked = MockCameraBank(
                 self.count, self.width, self.height, self.hz, reason="识别作业相机失败"
             )
-        old = self._inner
-        self._inner = picked
-        picked.start()
-        if old is not picked:
+        self._install(picked, stop_old=True)
+        if self._watch_th is None or not self._watch_th.is_alive():
+            self._watch_stop.clear()
+            self._watch_th = threading.Thread(target=self._watch, name="cam-hotplug", daemon=True)
+            self._watch_th.start()
+
+    def stop(self) -> None:
+        self._watch_stop.set()
+        th = self._watch_th
+        if th is not None:
+            th.join(timeout=2.5)
+        self._watch_th = None
+        with self._lock:
+            inner = self._inner
+        inner.stop()
+
+    def set_paused(self, paused: bool) -> None:
+        self._paused = bool(paused)
+        with self._lock:
+            inner = self._inner
+        inner.set_paused(paused)
+
+    def stream_ids(self) -> list[int]:
+        with self._lock:
+            inner = self._inner
+        return inner.stream_ids()
+
+    def latest_png(self, stream_id: int) -> tuple[int, int, bytes] | None:
+        with self._lock:
+            inner = self._inner
+        return inner.latest_png(stream_id)
+
+    def poll(self) -> CamSnap:
+        with self._lock:
+            inner = self._inner
+        return inner.poll()
+
+    def _rs_ok(self) -> bool:
+        try:
+            return bool(self.rs_ok_fn())
+        except Exception:
+            return False
+
+    def _discover(self) -> list[CamInfo]:
+        try:
+            return list(self.discover_fn())
+        except Exception:
+            logger.exception("枚举作业相机失败")
+            return []
+
+    def _bank_for(self, found: list[CamInfo], *, log: bool = False) -> CameraBank:
+        if log:
+            for info in found:
+                logger.info(
+                    "相机候选 score=%s kind=%s %s vid=%s pid=%s serial=%s",
+                    score_camera(info),
+                    info.kind,
+                    info.name,
+                    info.vid,
+                    info.pid,
+                    info.serial,
+                )
+        picked, reason = describe_camera_choice(found, rs_ok=self._rs_ok())
+        if reason:
+            if log:
+                logger.warning("%s", reason)
+            return MockCameraBank(self.count, self.width, self.height, self.hz, reason=reason)
+        assert picked is not None
+        factory = self.live_factory
+        if callable(factory):
+            logger.info("选用作业相机 %s", picked.name)
+            return factory(picked)
+        logger.info("选用作业相机 %s", picked.name)
+        return RealSenseCameraBank(picked, self.width, self.height, self.hz)
+
+    def _install(self, nxt: CameraBank, *, stop_old: bool = True) -> None:
+        nxt.set_paused(self._paused)
+        nxt.start()
+        with self._lock:
+            old = self._inner
+            self._inner = nxt
+        if stop_old and old is not nxt:
             try:
                 old.stop()
             except Exception:
-                pass
+                logger.exception("关闭上一路相机失败")
 
-    def stop(self) -> None:
-        self._inner.stop()
-
-    def set_paused(self, paused: bool) -> None:
-        self._inner.set_paused(paused)
-
-    def stream_ids(self) -> list[int]:
-        return self._inner.stream_ids()
-
-    def latest_png(self, stream_id: int) -> tuple[int, int, bytes] | None:
-        return self._inner.latest_png(stream_id)
-
-    def poll(self) -> CamSnap:
-        return self._inner.poll()
-
-    def _choose(self) -> CameraBank:
-        found = discover_cameras()
-        for info in found:
-            logger.info(
-                "相机候选 score=%s kind=%s %s vid=%s pid=%s serial=%s",
-                score_camera(info),
-                info.kind,
-                info.name,
-                info.vid,
-                info.pid,
-                info.serial,
-            )
-        picked = pick_work_camera(found)
-        skipped = [c.name for c in found if score_camera(c) <= 0]
-        if picked is None:
-            if skipped:
-                reason = "未找到作业相机（已忽略笔记本内置摄像头：" + "、".join(skipped) + "）"
-            else:
-                reason = "未找到 USB 作业相机"
-            logger.warning("%s", reason)
-            return MockCameraBank(self.count, self.width, self.height, self.hz, reason=reason)
-        if picked.kind == "realsense":
+    def _capture_alive(self, inner: CameraBank) -> bool:
+        fn = getattr(inner, "capture_alive", None)
+        if callable(fn):
             try:
-                import pyrealsense2 as rs  # noqa: F401
+                return bool(fn())
             except Exception:
-                reason = f"已识别 {picked.name}，但未安装 pyrealsense2"
-                logger.warning("%s", reason)
-                return MockCameraBank(self.count, self.width, self.height, self.hz, reason=reason)
-            logger.info("选用作业相机 %s", picked.name)
-            return RealSenseCameraBank(picked, self.width, self.height, self.hz)
-        reason = f"已识别 {picked.name}，当前只支持 RealSense 作业相机"
-        logger.warning("%s", reason)
+                return False
+        th = getattr(inner, "_thread", None)
+        return bool(th is not None and getattr(th, "is_alive", lambda: False)())
+
+    def _same_device(self, inner: CameraBank, picked: CamInfo | None) -> bool:
+        if picked is None:
+            return False
+        info = getattr(inner, "info", None)
+        if info is None:
+            return False
+        serial = (getattr(info, "serial", "") or "").strip()
+        other = (picked.serial or "").strip()
+        if serial and other:
+            return serial == other
+        return bool(
+            (picked.device_id and picked.device_id == getattr(info, "device_id", ""))
+            or picked.name == getattr(info, "name", "")
+        )
+
+    def _is_live(self, inner: CameraBank) -> bool:
+        return str(getattr(inner, "backend", "") or "") == "realsense"
+
+    def _placeholder(self, reason: str) -> MockCameraBank:
         return MockCameraBank(self.count, self.width, self.height, self.hz, reason=reason)
+
+    def _watch(self) -> None:
+        while not self._watch_stop.wait(self._watch_s):
+            try:
+                self._tick()
+            except Exception:
+                logger.exception("作业相机热插拔检测失败")
+
+    def _tick(self) -> None:
+        with self._lock:
+            inner = self._inner
+        snap = inner.poll()
+        live = self._is_live(inner)
+        alive = self._capture_alive(inner)
+        if live and any(bool(x) for x in (snap.online or [])):
+            return
+        if live and alive:
+            # Pipeline thread owns reconnect. Do not stop a starting/live
+            # RealSense bank because one enumerate came back empty.
+            return
+        found = self._discover()
+        picked, reason = describe_camera_choice(found, rs_ok=self._rs_ok())
+        can_open = picked is not None and not reason
+        if live and not alive:
+            if can_open:
+                logger.info("作业相机采集结束，按当前 USB 重开")
+                self._install(self._bank_for(found))
+            else:
+                err = str(getattr(snap, "reason", "") or "")
+                if any(s in err for s in ("拔出", "掉线", "占用", "失败", "隐私")):
+                    why = err
+                else:
+                    why = reason or "作业相机已拔出，等待重新接入"
+                logger.warning("%s", why)
+                self._install(self._placeholder(why))
+            return
+        setter = getattr(inner, "set_reason", None)
+        if callable(setter) and reason:
+            setter(reason)
+        if can_open:
+            logger.info("检测到作业相机 USB，自动打开画面")
+            self._install(self._bank_for(found))
 
 
 def build_camera(kind: str, count: int, width: int, height: int, hz: float) -> CameraBank:

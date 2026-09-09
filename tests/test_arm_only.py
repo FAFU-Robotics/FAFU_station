@@ -186,6 +186,8 @@ class ArmOnlyStationTests(unittest.TestCase):
         self.assertIn("set_paused", cam)
         self.assertIn("pick_work_camera", cam)
         self.assertIn("AutoCameraBank", cam)
+        self.assertIn("describe_camera_choice", cam)
+        self.assertIn("cam-hotplug", cam)
         self.assertIn("js-cam-overlay", html)
         self.assertIn("shortCamName", js)
         self.assertIn("camLive", js)

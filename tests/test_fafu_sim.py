@@ -430,7 +430,7 @@ class FafuSimTests(unittest.TestCase):
         cache = {i: Motor() for i in range(1, 7)}
 
         class Stats:
-            last_rx_age_ms = 5000.0
+            last_rx_age_ms = 50.0
 
         class Ht:
             def is_async_rx(self) -> bool:
@@ -461,6 +461,52 @@ class FafuSimTests(unittest.TestCase):
         obj._gripper_motor_id = 7
         obj._missing_motors = [7]
         self.assertTrue(obj._stream_link_ok())
+
+    def test_stream_link_ok_false_when_usb_silent(self) -> None:
+        from types import SimpleNamespace
+
+        from robot_station.adapters.fafu_arm import _with_soft_precheck
+
+        class Motor:
+            def __init__(self, mode: int = 0x0A) -> None:
+                self.mode = mode
+
+        cache = {i: Motor() for i in range(1, 7)}
+        dead: list[str] = []
+
+        class Stats:
+            last_rx_age_ms = 5000.0
+
+        class Ht:
+            def is_async_rx(self) -> bool:
+                return True
+
+            def get_stats(self) -> Stats:
+                return Stats()
+
+            def get_cached_state(self, mid: int) -> Motor | None:
+                return cache.get(int(mid))
+
+        class Dummy:
+            MODE_POSITION = 0x0A
+            _dead_rx_timeout_ms = 500.0
+
+            def _enter_dead(self, reason: str) -> None:
+                dead.append(reason)
+
+            def _stream_link_ok(self) -> bool:
+                self._enter_dead("vendor would latch DEAD")
+                return False
+
+        wrapped = _with_soft_precheck(Dummy)
+        obj = wrapped.__new__(wrapped)
+        obj._ht = Ht()
+        obj._cfg = SimpleNamespace(motor_ids=[1, 2, 3, 4, 5, 6, 7])
+        obj._joint_motor_ids = [1, 2, 3, 4, 5, 6]
+        obj._gripper_motor_id = 7
+        obj._missing_motors = [7]
+        self.assertFalse(obj._stream_link_ok())
+        self.assertTrue(dead)
 
     def test_vendor_enable_impl_does_not_reset_offline_gripper(self) -> None:
         """SDK enable() calls _enable_impl on every cfg.motor_ids, including M7."""

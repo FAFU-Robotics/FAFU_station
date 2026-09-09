@@ -9,11 +9,12 @@ from pathlib import Path
 from robot_station.config import StationConfig
 from robot_station.lock import MOTION_LOCK, lock_held, port_open
 
-# 9470 把这些文件 import 进内存。磁盘 hash 变了必须换运动进程，否则改使能/伺服不生效。
+# 9470 把这些文件 import 进内存。网页进程的相机适配器也算：热插拔改了但旧 9400 还在时必须换代。
 CODE_REV_FILES = (
     "robot_station/adapters/fafu_arm.py",
     "robot_station/vendor_fafu/fafu_robot_controller.py",
     "robot_station/motion.py",
+    "robot_station/adapters/camera.py",
 )
 
 

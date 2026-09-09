@@ -88,6 +88,163 @@ class FafuArmTests(unittest.TestCase):
         self.assertIsNotNone(blocked)
         self.assertIn("未连接", blocked or "")
 
+    def test_hardware_link_down_when_rx_stale(self) -> None:
+        from types import SimpleNamespace
+
+        from robot_station.adapters.fafu_arm import _hardware_link_up, _station_stream_link_ok
+
+        class Stats:
+            last_rx_age_ms = 5000.0
+
+        ht = SimpleNamespace(
+            is_open=lambda: True,
+            is_async_rx=lambda: True,
+            get_stats=lambda: Stats(),
+        )
+        stale = SimpleNamespace(
+            state=SimpleNamespace(value="IDLE"),
+            _ht=ht,
+            _dead_rx_timeout_ms=500.0,
+            sim_teach=False,
+        )
+        self.assertFalse(_hardware_link_up(stale))
+        self.assertFalse(_station_stream_link_ok(stale))
+
+        class Fresh:
+            last_rx_age_ms = 40.0
+
+        ht_ok = SimpleNamespace(
+            is_open=lambda: True,
+            is_async_rx=lambda: True,
+            get_stats=lambda: Fresh(),
+        )
+        live = SimpleNamespace(
+            state=SimpleNamespace(value="IDLE"),
+            _ht=ht_ok,
+            _dead_rx_timeout_ms=500.0,
+            sim_teach=False,
+            _stream_link_ok=lambda: True,
+        )
+        self.assertTrue(_hardware_link_up(live))
+        self.assertTrue(_station_stream_link_ok(live))
+
+        fake = SimpleNamespace(state=SimpleNamespace(value="IDLE"), _ht=None, sim_teach=True)
+        self.assertTrue(_hardware_link_up(fake))
+        no_ht = SimpleNamespace(state=SimpleNamespace(value="IDLE"), _ht=None, sim_teach=False)
+        self.assertTrue(_hardware_link_up(no_ht))
+
+    def test_poll_offline_when_usb_rx_stale(self) -> None:
+        from types import SimpleNamespace
+
+        class Motor:
+            online = True
+            fault = 0
+            mode = 0x0A
+            position = 0.0
+            torque = 0
+
+        class Stats:
+            last_rx_age_ms = 5000.0
+
+        class Ht:
+            def is_open(self) -> bool:
+                return True
+
+            def is_async_rx(self) -> bool:
+                return True
+
+            def get_stats(self) -> Stats:
+                return Stats()
+
+        class Dummy:
+            joint_motor_ids = [1, 2, 3, 4, 5, 6]
+            sim_teach = False
+            _dead_rx_timeout_ms = 500.0
+            _tgt_rad = None
+            closed = False
+
+            def __init__(self) -> None:
+                self._ht = Ht()
+                self.state = SimpleNamespace(value="IDLE")
+
+            def get_motor_states(self, prefer_cache: bool = True) -> dict:
+                return {i: Motor() for i in range(1, 7)}
+
+            def get_joint_values(self, prefer_cache: bool = True) -> list[float]:
+                return [0.0] * 6
+
+            def get_joint_velocities(self, prefer_cache: bool = True) -> list[float]:
+                return [0.0] * 6
+
+            def close_connection(self, **_kwargs: object) -> None:
+                self.closed = True
+
+        arm = FafuArm(required=False, allow_motion=False, has_gripper=True)
+        dummy = Dummy()
+        arm._robot = dummy
+        snap = arm.poll()
+        self.assertFalse(snap.online)
+        self.assertTrue(all(not m.get("online") for m in snap.motors))
+        self.assertIsNone(arm._robot)
+        self.assertTrue(dummy.closed)
+
+    def test_poll_online_when_usb_rx_fresh(self) -> None:
+        from types import SimpleNamespace
+
+        class Motor:
+            online = True
+            fault = 0
+            mode = 0x0A
+            position = 0.0
+            torque = 0
+
+        class Stats:
+            last_rx_age_ms = 40.0
+
+        class Ht:
+            def is_open(self) -> bool:
+                return True
+
+            def is_async_rx(self) -> bool:
+                return True
+
+            def get_stats(self) -> Stats:
+                return Stats()
+
+        class Dummy:
+            joint_motor_ids = [1, 2, 3, 4, 5, 6]
+            sim_teach = False
+            _dead_rx_timeout_ms = 500.0
+            _tgt_rad = None
+            is_enabled = False
+
+            def __init__(self) -> None:
+                self._ht = Ht()
+                self.state = SimpleNamespace(value="IDLE")
+
+            def _stream_link_ok(self) -> bool:
+                return True
+
+            def get_motor_states(self, prefer_cache: bool = True) -> dict:
+                return {i: Motor() for i in range(1, 7)}
+
+            def get_joint_values(self, prefer_cache: bool = True) -> list[float]:
+                return [0.0] * 6
+
+            def get_joint_velocities(self, prefer_cache: bool = True) -> list[float]:
+                return [0.0] * 6
+
+            def close_connection(self, **_kwargs: object) -> None:
+                raise AssertionError("fresh USB must not drop the link")
+
+        arm = FafuArm(required=False, allow_motion=False, has_gripper=True)
+        dummy = Dummy()
+        arm._robot = dummy
+        snap = arm.poll()
+        self.assertTrue(snap.online)
+        self.assertIs(arm._robot, dummy)
+        self.assertEqual(sum(1 for m in snap.motors if m.get("name") != "夹爪" and m.get("online")), 6)
+
 
 if __name__ == "__main__":
     unittest.main()
