@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+        python-version: ["3.10", "3.12"]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install build dependencies
+        run: python -m pip install numpy pybind11
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          $pybind11Dir = python -m pybind11 --cmakedir
+          cmake -S fafu_robot_cpp -B fafu_robot_cpp/build-ci `
+            "-Dpybind11_DIR=$pybind11Dir" `
+            -DFAFU_BUILD_PYBIND11_MODULE=ON `
+            -DFAFU_BUILD_NATIVE_SDK=ON `
+            -DFAFU_BUILD_SDK_EXAMPLES=ON
+
+      - name: Build
+        run: cmake --build fafu_robot_cpp/build-ci --config Release --parallel 4
+
+      # 目前 CMake 里没有注册任何 ctest 用例, 所以没有 "Run native tests" 步骤。
+      # 等 hightorque_protocol 的 golden test 落地后再加回来。
+
+      # 不需要硬件的检查: 导出面是否齐全、力矩系数有没有漂、robot.cfg 能不能解析、
+      # 故障表是否照厂商表3 收全、一拖多梯形帧结构对不对。
+      # 本地也可以直接跑: python fafu_robot_python/tests/offline_checks.py
+      - name: Hardware-free checks
+        run: python fafu_robot_python/tests/offline_checks.py
+
+      - name: Verify high-level Python import compatibility
+        run: |
+          python -c "import sys; sys.path.insert(0, 'fafu_robot_python'); import fafu_robot_controller as sdk; assert sdk.FafuRobotController"
+          python -c "import fafu_robot_python as sdk; assert sdk.FafuRobotController"

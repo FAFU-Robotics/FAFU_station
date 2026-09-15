@@ -1,13 +1,44 @@
+# Python
 __pycache__/
-*.py[cod]
+*.pyc
+*.pyo
 *.egg-info/
 .venv/
 venv/
 .pytest_cache/
 .mypy_cache/
+
+# Station local / build
 logs/
 *.log
-configs/station.yaml
+robot_station/configs/station.yaml
+robot_station/urdf/.selected
+robot_station/dist/
+robot_station/packaging/windows/cache/
+
+# SDK build intermediates (runtime .pyd/.dll stay tracked)
+build*/
+**/build*/
+*.obj
+*.iobj
+*.ipdb
+*.pdb
+*.idb
+*.ilk
+*.exp
+*.lib
+*.tlog
+*.recipe
+*.lastbuildstate
+fafu_arm_sdk/fafu_robot_cpp/build/
+fafu_arm_sdk/fafu_robot_python/tests/recordings/
+
+# IDE / OS
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
 .DS_Store
-/dist/
-packaging/windows/cache/
+Thumbs.db
+desktop.ini

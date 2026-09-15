@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>FAFU 机械臂站控</title>
+  <link rel="stylesheet" href="/static/css/app.css"/>
+</head>
+<body>
+<div class="app" id="app">
+  <div class="top">
+    <div class="brand">
+      <b>FAFU 机械臂站控</b>
+      <span id="brandSub">控制 100Hz · 视频另通道</span>
+    </div>
+    <div class="page-jump" id="pageJump">
+      <a href="#/arm" data-page="arm" class="on">机械臂</a>
+    </div>
+    <div class="leds">
+      <div class="led"><span class="dot off" id="dotLink"></span> <span id="linkTxt">未连接</span></div>
+      <div class="led">指令 <b id="hzTxt">—</b></div>
+      <div class="led">RTT <b id="rttTxt">—</b></div>
+      <div class="led">连接 <b id="cliTxt">0</b></div>
+      <div class="led">安全 <b id="safeTxt">—</b></div>
+      <div class="led"><span class="dot warn" id="mockDot"></span> <span id="mockTxt">假臂 · 假相机</span></div>
+    </div>
+    <div class="hotkeys" id="hotkeyBar">
+      <button type="button" class="hotkey-toggle" id="btnHotkeys" aria-expanded="false" aria-controls="hotkeyPop">快捷键</button>
+      <span class="hotkey-flash" id="hotkeyFlash" hidden></span>
+      <div class="hotkey-chips" id="hotkeyChips">
+        <span data-hot="estop"><kbd>Esc</kbd>急停</span>
+        <span data-hot="clear"><kbd>U</kbd>解除</span>
+        <span data-hot="home"><kbd>H</kbd>复位</span>
+        <span data-hot="enable"><kbd>P</kbd>使能</span>
+        <span data-hot="grip-toggle"><kbd>空格</kbd>夹爪</span>
+      </div>
+      <div class="hotkey-pop" id="hotkeyPop" hidden>
+        <p class="hotkey-note">输入框打字时除 <kbd>Esc</kbd> 外不触发。笛卡尔键按住连续动；其余点一下即执行，顶栏会亮出当前指令。</p>
+        <div class="hotkey-cols">
+          <div>
+            <h3>指令</h3>
+            <ul class="hotkey-list">
+              <li data-hot="estop"><span class="hot-keys"><kbd>Esc</kbd></span><span>急停（刹车模式）</span></li>
+              <li data-hot="clear"><span class="hot-keys"><kbd>U</kbd></span><span>解除急停</span></li>
+              <li data-hot="home"><span class="hot-keys"><kbd>H</kbd></span><span>复位回零</span></li>
+              <li data-hot="send"><span class="hot-keys"><kbd>Enter</kbd></span><span>发送位置</span></li>
+              <li data-hot="enable"><span class="hot-keys"><kbd>P</kbd></span><span>使能</span></li>
+              <li data-hot="disable"><span class="hot-keys"><kbd>L</kbd></span><span>去使能</span></li>
+              <li data-hot="grip-toggle"><span class="hot-keys"><kbd>空格</kbd></span><span>夹爪开 / 合（按当前状态切换）</span></li>
+              <li data-hot="follow"><span class="hot-keys"><kbd>F</kbd></span><span>实时跟随开/关</span></li>
+              <li data-hot="joint"><span class="hot-keys"><kbd>J</kbd></span><span>关节空间</span></li>
+              <li data-hot="cartspace"><span class="hot-keys"><kbd>T</kbd></span><span>笛卡尔空间</span></li>
+            </ul>
+          </div>
+          <div>
+            <h3>笛卡尔遥操作（按住）</h3>
+            <ul class="hotkey-list">
+              <li data-hot="cart-move"><span class="hot-keys"><kbd>W</kbd><kbd>S</kbd></span><span>X 前后</span></li>
+              <li data-hot="cart-move"><span class="hot-keys"><kbd>A</kbd><kbd>D</kbd></span><span>Y 左右</span></li>
+              <li data-hot="cart-move"><span class="hot-keys"><kbd>Q</kbd><kbd>E</kbd></span><span>Z 上下</span></li>
+              <li data-hot="cart-move"><span class="hot-keys"><kbd>1</kbd><kbd>2</kbd></span><span>滚转</span></li>
+              <li data-hot="cart-move"><span class="hot-keys"><kbd>3</kbd><kbd>4</kbd></span><span>俯仰</span></li>
+              <li data-hot="cart-move"><span class="hot-keys"><kbd>5</kbd><kbd>6</kbd></span><span>偏航</span></li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </div>
+    <button class="ok" type="button" id="btnClear" data-hot="clear" data-idle="解除急停">解除急停</button>
+    <button class="danger estop" type="button" id="btnEstop" data-hot="estop" data-idle="急停 ESTOP">急停 ESTOP</button>
+  </div>
+  <div class="banner" id="estopBanner">急停已锁存。电机已切入刹车（无保持力矩，抬着的臂可能下沉）。可点「复位」受控回零；其它运动请先「解除急停」。</div>
+  <div class="banner collect on" id="collectBanner">未允许真机串口：当前是仿真/假臂，网页运动不会传到真机。</div>
+  <nav class="navtabs" id="navTabs">
+    <a href="#/arm" data-page="arm" class="on">机械臂</a>
+    <a href="#/home" data-page="home">总览</a>
+  </nav>
+  <div class="wrap wide">
+    <section class="page" id="page-home">
+      <div class="page-head">
+        <h1>总览</h1>
+        <p id="homeHint">本站在本机运行，USB 直连机械臂与作业相机。</p>
+      </div>
+      <div class="metrics" id="homeMetrics"></div>
+      <div class="tiles">
+        <a class="tile" href="#/arm"><div class="tag">Joints · 3D · 相机</div><h3>机械臂</h3><p>关节、3D 参考臂、连接、本机作业相机</p></a>
+        <a class="tile" href="/lab"><div class="tag">本机 :9400</div><h3>本机状态</h3><p>查看本机入口和运动进程。</p></a>
+      </div>
+      <div class="cams cams-home" style="margin-top:14px">
+        <div class="cam-box"><header><span id="homeRole0">作业相机</span><span id="homeFps0">—</span></header>
+          <div class="cam-stage"><img id="homeCam0" alt="作业相机"/><div class="cam-overlay js-cam-overlay">未连接 · 假画面</div></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="page on" id="page-arm">
+      <div class="page-head">
+        <h1>机械臂</h1>
+        <p>布局参考 Panthera-HT Host。正中是 3D 参考臂（SDK CAD 网格，跟随后端关节）。作业相机一路，启动时自动识别本机 USB（优先 RealSense D405，跳过笔记本内置摄像头）。可用开关隐藏。mock / sim 可在本页控假臂；真机须两道闸：<code>STATION_ALLOW_LIVE_ARM=1</code> 且允许运动。</p>
+        <div class="host-toggles" id="hostToggles">
+          <button type="button" class="on" data-panel="joints">关节</button>
+          <button type="button" class="on" data-panel="twin">3D</button>
+          <button type="button" class="on" data-panel="cams">相机</button>
+          <button type="button" class="on" data-panel="conn">连接</button>
+          <button type="button" class="on" data-panel="ee">末端</button>
+          <button type="button" class="on" data-panel="wp">路点</button>
+          <button type="button" class="on" data-panel="traj">示教</button>
+          <button type="button" class="on" data-panel="kb">键盘</button>
+          <button type="button" data-panel="scripts">脚本</button>
+        </div>
+      </div>
+      <div class="arm-workspace">
+        <div class="arm-col">
+          <div class="card joints-card" id="panel-joints">
+            <h2>Joints</h2>
+            <div class="mode-btns" id="spaceBtns">
+              <button type="button" class="mode-btn active" data-space="joint" data-hot="joint">关节空间</button>
+              <button type="button" class="mode-btn" data-space="cart" data-hot="cartspace">笛卡尔</button>
+            </div>
+            <p class="hint" id="spaceHint" style="margin-top:8px">关节空间：拖 J1–J6 改目标，点「发送位置」下发；勾选「实时跟随」后拖滑条才发 servo。笛卡尔：拖末端滑条，松手或点「发送位置」后按 Speed 走到目标。</p>
+            <div class="space-panel" id="jointSpace">
+              <div class="joint-head"><span>关节</span><span>目标角度</span><span>deg</span></div>
+              <div id="jointList"></div>
+              <label class="follow-row" data-hot="follow"><input type="checkbox" id="armFollow"/> 实时跟随（勾选后拖滑条即发 servo，不会自动勾选）</label>
+            </div>
+            <div class="space-panel off" id="cartSpace">
+              <div class="cart-pose" id="cartPose">实测  X —　Y —　Z —</div>
+              <div class="joint-head cart-head"><span>轴</span><span>目标</span><span></span><span></span></div>
+              <div class="cart-list" id="cartList"></div>
+              <p class="hint" id="kbPadHint">拖动只改目标。松手或「发送位置」后 IK + move_j，速度用上方 Speed。键盘 WASD 仍是增量遥操作。</p>
+            </div>
+            <div class="speed-row">
+              <span>Speed</span>
+              <input id="armSpeedRange" type="range" min="5" max="80" step="1" value="40"/>
+              <input id="armSpeed" type="number" value="40" min="5" max="80" step="1"/>
+              <span>deg/s（发送位置 / 跟随 / 键盘）</span>
+            </div>
+            <div class="row" style="margin-top:14px">
+              <button class="primary" type="button" id="btnSendArm" data-hot="send" data-idle="发送位置">发送位置</button>
+              <button type="button" id="btnHome" data-hot="home" data-idle="复位">复位</button>
+            </div>
+            <div class="grip-row">
+              <span>夹爪 · J7</span>
+              <input id="gripRange" type="range" min="8" max="75" step="0.5" value="75"/>
+              <input id="gripDeg" type="number" step="0.5" value="75"/>
+              <span>deg</span>
+            </div>
+            <div class="grip-row">
+              <span>夹持力矩</span>
+              <input id="gripEffortRange" type="range" min="50" max="800" step="10" value="300"/>
+              <input id="gripEffort" type="number" min="50" max="800" step="10" value="300"/>
+              <span id="gripEffortUnit">raw ≈ 1.6 Nm</span>
+            </div>
+            <div class="row" style="margin-top:8px">
+              <button class="ok" type="button" id="btnGripOpen" data-hot="grip-open" data-idle="打开">打开</button>
+              <button type="button" id="btnGripClose" data-hot="grip-close" data-idle="闭合">闭合</button>
+            </div>
+            <p class="hint">开合带 SDK effort 力矩上限（默认 300≈1.6 Nm）。键盘 <kbd>空格</kbd> 按当前状态切换开/合。易碎物可把力矩降到 80–120。</p>
+            <p class="hint" id="armAck"></p>
+          </div>
+          <div class="card" id="panel-wp">
+            <h2>WAYPOINTS</h2>
+            <div class="row">
+              <button type="button" id="btnWpAdd" data-idle="+ 记录当前">+ 记录当前</button>
+              <button class="primary" type="button" id="btnWpRun" data-idle="运行轨迹">运行轨迹</button>
+              <button type="button" id="btnWpClear" data-idle="清空">清空</button>
+            </div>
+            <ul class="wp-list" id="wpList"></ul>
+            <p class="hint">记录当前关节；可改每点时长。Position 模式下运行。后端按路径插补。</p>
+          </div>
+          <div class="card" id="panel-traj">
+            <h2>示教轨迹</h2>
+            <div class="mode-btns" id="trajTeachBtns">
+              <button type="button" class="mode-btn active" data-traj-teach="drag">拖臂录制</button>
+              <button type="button" class="mode-btn" data-traj-teach="soft">软件录制</button>
+            </div>
+            <p class="hint" id="trajTeachHint">默认：开始录制会切入 Gravity（纯 G(q)，不加摩擦），扶稳后徒手拖臂。仿真用滑条。</p>
+            <div class="row">
+              <button type="button" id="btnRecStart" data-idle="开始录制">开始录制</button>
+              <button type="button" id="btnRecStop" data-idle="停止录制">停止录制</button>
+              <button class="primary" type="button" id="btnReplay" data-idle="回放">回放</button>
+              <button type="button" id="btnRecRename" data-idle="重命名">重命名</button>
+              <button type="button" id="btnRecDelete" data-idle="删除文件">删除文件</button>
+            </div>
+            <p class="hint" id="trajStatus">未录制。先选「拖臂录制」或「软件录制」。</p>
+            <div class="speed-row">
+              <span>回放</span>
+              <input id="trajRateRange" type="range" min="0.5" max="1" step="0.05" value="1"/>
+              <input id="trajRate" type="number" value="1" min="0.5" max="1" step="0.05"/>
+              <span>× 速度</span>
+            </div>
+            <select id="trajFile"></select>
+            <p class="hint">文件在本机 recordings 目录。回放先慢速走到起点再按时间戳 servo_j，不是 MIT。路点面板仍是稀疏关键帧。</p>
+          </div>
+          <div class="card" id="panel-kb">
+            <h2>Keyboard · 笛卡尔</h2>
+            <p class="hint" style="margin-top:0">按住 WASD/QE、1–6 做增量遥操作（100 Hz cart）。<kbd>空格</kbd> 切换夹爪开/合。急停、复位、使能见顶栏「快捷键」。零位靠近奇异，无解时先抬 J2/J3。</p>
+            <div class="kb-map">
+              <div><kbd>W</kbd>/<kbd>S</kbd> X 前后</div>
+              <div><kbd>A</kbd>/<kbd>D</kbd> Y 左右</div>
+              <div><kbd>Q</kbd>/<kbd>E</kbd> Z 上下</div>
+              <div><kbd>1</kbd>/<kbd>2</kbd> 滚转　<kbd>3</kbd>/<kbd>4</kbd> 俯仰　<kbd>5</kbd>/<kbd>6</kbd> 偏航</div>
+              <div><kbd>空格</kbd> 夹爪开 / 合</div>
+            </div>
+            <p class="hint" id="kbAck">按键映射与 SDK test_fafu_keyboard_cartesian 相同。</p>
+          </div>
+        </div>
+        <div class="arm-col arm-stage" id="panel-stage">
+          <div class="twin-box" id="panel-twin">
+            <header><span>3D 参考臂</span><span>拖拽旋转 · 滚轮缩放 · 双击框选</span></header>
+            <div class="twin-stage" id="arm3dHost">
+              <div class="cam-overlay" id="arm3dOverlay">加载中</div>
+            </div>
+          </div>
+          <div class="cams cams-mini" id="panel-cams">
+            <div class="cam-box cam-hero">
+              <header><span id="camRole0">作业相机</span><span id="camFps0">—</span></header>
+              <div class="cam-stage"><img id="cam0" alt="作业相机"/><div class="cam-overlay js-cam-overlay">未连接 · 假画面</div></div>
+            </div>
+          </div>
+        </div>
+        <div class="arm-col">
+          <div class="card conn-card" id="panel-conn">
+            <h2>Robot Connection</h2>
+            <div class="conn-status">
+              <span class="status-dot connected" id="armDot"></span>
+              <b id="armModeBadge">Demo Mode</b>
+            </div>
+            <table class="conn-table">
+              <tr><td>Server</td><td id="armServerUrl">cfg / auto</td></tr>
+              <tr><td>Robot</td><td id="armRobotName">FAFU</td></tr>
+              <tr><td>Joints</td><td>7（6 + 夹爪）</td></tr>
+              <tr><td>Backend</td><td id="armBackend">mock</td></tr>
+              <tr><td>Link</td><td id="armLinkTxt">—</td></tr>
+              <tr><td>Enabled</td><td id="armEnabled">—</td></tr>
+              <tr><td>Gripper</td><td id="armGripTxt">—</td></tr>
+              <tr><td>控制模式</td><td id="armCtrlMode">Position</td></tr>
+            </table>
+            <h2>臂源</h2>
+            <div class="mode-btns" id="armSrcBtns">
+              <button type="button" class="mode-btn" data-arm-src="fafu" id="btnArmLive" data-idle="真机 USB">真机 USB</button>
+              <button type="button" class="mode-btn" data-arm-src="sim" id="btnArmSim" data-idle="仿真臂">仿真臂</button>
+            </div>
+            <p class="hint" id="armSrcHint">启动真机已自动连 USB 并使能。切「仿真臂」只练界面；切回真机后需再点使能。</p>
+            <div class="mode-btns" id="linkBtns">
+              <button type="button" class="mode-btn" id="btnArmConnect" data-hot="connect" data-idle="Connect">Connect</button>
+              <button type="button" class="mode-btn" id="btnArmDisconnect" data-hot="disconnect" data-idle="Disconnect">Disconnect</button>
+            </div>
+            <div class="mode-btns" id="powerBtns">
+              <button type="button" class="mode-btn" id="btnArmEnable" data-hot="enable" data-idle="使能">使能</button>
+              <button type="button" class="mode-btn" id="btnArmDisable" data-hot="disable" data-idle="去使能">去使能</button>
+            </div>
+            <p class="hint" id="connAck"></p>
+            <div class="motor-panel" id="motorPanel">
+              <h2>电机状态</h2>
+              <p class="hint" id="motorHint" style="margin-top:0">点「使能」后查看各轴是否在线、有无故障、当前模式。</p>
+              <table class="conn-table motor-table" id="motorTable">
+                <tr><td colspan="4">尚未使能</td></tr>
+              </table>
+            </div>
+            <h2>CONTROL MODE</h2>
+            <div class="mode-btns" id="modeBtns">
+              <button type="button" class="mode-btn active" data-mode="Position">Position</button>
+              <button type="button" class="mode-btn" data-mode="Gravity" disabled title="Gravity：需 pinocchio（真机力矩环未加载）">Gravity</button>
+              <button type="button" class="mode-btn" data-mode="Gra+Fri" disabled title="Gra+Fri：需 pinocchio（真机力矩环未加载）">Gra+Fri</button>
+              <button type="button" class="mode-btn" data-mode="Impedance" disabled title="Impedance：需 pinocchio（真机力矩环未加载）">Impedance</button>
+            </div>
+            <p class="hint" id="modeHint">Position：滑条 + 发送位置 + 键盘。Gravity / Gra+Fri：真机与 SDK [t] 示教相同（纯重力力矩，Gra+Fri 加摩擦）。Impedance：柔顺保持进入时的姿态。</p>
+            <p class="hint tone-warn" id="modeCapHint">Gravity / Gra+Fri / Impedance 需 pinocchio（真机力矩环未加载）。</p>
+            <div class="speed-row urdf-row">
+              <span>重力 URDF</span>
+              <select id="gravUrdf"></select>
+            </div>
+            <p class="hint" id="gravUrdfHint">URDF 只认站控目录 <code>robot_station\urdf</code>。Gravity / Gra+Fri / Impedance 与拖臂录制共用。</p>
+          </div>
+          <div class="card" id="panel-ee">
+            <h2>End Effector</h2>
+            <div class="kv" id="eeKv"></div>
+            <p class="hint">位姿优先 SDK FK。外力无腕部传感器，下面是关节力矩 raw。</p>
+          </div>
+          <div class="card off" id="panel-scripts">
+            <h2>Scripts</h2>
+            <select id="scriptSel"></select>
+            <div class="row" style="margin-top:10px">
+              <button class="primary" type="button" id="btnScriptRun" data-idle="运行映射">运行映射</button>
+              <button type="button" id="btnScriptRefresh" data-idle="Refresh">Refresh</button>
+            </div>
+            <p class="hint" id="scriptAck">不另起 SDK 进程（串口单写者）。仅映射 go_home / gripper / 急停。</p>
+          </div>
+          <div class="kv" id="armKv"></div>
+        </div>
+      </div>
+    </section>
+  </div>
+</div>
+<script src="/static/vendor/three.min.js"></script>
+<script src="/static/js/arm3d.js"></script>
+<script src="/static/js/app.js"></script>
+</body>
+</html>
