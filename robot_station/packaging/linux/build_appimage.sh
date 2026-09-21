@@ -154,8 +154,8 @@ echo "Installing pip packages into private runtime"
 "$PY" -m pip install --no-warn-script-location --no-user -U pip setuptools wheel
 core_req="$(mktemp)"
 grep -vE '^[[:space:]]*(#|$)' "$REPO/requirements.txt" | grep -viE '^pyrealsense2' > "$core_req"
-"$PY" -m pip install --no-warn-script-location --no-user -r "$core_req" numpy pybind11 \
-  'pycairo>=1.20,<2' 'PyGObject>=3.42,<3.52'
+"$PY" -m pip install --no-warn-script-location --no-user -r "$core_req" numpy \
+  'pybind11>=2.12,<3' 'pycairo>=1.20,<2' 'PyGObject>=3.42,<3.52'
 rm -f "$core_req"
 if ! "$PY" -m pip install --no-warn-script-location --no-user 'pyrealsense2>=2.54'; then
   echo "WARNING: pyrealsense2 not installed; camera stays mock until a cp310 Linux wheel is available"
@@ -208,9 +208,13 @@ if SDK="$(find_sdk)"; then
   mkdir -p "$OUT_DIR/app/vendor"
   copy_tree "$SDK" "$OUT_DIR/app/vendor/fafu_arm_sdk"
   echo "Building fafu_motor.so for bundled Python"
-  "$PY" -m pip install --no-warn-script-location --no-user pybind11
+  "$PY" -c "import sys,sysconfig,pybind11; print('py', sys.executable); print(sys.version); print('inc', sysconfig.get_path('include')); print('lib', sysconfig.get_config_var('LIBDIR')); print('pybind11', pybind11.get_cmake_dir())"
+  export Python3_ROOT_DIR="$(cd "$(dirname "$PY")/.." && pwd)"
+  export CMAKE_PREFIX_PATH="${Python3_ROOT_DIR}${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}"
+  export LD_LIBRARY_PATH="${Python3_ROOT_DIR}/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  "$PY" -m pip install --no-warn-script-location --no-user 'pybind11>=2.12,<3'
   bash "$OUT_DIR/app/vendor/fafu_arm_sdk/fafu_robot_cpp/linux/build.sh" \
-    --module-only --python "$PY"
+    --module-only --python "$PY" --jobs 2
   so="$(ls "$OUT_DIR/app/vendor/fafu_arm_sdk/fafu_robot_python"/fafu_motor.cpython-310*-linux-gnu.so 2>/dev/null | head -n1 || true)"
   if [ -z "$so" ]; then
     echo "fafu_motor.so was not produced" >&2

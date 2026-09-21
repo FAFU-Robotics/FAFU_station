@@ -133,17 +133,32 @@ jobs:
         if: always()
         run: |
           log=robot_station/dist/appimage-build.log
+          rc_file=robot_station/dist/appimage-build.status
           if [ -f "$log" ]; then
             echo "----- appimage-build.log -----"
             cat "$log"
             echo "----- end -----"
-            body="$(tail -n 25 "$log" | tr '\n' ' | ' | cut -c1-700)"
-            rc="$(cat robot_station/dist/appimage-build.status 2>/dev/null || echo 1)"
-            if [ "$rc" != 0 ]; then
-              echo "::error title=AppImage build failed::$body"
-            else
-              echo "::notice title=AppImage build ok::$body"
-            fi
+            python3 - "$log" "$rc_file" <<'PY'
+from pathlib import Path
+import sys
+log = Path(sys.argv[1])
+rc_path = Path(sys.argv[2])
+text = log.read_text(errors="replace") if log.is_file() else ""
+rc = rc_path.read_text(encoding="utf-8").strip() if rc_path.is_file() else "1"
+keys = (
+    "error:", "fatal error", "CMake Error", "FAILED", "undefined reference",
+    "ninja: build stopped", "collect2:", "Refusing", "not gzip", "download empty",
+    "customer readme missing", "fafu_motor.so was not produced", "python3 missing",
+    "OS Support seems wrong",
+)
+hits = [ln.strip() for ln in text.splitlines() if any(k in ln for k in keys)]
+body = " | ".join(hits[-12:] or text.splitlines()[-20:])
+print(body[:1200])
+if rc != "0":
+    print(f"::error title=AppImage build failed::{body[:700]}")
+else:
+    print(f"::notice title=AppImage build ok::{body[:400]}")
+PY
           else
             echo "::error title=AppImage build failed::no appimage-build.log"
           fi

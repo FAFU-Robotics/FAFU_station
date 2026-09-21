@@ -69,6 +69,7 @@ class LinuxPackagingFilesTests(unittest.TestCase):
         self.assertIn("curl -fL", script)
         self.assertIn("fetch_url", script)
         self.assertIn("PyGObject>=3.42,<3.52", script)
+        self.assertIn("pybind11>=2.12,<3", script)
         docker = (PACK / "Dockerfile").read_text(encoding="utf-8")
         self.assertIn("APPIMAGE_EXTRACT_AND_RUN=1", docker)
         entry = (PACK / "docker-entrypoint.sh").read_text(encoding="utf-8")
