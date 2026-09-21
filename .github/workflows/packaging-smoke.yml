@@ -1,0 +1,123 @@
+name: packaging-smoke
+
+on:
+  push:
+    paths:
+      - "robot_station/packaging/windows/**"
+      - "robot_station/packaging/linux/**"
+      - "robot_station/tests/test_single_exe.py"
+      - "robot_station/tests/test_portable.py"
+      - "robot_station/tests/test_linux_packaging.py"
+      - "robot_station/tests/test_linux_preflight.py"
+      - "robot_station/.github/workflows/packaging-smoke.yml"
+      - ".github/workflows/packaging-smoke.yml"
+      - "fafu_arm_sdk/**"
+      - "robot_station/requirements.txt"
+  pull_request:
+    paths:
+      - "robot_station/packaging/windows/**"
+      - "robot_station/packaging/linux/**"
+      - "robot_station/tests/test_single_exe.py"
+      - "robot_station/tests/test_portable.py"
+      - "robot_station/tests/test_linux_packaging.py"
+      - "robot_station/tests/test_linux_preflight.py"
+      - "robot_station/.github/workflows/packaging-smoke.yml"
+      - ".github/workflows/packaging-smoke.yml"
+      - "fafu_arm_sdk/**"
+      - "robot_station/requirements.txt"
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: robot_station
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Unit tests (footer, sources, csc stub)
+        run: python -m unittest tests.test_single_exe tests.test_portable -v
+      - name: Pack fake tree into FAFUEXE1 exe
+        run: |
+          $src = Join-Path $env:RUNNER_TEMP "FAFUArmStation"
+          New-Item -ItemType Directory -Force -Path (Join-Path $src "runtime\python310") | Out-Null
+          New-Item -ItemType Directory -Force -Path (Join-Path $src "app") | Out-Null
+          Set-Content -Encoding ascii (Join-Path $src "runtime\python310\python.exe") "fake"
+          Set-Content -Encoding ascii (Join-Path $src "FAFUArmStation.exe") "thin"
+          Set-Content -Encoding ascii (Join-Path $src "app\station_desktop.py") "#"
+          $out = Join-Path $env:RUNNER_TEMP "FAFUArmStation.exe"
+          powershell -NoProfile -ExecutionPolicy Bypass -File packaging\windows\pack_single_exe.ps1 -SourceDir $src -OutExe $out -AllowNoSdk
+          python -c "from pathlib import Path; from tests.test_single_exe import split_bundle, MAGIC; blob=Path(r'$out').read_bytes(); stub, payload, digest = split_bundle(blob); assert blob[-8:]==MAGIC; assert payload[:2]==b'PK'; print('ci pack ok', len(blob))"
+          $man = Join-Path $env:RUNNER_TEMP "BUILD_MANIFEST.json"
+          if (-not (Test-Path $man)) { throw "BUILD_MANIFEST.json was not written next to the exe" }
+          python -c "import json; from pathlib import Path; m=json.loads(Path(r'$man').read_text(encoding='utf-8')); assert m['magic']=='FAFUEXE1'; assert m['exe_bytes']>0; assert m['exe_sha256']!=m['payload_sha256']; print('ci manifest ok', m['exe_bytes'])"
+
+  linux-smoke:
+    runs-on: ubuntu-22.04
+    defaults:
+      run:
+        working-directory: robot_station
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Linux packaging unit tests
+        run: python -m unittest tests.test_portable tests.test_linux_packaging tests.test_linux_preflight tests.test_camera_detect -v
+
+  linux-appimage:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Require fafu_arm_sdk
+        run: |
+          set -euo pipefail
+          sdk="$GITHUB_WORKSPACE/fafu_arm_sdk/fafu_robot_python/fafu_robot_controller.py"
+          if [ ! -f "$sdk" ]; then
+            echo "fafu_arm_sdk missing at $sdk; refusing customer AppImage (same rule as Windows)." >&2
+            exit 1
+          fi
+      - name: Install pack dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            ca-certificates \
+            cmake \
+            desktop-file-utils \
+            file \
+            g++ \
+            gir1.2-gtk-3.0 \
+            gir1.2-webkit2-4.0 \
+            libfuse2 \
+            libgirepository1.0-dev \
+            libgtk-3-dev \
+            libssl-dev \
+            libwebkit2gtk-4.0-dev \
+            libcairo2-dev \
+            pkg-config \
+            patchelf \
+            python3 \
+            python3-dev \
+            python3-pip \
+            wget \
+            xz-utils \
+            zlib1g-dev
+      - name: Build AppImage
+        env:
+          FAFU_ARM_SDK: ${{ github.workspace }}/fafu_arm_sdk
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+        run: bash robot_station/packaging/linux/build_appimage.sh
+      - name: Upload AppImage
+        uses: actions/upload-artifact@v4
+        with:
+          name: FAFUArmStation-x86_64-AppImage
+          path: |
+            robot_station/dist/FAFUArmStation-x86_64.AppImage
+            robot_station/dist/BUILD_MANIFEST.json
+          if-no-files-found: error
+          retention-days: 7

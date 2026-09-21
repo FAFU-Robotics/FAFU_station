@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 import json
 import logging
 import re
@@ -199,8 +200,69 @@ def list_windows_cameras() -> list[CamInfo]:
     return out
 
 
+def _linux_usb_ids(node: Path) -> tuple[str, str]:
+    cur = node
+    for _ in range(10):
+        vid_f = cur / "idVendor"
+        pid_f = cur / "idProduct"
+        try:
+            if vid_f.is_file() and pid_f.is_file():
+                vid = vid_f.read_text(encoding="ascii", errors="ignore").strip().upper()
+                pid = pid_f.read_text(encoding="ascii", errors="ignore").strip().upper()
+                return vid, pid
+        except OSError:
+            return "", ""
+        parent = cur.parent
+        if parent == cur:
+            break
+        cur = parent
+    return "", ""
+
+
+def list_linux_cameras(sys_root: str | Path | None = None) -> list[CamInfo]:
+    """Enumerate ``/sys/class/video4linux``. Never opens a capture device."""
+    if sys.platform.startswith("linux") is False and sys_root is None:
+        return []
+    root = Path(sys_root) if sys_root is not None else Path("/sys/class/video4linux")
+    try:
+        if not root.is_dir():
+            return []
+    except OSError:
+        return []
+    out: list[CamInfo] = []
+    try:
+        entries = sorted(root.iterdir(), key=lambda p: p.name)
+    except OSError:
+        return []
+    for node in entries:
+        name_f = node / "name"
+        try:
+            name = name_f.read_text(encoding="utf-8", errors="replace").strip() if name_f.is_file() else node.name
+        except OSError:
+            name = node.name
+        if not name or "metadata" in name.lower():
+            continue
+        device_link = node / "device"
+        try:
+            resolved = device_link.resolve() if device_link.exists() else node
+        except OSError:
+            resolved = node
+        vid, pid = _linux_usb_ids(resolved)
+        device_id = f"/dev/{node.name}"
+        out.append(
+            CamInfo(
+                name=name,
+                device_id=device_id,
+                vid=vid,
+                pid=pid,
+                kind=_kind_for(name, vid, pid),
+            )
+        )
+    return out
+
+
 def discover_cameras() -> list[CamInfo]:
-    """RealSense SDK first. Windows Camera class is a fallback if SDK sees nothing."""
+    """RealSense SDK first. OS camera class is a fallback if SDK sees nothing."""
     found: list[CamInfo] = []
     seen_id: set[str] = set()
     seen_vp: set[str] = set()
@@ -220,6 +282,8 @@ def discover_cameras() -> list[CamInfo]:
         _add(info)
     if not any(score_camera(c) > 0 for c in found):
         for info in list_windows_cameras():
+            _add(info)
+        for info in list_linux_cameras():
             _add(info)
     return found
 
@@ -544,6 +608,8 @@ class AutoCameraBank(CameraBank):
         self.height = int(height)
         self.hz = float(hz)
         self._inner: CameraBank = MockCameraBank(self.count, self.width, self.height, self.hz)
+        self._swap_lock = threading.Lock()
+        self._paused = False
 
     def start(self) -> None:
         try:
@@ -556,16 +622,62 @@ class AutoCameraBank(CameraBank):
         old = self._inner
         self._inner = picked
         picked.start()
+        picked.set_paused(self._paused)
         if old is not picked:
             try:
                 old.stop()
             except Exception:
                 pass
 
+    def rescan(self) -> CameraBank:
+        """Re-run the pick (USB work camera plugged/unplugged) and swap the backend.
+
+        Called only when the device signature actually changed
+        (``robot_station.usb_watch``). Keeps the current pause state, so a swap
+        during teleop does not resume encoding. Never raises: on failure the
+        previous backend stays in place.
+        """
+        with self._swap_lock:
+            was_paused = bool(self._paused)
+            try:
+                picked = self._choose()
+            except Exception:
+                logger.exception("重新识别作业相机失败，沿用当前后端")
+                return self._inner
+            old = self._inner
+            same = type(picked) is type(old) and (
+                getattr(picked, "device", None) == getattr(old, "device", None)
+            )
+            if same:
+                try:
+                    picked.stop()
+                except Exception:
+                    pass
+                return old
+            self._inner = picked
+            try:
+                picked.start()
+            except Exception:
+                logger.exception("新相机后端启动失败，回退旧后端")
+                self._inner = old
+                try:
+                    picked.stop()
+                except Exception:
+                    pass
+                return old
+            picked.set_paused(was_paused)
+            try:
+                old.stop()
+            except Exception:
+                logger.exception("停旧相机后端失败")
+            logger.info("作业相机已切换为 %s", getattr(picked, "device", "") or type(picked).__name__)
+            return picked
+
     def stop(self) -> None:
         self._inner.stop()
 
     def set_paused(self, paused: bool) -> None:
+        self._paused = bool(paused)
         self._inner.set_paused(paused)
 
     def stream_ids(self) -> list[int]:

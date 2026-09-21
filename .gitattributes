@@ -1,0 +1,4 @@
+# Linux pack scripts must stay LF on GitHub Actions runners.
+*.sh text eol=lf
+robot_station/packaging/linux/AppRun text eol=lf
+robot_station/packaging/linux/docker-entrypoint.sh text eol=lf

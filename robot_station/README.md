@@ -10,14 +10,16 @@
 
 **客户（推荐）：** 使用打包好的私有运行时，不必在电脑上安装 Python。
 
-在开发机执行 `packaging\windows\build_portable.bat`，把 `dist\FAFUArmStation` 交给客户。客户插上 USB，双击 `FAFUArmStation.exe`：第一次装到本用户目录（不写 PATH）并打开页面，之后点桌面快捷方式即可。该运行时只给本软件用，**不会**写入系统 PATH。
+在开发机执行 `packaging\windows\build_portable.bat`，把 **`dist\FAFUArmStation.exe`**（单个文件）交给 Windows 客户。Ubuntu 客户发给 **`dist/FAFUArmStation-x86_64.AppImage`**（须在 Ubuntu 22.04 / Docker 打包，见 `packaging/linux/README.md`）。客户插上 USB，双击该文件打开控制页。该运行时只给本软件用，**不会**写入系统 PATH。
 
 开发或未打包时，默认地址仍是 `http://127.0.0.1:9400/`。
 
 | 谁 | 怎么开 | 文件 |
 |---|---|---|
-| 客户 Windows（推荐） | 插 USB 后双击 `FAFUArmStation.exe` | 第一次装到用户目录；之后点桌面快捷方式 |
-| 开发机 Windows | 双击 `启动真机.bat` | 优先目录内私有 `runtime\python310`（打包时应已含 pinocchio）；否则 conda Python 3.10 + pinocchio，再退回本机 Python 3.10 |
+| 客户 Windows（推荐） | 插 USB 后双击收到的 `FAFUArmStation.exe` | 解到用户目录并打开控制页；后台建桌面快捷方式 |
+| 客户 Ubuntu（推荐） | 插 USB 后双击 `FAFUArmStation-x86_64.AppImage` | 独立 GTK 窗口；`chmod +x`；缺 FUSE 时 `--appimage-extract-and-run` |
+| 开发机 Windows | 双击 `启动真机.bat` | 优先目录内私有 `runtime\python310`；否则本机 Python 3.10 |
+| 开发机 Ubuntu | `bash 启动真机.sh` | 优先私有 `runtime/python310/bin/python3`；否则本机 Python 3.10 |
 | 任意平台命令行 | `python run_station.py` | 运动进程 `:9470` + 网页 `:9400` |
 | 只看总览、不控臂 | `python tools/status_panel.py` | 需站控已在本机运行 |
 
@@ -74,7 +76,7 @@ py -3.10 -m robot_station.adapters.fafu_arm
 5. 臂页正中是 3D 参考臂（100 Hz 关节；外观为 SDK `fafu_baseV1` 的 SolidWorks STL，自动框选进视口）。作业相机一路：启动时自动识别本机 USB（优先 RealSense D405，跳过笔记本内置摄像头）；没插作业相机时是未连接 + 假画面。可用「3D」「相机」开关。
 6. 本机状态页：`http://127.0.0.1:9400/lab`。
 
-规格：[`docs/SPEC.md`](docs/SPEC.md) · 客户说明：[`docs/客户使用说明.md`](docs/客户使用说明.md)（便携包 `app/README.md`） · 交付/开发说明：[`docs/使用说明.md`](docs/使用说明.md) · 打包：[`packaging/windows/README.md`](packaging/windows/README.md)
+规格：[`docs/SPEC.md`](docs/SPEC.md) · 客户说明：[`docs/客户使用说明.md`](docs/客户使用说明.md)（Windows 便携包 `app/README.md`）· [`docs/客户使用说明-linux.md`](docs/客户使用说明-linux.md)（AppImage `app/README.md`） · 交付/开发说明：[`docs/使用说明.md`](docs/使用说明.md) · 打包：[`packaging/windows/README.md`](packaging/windows/README.md) · [`packaging/linux/README.md`](packaging/linux/README.md)
 
 ## 验收
 

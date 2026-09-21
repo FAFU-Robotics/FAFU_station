@@ -51,6 +51,10 @@ class StationConfig:
     arm_port: str = ""
     arm_allow_motion: bool = False
     arm_gripper_id: int = 7
+    # USB 热插拔监视：只在设备签名变化时才去认硬件。默认关闭，
+    # 便携启动器显式打开（见 usb_watch.py）。
+    arm_watch: bool = False
+    camera_watch: bool = False
 
     @classmethod
     def from_mapping(cls, raw: dict[str, Any]) -> "StationConfig":
@@ -58,6 +62,9 @@ class StationConfig:
         data = {k: v for k, v in raw.items() if k in allowed}
         if "arm_allow_motion" in data:
             data["arm_allow_motion"] = _as_bool(data["arm_allow_motion"], False)
+        for key in ("arm_watch", "camera_watch"):
+            if key in data:
+                data[key] = _as_bool(data[key], False)
         cfg = cls(**data)
         cfg.camera_count = 1  # 本机笔记本只接一路作业相机
         return cfg

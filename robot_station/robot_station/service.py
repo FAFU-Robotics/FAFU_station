@@ -17,6 +17,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
 from robot_station.adapters.camera import CameraBank, build_camera
 from robot_station.bridge import MotionClient
@@ -29,6 +30,12 @@ from robot_station.runtime import RuntimeStatus, inspect_runtime, plan_startup, 
 logger = logging.getLogger("station")
 
 TELEOP_HOLD_S = 0.25
+
+_TRUE = frozenset({"1", "true", "yes", "on"})
+
+
+def _env_flag(name: str) -> bool:
+    return (os.environ.get(name) or "").strip().lower() in _TRUE
 
 
 def _mark_teleop(owner: object) -> None:
@@ -188,6 +195,7 @@ class WebFront:
         self._rtt: float | None = None
         self._lock = threading.Lock()
         self._teleop_mono = 0.0
+        self._watch: Any | None = None
 
     @property
     def host_ip(self) -> str:
@@ -196,6 +204,7 @@ class WebFront:
     def start(self) -> None:
         # Camera must not block the web port or the motion TCP connect.
         threading.Thread(target=self._boot_camera, name="cam-boot", daemon=True).start()
+        self._start_camera_watch()
         self.motion.connect(timeout_s=15.0)
 
     def _boot_camera(self) -> None:
@@ -204,7 +213,53 @@ class WebFront:
         except Exception:
             logger.exception("作业相机启动失败")
 
+    def _start_camera_watch(self) -> None:
+        """Hot-plug the work camera in the web process (that is where video lives)."""
+        if not getattr(self.cfg, "camera_watch", False):
+            return
+        try:
+            from robot_station.usb_watch import UsbWatcher, camera_signature
+
+            self._watch = UsbWatcher(
+                serial_fn=lambda: ((),),
+                camera_fn=camera_signature,
+                on_camera=self._watch_camera,
+            )
+            self._watch.start()
+            logger.info("作业相机 USB 监视已开启（网页进程）")
+        except Exception:
+            logger.warning("作业相机 USB 监视启动失败，启动时识别仍可用", exc_info=True)
+            self._watch = None
+
+    def _stop_camera_watch(self) -> None:
+        watch = self._watch
+        self._watch = None
+        if watch is None:
+            return
+        try:
+            watch.stop(timeout=1.0)
+        except Exception:
+            logger.warning("作业相机 USB 监视停止失败", exc_info=True)
+
+    def _watch_camera(self, attached: bool) -> None:
+        camera = self.camera
+        rescan = getattr(camera, "rescan", None)
+        if not callable(rescan):
+            return
+        try:
+            before = getattr(getattr(camera, "_inner", None), "device", None)
+            bank = rescan()
+            after = getattr(bank, "device", None)
+        except Exception:
+            logger.warning("相机重新识别失败", exc_info=True)
+            return
+        if before != after:
+            logger.info("作业相机已更新：%s → %s", before or "假画面", after or "假画面")
+        elif attached:
+            logger.debug("相机变化未产生新后端，沿用 %s", after or "假画面")
+
     def stop(self) -> None:
+        self._stop_camera_watch()
         try:
             self.camera.stop()
         except Exception:
@@ -588,6 +643,10 @@ def motion_argv(cfg: StationConfig, config_path: Path | None) -> list[str]:
     cmd += ["--arm", kind]
     if cfg.arm_allow_motion:
         cmd.append("--allow-motion")
+    if getattr(cfg, "arm_watch", False):
+        cmd.append("--arm-watch")
+    if getattr(cfg, "camera_watch", False):
+        cmd.append("--camera-watch")
     return cmd
 
 
@@ -704,6 +763,16 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="覆盖配置里的 camera（auto=识别 RealSense 作业相机，跳过笔记本内置摄像头）",
     )
+    parser.add_argument(
+        "--arm-watch",
+        action="store_true",
+        help="USB 热插拔：调试板插上时自动把臂源切到真机（不自动使能）",
+    )
+    parser.add_argument(
+        "--camera-watch",
+        action="store_true",
+        help="USB 热插拔：作业相机插上/拔掉时自动重认相机",
+    )
     args = parser.parse_args(argv)
     cfg = load_config(args.config)
     if args.arm:
@@ -712,6 +781,10 @@ def main(argv: list[str] | None = None) -> int:
         cfg.camera = args.camera
     if args.allow_motion:
         cfg.arm_allow_motion = True
+    if args.arm_watch or _env_flag("STATION_ARM_WATCH"):
+        cfg.arm_watch = True
+    if args.camera_watch or _env_flag("STATION_CAMERA_WATCH"):
+        cfg.camera_watch = True
     from robot_station.serial_guard import apply_live_arm_policy
 
     cfg.arm = apply_live_arm_policy(cfg.arm)

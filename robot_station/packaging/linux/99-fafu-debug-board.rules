@@ -1,0 +1,21 @@
+# =============================================================================
+#  99-fafu-debug-board.rules
+#
+#  把调试板 USB 串口固定到 /dev/fafu_debug_board, 设置全用户可读写.
+#  覆盖 VID: 0483 ST / 0403 FTDI / 1a86 CH340 / 10c4 CP210x / 067b PL2303
+# =============================================================================
+
+# --- ST Micro (STM32 USB-CDC) ---
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0483", MODE="0666", GROUP="dialout", SYMLINK+="fafu_debug_board", TAG+="uaccess"
+
+# --- FTDI ---
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", MODE="0666", GROUP="dialout", SYMLINK+="fafu_debug_board", TAG+="uaccess"
+
+# --- CH340 / CH341 ---
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", MODE="0666", GROUP="dialout", SYMLINK+="fafu_debug_board", TAG+="uaccess"
+
+# --- Silicon Labs CP210x ---
+SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", MODE="0666", GROUP="dialout", SYMLINK+="fafu_debug_board", TAG+="uaccess"
+
+# --- Prolific PL2303 ---
+SUBSYSTEM=="tty", ATTRS{idVendor}=="067b", MODE="0666", GROUP="dialout", SYMLINK+="fafu_debug_board", TAG+="uaccess"

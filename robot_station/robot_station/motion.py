@@ -77,6 +77,31 @@ def _win_timer_end() -> None:
                 pass
 
 
+def _linux_rt_begin() -> bool:
+    """Best-effort SCHED_FIFO for the 100 Hz tick. AppImage cannot reliably setcap."""
+    if os.name == "nt":
+        return False
+    try:
+        policy = int(getattr(os, "SCHED_FIFO"))
+        param = os.sched_param(10)
+        os.sched_setscheduler(0, policy, param)
+        logger.info("Linux SCHED_FIFO 已启用（prio=10）")
+        return True
+    except (AttributeError, PermissionError, OSError) as exc:
+        logger.info("Linux SCHED_FIFO 不可用，沿用普通调度: %s", exc)
+        return False
+
+
+def _linux_rt_end() -> None:
+    if os.name == "nt":
+        return
+    try:
+        other = int(getattr(os, "SCHED_OTHER"))
+        os.sched_setscheduler(0, other, os.sched_param(0))
+    except (AttributeError, PermissionError, OSError):
+        return
+
+
 def _sleep_until(deadline: float) -> None:
     """Sleep until perf_counter deadline. Last ~0.3 ms spins so 100 Hz does not slip."""
     while True:
@@ -125,8 +150,10 @@ class MotionCore:
         self._cmd_err = ""
         self._pub = threading.Condition()
         self._timer_armed = False
+        self._rt_armed = False
         self._arm_lock = threading.RLock()
         self._arm_switching = False
+        self._watch: Any = None
 
     def _note_echo(self, t0: object) -> None:
         if t0 is None or t0 == "":
@@ -161,8 +188,10 @@ class MotionCore:
             raise
         self._stop.clear()
         self._timer_armed = _win_timer_begin()
+        self._rt_armed = _linux_rt_begin()
         self._tick_th = threading.Thread(target=self._tick_loop, name="station-tick", daemon=True)
         self._tick_th.start()
+        self._start_watch()
         logger.info(
             "tick %s Hz  臂=%s  相机=%s",
             self.cfg.control_hz,
@@ -225,8 +254,116 @@ class MotionCore:
         self.cfg.arm = "sim"
         self._cmd_err = f"真机未连上，已切仿真：{reason}"
 
+    # ---- USB 热插拔监视（默认关闭；cfg.arm_watch / camera_watch 打开） ----
+    #
+    # 只在设备签名变化时才去认硬件，见 robot_station/usb_watch.py。默认关闭
+    # 意味着 MotionCore 的行为与从前完全一致（单测、arm: mock 开发机不受影响）。
+
+    def _start_watch(self) -> None:
+        try:
+            from robot_station.usb_watch import UsbWatcher, watch_enabled
+
+            arm_watch, camera_watch = watch_enabled(self.cfg)
+            local_camera = bool(camera_watch) and self.camera is not None
+            if not (arm_watch or local_camera):
+                return
+            from robot_station.usb_watch import camera_signature
+
+            self._watch = UsbWatcher(
+                on_arm=self._watch_arm if arm_watch else None,
+                on_camera=self._watch_camera if local_camera else None,
+                camera_fn=camera_signature if local_camera else None,
+            )
+            self._watch.start()
+            logger.info(
+                "USB 监视已开启（臂=%s 相机=%s）：仅在设备变化时探测",
+                arm_watch,
+                camera_watch,
+            )
+        except Exception:
+            logger.warning("USB 监视启动失败，站控照常运行", exc_info=True)
+            self._watch = None
+
+    def _stop_watch(self) -> None:
+        watch = self._watch
+        self._watch = None
+        if watch is None:
+            return
+        try:
+            watch.stop(timeout=1.0)
+        except Exception:
+            logger.warning("USB 监视停止失败", exc_info=True)
+
+    def note_device_change(self) -> None:
+        """Tell the watcher to re-read now, without waiting for its interval.
+
+        Called after a manual 臂源 switch so the watcher does not immediately
+        undo it, and after a successful hot-plug switch so the debounce state
+        follows reality.
+        """
+        watch = self._watch
+        if watch is None:
+            return
+        try:
+            watch.rescan()
+        except Exception:
+            logger.debug("USB 监视重读失败", exc_info=True)
+
+    def _watch_arm(self, attached: bool) -> None:
+        """USB debug board set changed: adopt the live arm when we are on sim/mock.
+
+        Two rules that are deliberately conservative:
+
+        * **Unplug keeps ``backend=fafu``.** The page reads connected/not from the
+          adapter itself (``_drop_lost_live_link``). Silently swapping to the sim
+          arm would let an operator believe the metal arm is still the one being
+          commanded.
+        * **Never touch the adapter while it reports connected.** A re-enumeration
+          on another COM port mid-session is logged only; the 100 Hz loop keeps
+          running, and the existing unplug detection marks the link down. The
+          next change callback (or a manual Connect) re-opens on the new port.
+        """
+        if self.arm_kind() not in ("mock", "sim"):
+            logger.info(
+                "调试板签名已变化（%s），当前仍连着真机；未打断控制回路",
+                "已接上" if attached else "已拔出",
+            )
+            return
+        if not attached:
+            logger.info("调试板已拔出；保持仿真，等待重新插上")
+            return
+        if not self.gate.motion_allowed():
+            logger.info("急停锁存中，暂不自动切真机；解除后或重新插拔即可")
+            return
+        err = self.on_arm_src("usb-watch", "fafu")
+        self._set_cmd_err(err)
+        if err is None:
+            logger.info("检测到调试板已插上，臂源已切到真机（未自动使能）")
+            self.note_device_change()
+        else:
+            logger.warning("检测到调试板但切换真机失败：%s", err)
+
+    def _watch_camera(self, attached: bool) -> None:
+        """USB camera set changed: re-run the work-camera pick and swap backend."""
+        camera = self.camera
+        rescan = getattr(camera, "rescan", None)
+        if not callable(rescan):
+            return
+        try:
+            before = getattr(getattr(camera, "_inner", None), "device", None)
+            bank = rescan()
+            after = getattr(bank, "device", None)
+        except Exception:
+            logger.warning("相机重新识别失败", exc_info=True)
+            return
+        if before != after:
+            logger.info("作业相机已更新：%s → %s", before or "假画面", after or "假画面")
+        elif attached:
+            logger.debug("相机变化未产生新后端，沿用 %s", after or "假画面")
+
     def stop(self) -> None:
         self._stop.set()
+        self._stop_watch()
         with self._pub:
             self._pub.notify_all()
         if self._tick_th is not None:
@@ -234,6 +371,9 @@ class MotionCore:
         if self._timer_armed:
             _win_timer_end()
             self._timer_armed = False
+        if self._rt_armed:
+            _linux_rt_end()
+            self._rt_armed = False
         try:
             self.arm.hold()
         except Exception:
@@ -257,7 +397,7 @@ class MotionCore:
             from robot_station.serial_guard import live_serial_allowed
 
             if not live_serial_allowed():
-                return "未允许真机串口（请用「启动真机.bat」，需 STATION_ALLOW_LIVE_ARM=1）"
+                return "未允许真机串口（请用「启动真机.bat」或 Ubuntu 的「启动真机.sh」，需 STATION_ALLOW_LIVE_ARM=1）"
         q_keep = list(self.world.arm.q_deg)
         self._arm_switching = True
         try:
@@ -316,6 +456,7 @@ class MotionCore:
                 return None
         finally:
             self._arm_switching = False
+            self.note_device_change()
 
     def _seed_sim_pose(self, q_deg: list[float]) -> None:
         if not q_deg:

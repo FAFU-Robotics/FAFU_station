@@ -1,10 +1,14 @@
 // Private-runtime launcher. Process-local environment only.
-// Does not write PATH, registry, or the customer's Python.
+// Runs in place next to this exe. Does not copy the tree, write PATH,
+// or touch the customer's Python. Optional Install.bat still copies
+// to %LOCALAPPDATA%\FAFUArmStation for users who want to delete the zip.
 using System;
 using System.Diagnostics;
 using System.IO;
+using System.IO.Ports;
 using System.Text;
 using System.Windows.Forms;
+using Microsoft.Win32;
 
 internal static class PortableLauncher
 {
@@ -21,24 +25,6 @@ internal static class PortableLauncher
             Log(logPath, "portable launcher " + DateTime.Now.ToString("s"));
             Log(logPath, "root=" + root);
 
-            string dest = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "FAFUArmStation");
-            if (!SameDir(root, dest))
-            {
-                Log(logPath, "first-run copy to " + dest);
-                if (InstallTo(root, dest, logPath) && File.Exists(Path.Combine(dest, "FAFUArmStation.exe")))
-                {
-                    ProcessStartInfo next = new ProcessStartInfo();
-                    next.FileName = Path.Combine(dest, "FAFUArmStation.exe");
-                    next.WorkingDirectory = dest;
-                    next.UseShellExecute = true;
-                    Process.Start(next);
-                    return 0;
-                }
-                Log(logPath, "install copy failed, starting from zip folder");
-            }
-
             string python = Path.Combine(root, "runtime", "python310", "python.exe");
             string appDir = Path.Combine(root, "app");
             string desktop = Path.Combine(appDir, "station_desktop.py");
@@ -46,11 +32,14 @@ internal static class PortableLauncher
             {
                 MessageBox.Show(
                     "便携包不完整：找不到私有 Python 或 app\\station_desktop.py。\n"
-                    + "请用 packaging\\windows\\build_portable.ps1 重新打包。\n"
+                    + "请把整个 FAFUArmStation 文件夹放在一起，不要只拷 exe。\n"
                     + "日志: " + logPath,
                     Title);
                 return 1;
             }
+
+            if (!RunPreflight(root, python, logPath))
+                return 1;
 
             string sdk = Path.Combine(appDir, "vendor", "fafu_arm_sdk");
             if (!Directory.Exists(Path.Combine(sdk, "fafu_robot_python")))
@@ -74,6 +63,9 @@ internal static class PortableLauncher
             psi.EnvironmentVariables.Remove("PYTHONUSERBASE");
             if (Directory.Exists(Path.Combine(sdk, "fafu_robot_python")))
                 psi.EnvironmentVariables["FAFU_ARM_SDK"] = sdk;
+            string urdf = Path.Combine(appDir, "urdf");
+            if (Directory.Exists(urdf))
+                psi.EnvironmentVariables["STATION_URDF_DIR"] = urdf;
 
             string pyDir = Path.GetDirectoryName(python);
             string scripts = Path.Combine(pyDir, "Scripts");
@@ -95,6 +87,7 @@ internal static class PortableLauncher
                     MessageBox.Show("无法启动私有 Python。\n日志: " + logPath, Title);
                     return 1;
                 }
+                EnsureShortcut(root, logPath);
                 proc.WaitForExit();
                 Log(logPath, "exit " + proc.ExitCode);
                 return proc.ExitCode;
@@ -108,62 +101,142 @@ internal static class PortableLauncher
         }
     }
 
-    static bool SameDir(string a, string b)
+    static bool RunPreflight(string root, string python, string logPath)
+    {
+        string pyDir = Path.GetDirectoryName(python) ?? "";
+        bool webview = HasWebView2();
+        bool vcruntime = HasVcRuntime(pyDir);
+        string[] ports = ComPorts();
+        Log(logPath, "preflight webview2=" + webview + " vcruntime=" + vcruntime
+            + " com=" + (ports.Length == 0 ? "(none)" : string.Join(",", ports)));
+
+        if (!webview)
+        {
+            DialogResult go = MessageBox.Show(
+                "未检测到 Microsoft Edge WebView2。独立控制窗口可能打不开。\n"
+                + "请安装 WebView2 运行时后再试：\n"
+                + "https://go.microsoft.com/fwlink/p/?LinkId=2124703\n\n"
+                + "日志: " + logPath + "\n\n仍要继续启动吗？",
+                Title,
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Warning);
+            if (go != DialogResult.Yes)
+                return false;
+        }
+        if (!vcruntime)
+        {
+            DialogResult go = MessageBox.Show(
+                "未找到 VC++ 运行库（vcruntime140.dll）。\n"
+                + "真机 USB 模块可能无法加载。请安装 Microsoft Visual C++ Redistributable (x64)。\n\n"
+                + "日志: " + logPath + "\n\n仍要继续启动吗？",
+                Title,
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Warning);
+            if (go != DialogResult.Yes)
+                return false;
+        }
+        if (ports.Length == 0)
+        {
+            MessageBox.Show(
+                "未检测到串口。若已插机械臂 USB，请在设备管理器确认 COM 口，"
+                + "并安装调试板驱动（CH340 / CP210x / FTDI）。\n"
+                + "软件仍会打开，可先用仿真臂。\n\n日志: " + logPath,
+                Title,
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+        }
+        return true;
+    }
+
+    static bool HasWebView2()
+    {
+        string guid = @"{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}";
+        string[] keys =
+        {
+            @"SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\" + guid,
+            @"SOFTWARE\Microsoft\EdgeUpdate\Clients\" + guid,
+            @"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Microsoft EdgeWebView",
+            @"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Microsoft EdgeWebView",
+        };
+        foreach (string k in keys)
+        {
+            try
+            {
+                using (RegistryKey hk = Registry.LocalMachine.OpenSubKey(k))
+                {
+                    if (hk != null) return true;
+                }
+                using (RegistryKey hk = Registry.CurrentUser.OpenSubKey(k))
+                {
+                    if (hk != null) return true;
+                }
+            }
+            catch { }
+        }
+        try
+        {
+            string x86 = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86);
+            if (!string.IsNullOrEmpty(x86)
+                && Directory.Exists(Path.Combine(x86, "Microsoft", "EdgeWebView", "Application")))
+                return true;
+        }
+        catch { }
+        return false;
+    }
+
+    static bool HasVcRuntime(string pyDir)
+    {
+        string[] names = { "vcruntime140.dll", "VCRUNTIME140.dll" };
+        string[] dirs =
+        {
+            pyDir ?? "",
+            Environment.SystemDirectory ?? "",
+        };
+        foreach (string d in dirs)
+        {
+            if (string.IsNullOrEmpty(d)) continue;
+            foreach (string n in names)
+            {
+                if (File.Exists(Path.Combine(d, n)))
+                    return true;
+            }
+        }
+        return false;
+    }
+
+    static string[] ComPorts()
     {
         try
         {
-            return string.Equals(
-                Path.GetFullPath(a).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
-                Path.GetFullPath(b).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
-                StringComparison.OrdinalIgnoreCase);
+            return SerialPort.GetPortNames() ?? new string[0];
         }
         catch
         {
-            return false;
+            return new string[0];
         }
     }
 
-    static bool InstallTo(string root, string dest, string logPath)
+    static void EnsureShortcut(string root, string logPath)
     {
         try
         {
-            Directory.CreateDirectory(dest);
-            ProcessStartInfo copy = new ProcessStartInfo();
-            copy.FileName = "robocopy";
-            copy.Arguments = "\"" + root + "\" \"" + dest + "\" /E /XD cache /NFL /NDL /NJH /NJS /nc /ns /np";
-            copy.UseShellExecute = false;
-            copy.CreateNoWindow = true;
-            using (Process p = Process.Start(copy))
+            string vbs = Path.Combine(root, "install_shortcut.vbs");
+            if (!File.Exists(vbs))
+                return;
+            ProcessStartInfo sc = new ProcessStartInfo();
+            sc.FileName = "cscript";
+            sc.Arguments = "//nologo \"" + vbs + "\" \"" + root + "\"";
+            sc.UseShellExecute = false;
+            sc.CreateNoWindow = true;
+            using (Process p = Process.Start(sc))
             {
-                if (p == null)
-                    return false;
-                p.WaitForExit();
-                if (p.ExitCode >= 8)
-                {
-                    Log(logPath, "robocopy " + p.ExitCode);
-                    return false;
-                }
+                if (p != null)
+                    p.WaitForExit(2500);
             }
-            string vbs = Path.Combine(dest, "install_shortcut.vbs");
-            if (File.Exists(vbs))
-            {
-                ProcessStartInfo sc = new ProcessStartInfo();
-                sc.FileName = "cscript";
-                sc.Arguments = "//nologo \"" + vbs + "\" \"" + dest + "\"";
-                sc.UseShellExecute = false;
-                sc.CreateNoWindow = true;
-                using (Process p = Process.Start(sc))
-                {
-                    if (p != null)
-                        p.WaitForExit(8000);
-                }
-            }
-            return true;
         }
         catch (Exception ex)
         {
-            Log(logPath, "install " + ex.Message);
-            return false;
+            Log(logPath, "shortcut " + ex.Message);
         }
     }
 

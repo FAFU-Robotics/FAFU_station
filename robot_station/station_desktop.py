@@ -23,14 +23,16 @@ MOTION_PORT = 9470
 DEFAULT_PATH = "/"
 APP_TITLE = "FAFU 机械臂站控"
 WAIT_S = 25.0
-LOG = Path(os.environ.get("TEMP") or os.environ.get("TMP") or str(HERE)) / "fafu-station-app.log"
+LOG_DIR = Path(
+    os.environ.get("TEMP")
+    or os.environ.get("TMP")
+    or os.environ.get("XDG_CACHE_HOME")
+    or (str(Path.home() / ".cache") if os.name != "nt" else str(HERE))
+)
+LOG = LOG_DIR / "fafu-station-app.log"
+HOST_LOG = LOG_DIR / "fafu-station-host.log"
 
-_OFFLINE_HTML = """<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="utf-8"/>
-<title>FAFU 机械臂站控</title>
-<style>
+_PAGE_CSS = """
   html, body {{
     margin: 0; min-height: 100%;
     background: #0a1016; color: #e8eef5;
@@ -47,7 +49,33 @@ _OFFLINE_HTML = """<!DOCTYPE html>
     border: 1px solid #2d6f8f; background: #123346; color: #d7f3ff;
     font: inherit; cursor: pointer;
   }}
-</style>
+"""
+
+_LOADING_HTML = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<title>FAFU 机械臂站控</title>
+<style>""" + _PAGE_CSS + """</style>
+</head>
+<body>
+  <div class="box">
+    <h1>正在启动机械臂站控</h1>
+    <p>目标：<code>{url}</code></p>
+    <p>控制页马上打开。真机 USB 在后台连接，不会挡住这个窗口。</p>
+    <p>日志：%TEMP%\\fafu-station-app.log</p>
+    <!-- host={host} port={port} -->
+  </div>
+</body>
+</html>
+"""
+
+_OFFLINE_HTML = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<title>FAFU 机械臂站控</title>
+<style>""" + _PAGE_CSS + """</style>
 </head>
 <body>
   <div class="box">
@@ -55,6 +83,7 @@ _OFFLINE_HTML = """<!DOCTYPE html>
     <p>目标：<code>{url}</code></p>
     <p>日志：%TEMP%\\fafu-station-app.log</p>
     <button onclick="retry()">重新连接</button>
+    <!-- host={host} -->
   </div>
   <script>
     function retry() {{
@@ -86,6 +115,17 @@ def _alert(text: str, title: str = APP_TITLE) -> None:
             ctypes.windll.user32.MessageBoxW(0, text, title, 0x10)
             return
         except Exception:
+            pass
+    zenity = shutil.which("zenity")
+    if zenity:
+        try:
+            subprocess.run(
+                [zenity, "--error", f"--title={title}", "--width=480", f"--text={text}"],
+                timeout=180,
+                check=False,
+            )
+            return
+        except (OSError, subprocess.TimeoutExpired):
             pass
     print(text, file=sys.stderr)
 
@@ -301,9 +341,14 @@ def _spawn_local_station(web_only: bool = False, *, replace_web: bool = False) -
         env = child_env(root)
     except Exception:
         env = os.environ.copy()
+    if _live_arm_wanted():
+        # USB 热插拔：调试板插上时自动把臂源切到真机（不自动使能），
+        # 作业相机插拔时自动重认。见 robot_station/usb_watch.py。
+        env["STATION_ARM_WATCH"] = "1"
+        env["STATION_CAMERA_WATCH"] = "1"
     log_fh = None
     try:
-        log_fh = LOG.open("a", encoding="utf-8")
+        log_fh = HOST_LOG.open("a", encoding="utf-8")
     except OSError:
         log_fh = subprocess.DEVNULL
     kwargs: dict = {
@@ -414,8 +459,50 @@ def _ensure_local_station(port: int) -> tuple[bool, subprocess.Popen | None]:
     if motion_up:
         _log(f"port {port} down, motion :{MOTION_PORT} still up — web-only (do not kill arm)")
         return _spawn_and_wait(port, web_only=True)
-    _log(f"port {port} down, starting host")
+        _log(f"port {port} down, starting host")
     return _spawn_and_wait(port, web_only=False)
+
+
+def _kickoff_local_station(port: int) -> tuple[bool, subprocess.Popen | None]:
+    """Start or attach the host without waiting on USB / 9470 boot.
+
+    The window must open first. Return ``(page_ready, child)``.
+    ``page_ready`` means :9400 is already serving this tree.
+    """
+    http_up = _port_open("127.0.0.1", port)
+    motion_up = _motion_up()
+    if http_up and motion_up:
+        if _live_arm_wanted() and not _running_code_matches(port):
+            _log(
+                f"motion :{MOTION_PORT} is up but code_rev != disk; "
+                "spawn --replace in background so the window can open"
+            )
+            return False, _spawn_local_station(web_only=False)
+        if _live_arm_wanted() and _has_pinocchio():
+            info = _station_info(port)
+            if info and not bool(info.get("dyn_ready")):
+                _log(
+                    "this Python has pinocchio but live station dyn_ready=false; "
+                    "spawn --replace in background so SDK gravity_compensation_step can load"
+                )
+                return False, _spawn_local_station(web_only=False)
+        _log(f"attach existing :{port} (motion :{MOTION_PORT} up, never replace while motion)")
+        return True, None
+    if http_up and _live_arm_wanted():
+        info = _station_info(port)
+        arm = str((info or {}).get("arm") or "")
+        _log(
+            f"live arm requested; existing :{port} is arm={arm or 'unknown'} "
+            f"camera={(info or {}).get('camera') or 'unknown'} without motion, replacing"
+        )
+        return False, _spawn_local_station(web_only=False)
+    if http_up:
+        return True, None
+    if motion_up:
+        _log(f"port {port} down, motion :{MOTION_PORT} still up — web-only (do not kill arm)")
+        return False, _spawn_local_station(web_only=True)
+    _log(f"port {port} down, starting host (window first)")
+    return False, _spawn_local_station(web_only=False)
 
 
 def _guard_web(
@@ -549,7 +636,8 @@ def _load_webview():
         if portable:
             _alert(
                 "便携包缺少独立窗口组件 pywebview。\n"
-                "请用 packaging\\windows\\build_portable.ps1 重新打包，"
+                "Windows：请用 packaging\\windows\\build_portable.ps1 重新打包。\n"
+                "Ubuntu：请用 packaging/linux/build_appimage.sh 重新打包。\n"
                 "不要对系统 Python 执行 pip。"
             )
             return None
@@ -571,7 +659,14 @@ def _load_webview():
             return None
 
 
-def _start_webview(url: str, ready: bool, host: str, port: int, path: str) -> int:
+def _start_webview(
+    url: str,
+    ready: bool,
+    host: str,
+    port: int,
+    path: str,
+    child: subprocess.Popen | None = None,
+) -> int:
     webview = _load_webview()
     if webview is None:
         return 1
@@ -594,25 +689,36 @@ def _start_webview(url: str, ready: bool, host: str, port: int, path: str) -> in
     if ready:
         window_kwargs["url"] = url
     else:
-        window_kwargs["html"] = _OFFLINE_HTML.format(url=url, host=host, port=port)
+        window_kwargs["html"] = _LOADING_HTML.format(url=url, host=host, port=port)
     window = webview.create_window(**window_kwargs)
     holder["window"] = window
     halt = threading.Event()
     state = {"offline": not ready}
 
     def _after_start() -> None:
-        if (not ready) and _wait_ready(host, port, 2.0):
-            try:
-                window.load_url(url)
-                state["offline"] = False
-            except Exception as exc:
-                _log(f"late load failed: {exc}")
         threading.Thread(
             target=_guard_web,
             args=(window, host, port, path, halt, state),
             name="web-guard",
             daemon=True,
         ).start()
+        if ready:
+            return
+        if _wait_ready(host, port, WAIT_S, child):
+            try:
+                window.load_url(url)
+                state["offline"] = False
+                _log("control page loaded")
+            except Exception as exc:
+                _log(f"late load failed: {exc}")
+            return
+        if not state.get("offline"):
+            return
+        try:
+            window.load_html(_OFFLINE_HTML.format(url=url, host=host, port=port))
+            _log("host did not listen; showing offline page")
+        except Exception as exc:
+            _log(f"offline page failed: {exc}")
 
     _log(f"window {url} ready={ready}")
     start_kwargs = {
@@ -621,19 +727,28 @@ def _start_webview(url: str, ready: bool, host: str, port: int, path: str) -> in
     }
     if os.name == "nt":
         start_kwargs["gui"] = "edgechromium"
+    else:
+        start_kwargs["gui"] = "gtk"
     try:
         try:
             webview.start(_after_start, **start_kwargs)
             return 0
         except Exception as exc:
-            _log(f"edgechromium failed: {exc}")
-            try:
-                start_kwargs.pop("gui", None)
-                webview.start(_after_start, **start_kwargs)
-                return 0
-            except Exception as exc2:
-                _alert(f"无法打开站控窗口：{exc2}")
-                return 1
+            _log(f"primary gui failed: {exc}")
+            if os.name == "nt":
+                try:
+                    start_kwargs.pop("gui", None)
+                    webview.start(_after_start, **start_kwargs)
+                    return 0
+                except Exception as exc2:
+                    _alert(f"无法打开站控窗口：{exc2}")
+                    return 1
+            _alert(
+                "无法打开独立控制窗口（需要 WebKitGTK / pywebview GTK 后端）。\n"
+                f"{exc}\n\n请使用官方 AppImage，或安装：\n"
+                "sudo apt install gir1.2-webkit2-4.0 gir1.2-gtk-3.0"
+            )
+            return 1
     finally:
         halt.set()
 
@@ -655,15 +770,13 @@ def main() -> int:
     host = (args.host or "127.0.0.1").strip() or "127.0.0.1"
 
     _log(f"launch desktop exe={sys.executable}")
-    ready, child = _ensure_local_station(args.port)
+    ready, child = _kickoff_local_station(args.port)
     if host not in ("127.0.0.1", "localhost") and not _port_open(host, args.port):
         host = "127.0.0.1"
     path = _norm_path(args.path)
     url = _make_url(host, args.port, path)
-    if ready:
-        ready = _wait_ready(host, args.port, 2.0)
     try:
-        return _start_webview(url, ready, host, args.port, path)
+        return _start_webview(url, ready, host, args.port, path, child)
     finally:
         if _station_should_outlive_window():
             _log("window closed; leave station running (do not kill arm / web)")

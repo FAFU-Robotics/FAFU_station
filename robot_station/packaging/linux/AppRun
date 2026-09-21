@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# Type 2 AppImage entry: private CPython + GTK window. Process-local env only.
+set -euo pipefail
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+export APPDIR="${APPDIR:-$HERE}"
+export STATION_PORTABLE=1
+export STATION_INSTALL_ROOT="$APPDIR"
+export STATION_ALLOW_LIVE_ARM=1
+export STATION_ARM_WATCH=1
+export STATION_CAMERA_WATCH=1
+export PYTHONNOUSERSITE=1
+export PIP_USER=0
+unset PYTHONSTARTUP || true
+unset PYTHONHOME || true
+unset PYTHONUSERBASE || true
+
+APP="$APPDIR/app"
+export PYTHONPATH="$APP"
+if [ -d "$APP/urdf" ]; then
+  export STATION_URDF_DIR="$APP/urdf"
+fi
+SDK="$APP/vendor/fafu_arm_sdk"
+if [ -d "$SDK/fafu_robot_python" ]; then
+  export FAFU_ARM_SDK="$SDK"
+fi
+
+PYDIR="$APPDIR/runtime/python310"
+PY="$PYDIR/bin/python3"
+if [ ! -x "$PY" ]; then
+  PY="$PYDIR/bin/python"
+fi
+if [ ! -x "$PY" ]; then
+  echo "便携包不完整：找不到 runtime/python310/bin/python3" >&2
+  exit 1
+fi
+
+export PATH="$PYDIR/bin:${PATH:-}"
+
+LIB_DIRS=()
+for d in \
+  "$APPDIR/usr/lib" \
+  "$APPDIR/usr/lib/x86_64-linux-gnu" \
+  "$APPDIR/usr/lib64" \
+  "$PYDIR/lib" \
+  "$SDK/fafu_robot_python"
+do
+  if [ -d "$d" ]; then
+    LIB_DIRS+=("$d")
+  fi
+done
+if [ "${#LIB_DIRS[@]}" -gt 0 ]; then
+  joined="$(IFS=:; echo "${LIB_DIRS[*]}")"
+  export LD_LIBRARY_PATH="$joined${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
+
+# Bundled GTK from Ubuntu 22.04 must not mix with the host GTK (24.04 ABI).
+export GDK_BACKEND="${GDK_BACKEND:-x11}"
+if [ -d "$APPDIR/usr/lib/girepository-1.0" ]; then
+  export GI_TYPELIB_PATH="$APPDIR/usr/lib/girepository-1.0${GI_TYPELIB_PATH:+:$GI_TYPELIB_PATH}"
+fi
+if [ -d "$APPDIR/usr/lib/x86_64-linux-gnu/girepository-1.0" ]; then
+  export GI_TYPELIB_PATH="$APPDIR/usr/lib/x86_64-linux-gnu/girepository-1.0${GI_TYPELIB_PATH:+:$GI_TYPELIB_PATH}"
+fi
+if [ -f "$APPDIR/usr/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache" ]; then
+  export GDK_PIXBUF_MODULE_FILE="$APPDIR/usr/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache"
+fi
+if [ -d "$APPDIR/usr/lib/gdk-pixbuf-2.0/2.10.0/loaders" ]; then
+  export GDK_PIXBUF_MODULE_FILE="${GDK_PIXBUF_MODULE_FILE:-$APPDIR/usr/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache}"
+fi
+
+cd "$APP"
+if [ "${STATION_SKIP_PREFLIGHT:-}" != "1" ]; then
+  "$PY" -m robot_station.linux_preflight --interactive || exit $?
+fi
+exec "$PY" -u "$APP/station_desktop.py" "$@"

@@ -2,10 +2,11 @@
 
 The portable layout is::
 
-    FAFUArmStation/
-      FAFUArmStation.exe
-      runtime/python310/     # embeddable CPython, not on PATH
-      app/                   # station sources (this package lives here)
+    FAFUArmStation/                  # Windows tree or AppImage AppDir
+      runtime/python310/             # private CPython, not on PATH
+        python.exe                   # Windows
+        bin/python3                  # Linux / AppImage
+      app/                           # station sources (this package lives here)
 
 Launchers set process-local environment only. They must not write
 user/system PATH, install a global Python, or pip into the customer's
@@ -13,8 +14,8 @@ interpreter.
 
 ``STATION_PORTABLE=1`` alone is not enough: a leftover flag in a developer
 shell must not hijack the system interpreter. Portable mode requires the
-bundled ``runtime/python310`` layout (or ``STATION_INSTALL_ROOT`` pointing
-at one).
+bundled ``runtime/python310`` layout (or ``STATION_INSTALL_ROOT`` / ``APPDIR``
+pointing at one).
 """
 from __future__ import annotations
 
@@ -38,27 +39,89 @@ def _is_under(path: Path, root: Path) -> bool:
         return False
 
 
+def _exe_name(path: Path) -> str:
+    return path.name.lower()
+
+
 def looks_like_bundled_python(executable: str | None = None) -> bool:
-    """True when the interpreter path is ``.../runtime/python310/python.exe``."""
-    exe = Path(executable or sys.executable).resolve()
+    """True when the interpreter lives under ``runtime/python310``.
+
+    Windows: ``.../runtime/python310/python.exe``
+    POSIX / AppImage: ``.../runtime/python310/bin/python3``
+    """
+    exe = Path(executable or sys.executable)
+    try:
+        exe = exe.resolve()
+    except OSError:
+        pass
+    name = _exe_name(exe)
+    if not name.startswith("python"):
+        return False
     parent = exe.parent
-    return parent.name.lower() == "python310" and parent.parent.name.lower() == "runtime"
+    if parent.name.lower() == "python310" and parent.parent.name.lower() == "runtime":
+        return True
+    if (
+        parent.name.lower() == "bin"
+        and parent.parent.name.lower() == "python310"
+        and parent.parent.parent.name.lower() == "runtime"
+    ):
+        return True
+    return False
+
+
+def _install_root_from_exe(exe: Path) -> Path | None:
+    parent = exe.parent
+    if parent.name.lower() == "python310" and parent.parent.name.lower() == "runtime":
+        return parent.parent.parent
+    if (
+        parent.name.lower() == "bin"
+        and parent.parent.name.lower() == "python310"
+        and parent.parent.parent.name.lower() == "runtime"
+    ):
+        return parent.parent.parent.parent
+    return None
+
+
+def bundled_python_exe(root: Path) -> Path | None:
+    """Private interpreter under ``root/runtime/python310``, if present."""
+    py_dir = root / "runtime" / "python310"
+    win = py_dir / "python.exe"
+    if win.is_file():
+        return win
+    for name in ("python3", "python"):
+        posix = py_dir / "bin" / name
+        if posix.is_file() or posix.is_symlink():
+            return posix
+    return None
+
+
+def _has_bundled_runtime(root: Path) -> bool:
+    return bundled_python_exe(root) is not None
 
 
 def install_root() -> Path | None:
     """Install directory that contains ``runtime`` and ``app``, if any."""
     if looks_like_bundled_python():
-        root = Path(sys.executable).resolve().parent.parent.parent
-        if (root / "app" / "run_station.py").is_file():
+        exe = Path(sys.executable)
+        try:
+            exe = exe.resolve()
+        except OSError:
+            pass
+        root = _install_root_from_exe(exe)
+        if root is not None:
+            if (root / "app" / "run_station.py").is_file() or _has_bundled_runtime(root):
+                return root
+    for key in ("STATION_INSTALL_ROOT", "APPDIR"):
+        raw = (os.environ.get(key) or "").strip()
+        if not raw:
+            continue
+        root = Path(raw).expanduser()
+        try:
+            root = root.resolve()
+        except OSError:
+            pass
+        if _has_bundled_runtime(root):
             return root
-        if (root / "runtime" / "python310" / "python.exe").is_file():
-            return root
-    env_root = (os.environ.get("STATION_INSTALL_ROOT") or "").strip()
-    if not env_root:
-        return None
-    root = Path(env_root).expanduser().resolve()
-    if (root / "runtime" / "python310" / "python.exe").is_file():
-        return root
     return None
 
 
@@ -136,9 +199,12 @@ def _private_python_dir() -> Path:
     inst = install_root()
     if inst is not None:
         bundled = inst / "runtime" / "python310"
-        if (bundled / "python.exe").is_file() or bundled.is_dir():
+        if bundled_python_exe(inst) is not None or bundled.is_dir():
             return bundled
-    return Path(sys.executable).resolve().parent
+    exe = Path(sys.executable).resolve()
+    if exe.parent.name.lower() == "bin":
+        return exe.parent.parent
+    return exe.parent
 
 
 def _native_bin_dirs(py_dir: Path) -> list[Path]:
@@ -146,18 +212,37 @@ def _native_bin_dirs(py_dir: Path) -> list[Path]:
     return [py_dir / "Library" / "bin", py_dir / "bin", py_dir, py_dir / "Scripts"]
 
 
-def _prepend_native_path(env: dict[str, str], py_dir: Path) -> None:
-    extras = [d for d in _native_bin_dirs(py_dir) if d.is_dir()]
-    if not extras:
-        extras = [py_dir]
-    path = env.get("PATH") or ""
-    parts = [p for p in path.split(os.pathsep) if p]
+def _native_lib_dirs(py_dir: Path) -> list[Path]:
+    """Directories that must be on ``LD_LIBRARY_PATH`` for ``fafu_motor`` / GTK."""
+    dirs: list[Path] = [
+        py_dir / "lib",
+        py_dir / "lib64",
+        py_dir / "Library" / "lib",
+    ]
+    inst = install_root()
+    if inst is not None:
+        dirs.extend(
+            (
+                inst / "usr" / "lib",
+                inst / "usr" / "lib" / "x86_64-linux-gnu",
+                inst / "usr" / "lib64",
+            )
+        )
+    sdk = bundled_sdk_dir()
+    if sdk is not None:
+        dirs.append(sdk / "fafu_robot_python")
+    return dirs
+
+
+def _prepend_env_path(env: dict[str, str], name: str, extras: list[Path]) -> None:
+    existing = env.get(name) or ""
+    parts = [p for p in existing.split(os.pathsep) if p]
     resolved: set[str] = set()
     for part in parts:
         try:
             resolved.add(str(Path(part).resolve()))
         except (OSError, ValueError):
-            continue
+            resolved.add(part)
     prefix: list[str] = []
     for folder in extras:
         try:
@@ -168,10 +253,20 @@ def _prepend_native_path(env: dict[str, str], py_dir: Path) -> None:
             prefix.append(str(folder))
             resolved.add(key)
     if prefix:
-        env["PATH"] = os.pathsep.join(prefix + parts)
+        env[name] = os.pathsep.join(prefix + parts)
+
+
+def _prepend_native_path(env: dict[str, str], py_dir: Path) -> None:
+    extras = [d for d in _native_bin_dirs(py_dir) if d.is_dir()]
+    if not extras:
+        extras = [py_dir]
+    _prepend_env_path(env, "PATH", extras)
     libbin = py_dir / "Library" / "bin"
     if libbin.is_dir():
         env["PINOCCHIO_WINDOWS_DLL_PATH"] = str(libbin)
+    lib_dirs = [d for d in _native_lib_dirs(py_dir) if d.is_dir()]
+    if lib_dirs:
+        _prepend_env_path(env, "LD_LIBRARY_PATH", lib_dirs)
 
 
 def apply_bundled_runtime() -> bool:

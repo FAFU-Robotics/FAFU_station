@@ -31,6 +31,7 @@ class StationLaunchFilesTests(unittest.TestCase):
         self.assertFalse((ROOT / "启动站控.bat").is_file())
         self.assertFalse((ROOT / "打开界面.bat").is_file())
         self.assertTrue((ROOT / "启动真机.bat").is_file())
+        self.assertTrue((ROOT / "启动真机.sh").is_file())
         self.assertTrue((ROOT / "station_desktop.py").is_file())
         self.assertTrue((ROOT / "scripts/verify_sim_arm.py").is_file())
         self.assertTrue((ROOT / "scripts/rebuild_fafu_motor.bat").is_file())
@@ -42,11 +43,18 @@ class StationLaunchFilesTests(unittest.TestCase):
         self.assertIn(b"Python310", live)
         self.assertIn(b"STATION_PORTABLE", live)
         self.assertIn(b"runtime\\python310", live)
-        self.assertIn(b"install_home", live)
-        self.assertIn(b"LOCALAPPDATA", live)
-        self.assertIn(b"FAFUArmStation.exe", live)
+        self.assertNotIn(b"install_home", live)
+        self.assertIn(b"goto portable", live)
+        self.assertIn(b"STATION_URDF_DIR", live)
         self.assertNotIn(b"setx", live.lower())
         self.assertEqual(live, (ROOT / "start_live_arm.bat").read_bytes())
+        live_sh = (ROOT / "启动真机.sh").read_text(encoding="utf-8")
+        self.assertIn("STATION_ALLOW_LIVE_ARM=1", live_sh)
+        self.assertIn("station_desktop.py", live_sh)
+        self.assertIn("STATION_PORTABLE", live_sh)
+        self.assertIn("runtime/python310", live_sh)
+        self.assertIn("linux_preflight", live_sh)
+        self.assertNotIn("setx", live_sh.lower())
         self.assertTrue((ROOT / "packaging/windows/build_portable.ps1").is_file())
         self.assertTrue((ROOT / "packaging/windows/PortableLauncher.cs").is_file())
         desktop = (ROOT / "station_desktop.py").read_text(encoding="utf-8")
@@ -65,7 +73,15 @@ class StationLaunchFilesTests(unittest.TestCase):
         self.assertIn("boot_rev", desktop)
         self.assertIn("_has_pinocchio", desktop)
         self.assertIn("dyn_ready=false", desktop)
-        self.assertIn(b"pick_pinocchio", live)
+        self.assertIn("_kickoff_local_station", desktop)
+        self.assertIn("_LOADING_HTML", desktop)
+        self.assertIn('start_kwargs["gui"] = "gtk"', desktop)
+        self.assertIn("edgechromium", desktop)
+        self.assertIn("正在启动机械臂站控", desktop)
+        self.assertIn("_wait_ready(host, port, WAIT_S", desktop)
+        self.assertIn("HOST_LOG", desktop)
+        self.assertIn("fafu-station-host.log", desktop)
+        self.assertIn(b"pick_py310", live)
         self.assertIn(b"pinocchio", live)
         self.assertIn(b"PINOCCHIO_WINDOWS_DLL_PATH", live)
         self.assertIn(b"Library\\bin", live)
@@ -86,7 +102,8 @@ class StationLaunchFilesTests(unittest.TestCase):
         self.assertIn("code_rev", spec)
         self.assertIn("只补 `--web-only`", spec)
         self.assertNotIn("工控机", spec)
-        self.assertNotIn("Jetson", spec)
+        self.assertIn("Jetson", spec)
+        self.assertIn("不要在 Jetson", spec)
         self.assertNotIn("FAFU-ARM", spec)
         self.assertNotIn("bunker-local", spec)
         self.assertNotIn("--discover", desktop)
@@ -313,6 +330,75 @@ class StationLaunchFilesTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertIs(proc, child)
         spawn.assert_called_once_with(9400, web_only=True)
+
+    def test_kickoff_attaches_when_motion_up(self) -> None:
+        import station_desktop as sd
+
+        def ports(_host: str, port: int, *_a: object, **_k: object) -> bool:
+            return int(port) in (9400, 9470)
+
+        with (
+            patch.object(sd, "_live_arm_wanted", return_value=True),
+            patch.object(sd, "_port_open", side_effect=ports),
+            patch.object(sd, "_running_code_matches", return_value=True),
+            patch.object(sd, "_has_pinocchio", return_value=False),
+            patch.object(sd, "_spawn_local_station") as spawn,
+            patch.object(sd, "_spawn_and_wait") as wait,
+        ):
+            ok, proc = sd._kickoff_local_station(9400)
+        self.assertTrue(ok)
+        self.assertIsNone(proc)
+        spawn.assert_not_called()
+        wait.assert_not_called()
+
+    def test_kickoff_spawns_without_waiting(self) -> None:
+        import station_desktop as sd
+        from unittest.mock import MagicMock
+
+        child = MagicMock()
+        with (
+            patch.object(sd, "_live_arm_wanted", return_value=True),
+            patch.object(sd, "_port_open", return_value=False),
+            patch.object(sd, "_motion_up", return_value=False),
+            patch.object(sd, "_spawn_local_station", return_value=child) as spawn,
+            patch.object(sd, "_spawn_and_wait") as wait,
+        ):
+            ok, proc = sd._kickoff_local_station(9400)
+        self.assertFalse(ok)
+        self.assertIs(proc, child)
+        spawn.assert_called_once_with(web_only=False)
+        wait.assert_not_called()
+
+    def test_kickoff_replaces_stale_code_without_waiting(self) -> None:
+        import station_desktop as sd
+        from unittest.mock import MagicMock
+
+        child = MagicMock()
+
+        def ports(_host: str, port: int, *_a: object, **_k: object) -> bool:
+            return int(port) in (9400, 9470)
+
+        with (
+            patch.object(sd, "_live_arm_wanted", return_value=True),
+            patch.object(sd, "_port_open", side_effect=ports),
+            patch.object(sd, "_running_code_matches", return_value=False),
+            patch.object(sd, "_spawn_local_station", return_value=child) as spawn,
+            patch.object(sd, "_spawn_and_wait") as wait,
+        ):
+            ok, proc = sd._kickoff_local_station(9400)
+        self.assertFalse(ok)
+        self.assertIs(proc, child)
+        spawn.assert_called_once_with(web_only=False)
+        wait.assert_not_called()
+
+    def test_loading_html_formats(self) -> None:
+        import station_desktop as sd
+
+        html = sd._LOADING_HTML.format(url="http://127.0.0.1:9400/", host="127.0.0.1", port=9400)
+        self.assertIn("正在启动机械臂站控", html)
+        self.assertIn("http://127.0.0.1:9400/", html)
+        offline = sd._OFFLINE_HTML.format(url="http://127.0.0.1:9400/", host="127.0.0.1", port=9400)
+        self.assertIn("本机站控未启动", offline)
 
     def test_station_outlives_window_when_live_or_motion_up(self) -> None:
         import sys

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=FAFU 机械臂站控
+Comment=FAFU arm station host
+Exec=AppRun
+Icon=FAFUArmStation
+Terminal=false
+Categories=Science;Engineering;
+StartupNotify=true
+X-AppImage-Name=FAFUArmStation

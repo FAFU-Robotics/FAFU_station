@@ -1,0 +1,10 @@
+# Nested copy: GitHub only runs workflows from the repository root.
+# Canonical file: /.github/workflows/packaging-smoke.yml
+name: packaging-smoke-nested-pointer
+on:
+  workflow_dispatch:
+jobs:
+  pointer:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Use the repo-root workflow .github/workflows/packaging-smoke.yml"
