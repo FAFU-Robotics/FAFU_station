@@ -311,11 +311,10 @@ export PATH="$CACHE:$PATH"
 export LINUXDEPLOY_PLUGIN_GTK="$PLUGIN_GTK"
 export DEPLOY_GTK_VERSION=3
 export APPIMAGE_EXTRACT_AND_RUN=1
+# Only gtk-probe is passed to linuxdeploy. Bundled Python is launched from AppRun;
+# feeding it as --executable makes linuxdeploy ldd the interpreter and usually fail.
 LD_ARGS=(--appdir "$OUT_DIR" --desktop-file "$OUT_DIR/fafu-arm-station.desktop" --icon-file "$ICON_DST")
 LD_ARGS+=(--executable "$OUT_DIR/usr/bin/gtk-probe" --plugin gtk)
-if [ -x "$PY" ]; then
-  LD_ARGS+=(--executable "$PY")
-fi
 # linuxdeploy may rewrite AppRun; restore ours afterwards.
 # A failed deploy must not wrap a GTK-less squashfs for customers.
 if ! "$LINUXDEPLOY" "${LD_ARGS[@]}"; then

@@ -7,6 +7,7 @@ from pathlib import Path
 
 KEYS = (
     "error:",
+    "ERROR",
     "fatal error",
     "CMake Error",
     "FAILED",
@@ -22,6 +23,7 @@ KEYS = (
     "fafu_motor.so was not produced",
     "python3 missing",
     "OS Support seems wrong",
+    "linuxdeploy failed",
 )
 
 

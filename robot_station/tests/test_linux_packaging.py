@@ -118,7 +118,7 @@ class LinuxPackagingFilesTests(unittest.TestCase):
 
     def test_desktop_and_udev(self) -> None:
         desktop = (PACK / "fafu-arm-station.desktop").read_text(encoding="utf-8")
-        self.assertIn("Exec=AppRun", desktop)
+        self.assertIn("Exec=gtk-probe", desktop)
         self.assertIn("Icon=FAFUArmStation", desktop)
         rules = (PACK / "99-fafu-debug-board.rules").read_text(encoding="utf-8")
         self.assertIn("fafu_debug_board", rules)

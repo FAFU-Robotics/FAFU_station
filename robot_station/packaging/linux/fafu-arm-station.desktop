@@ -2,7 +2,7 @@
 Type=Application
 Name=FAFU 机械臂站控
 Comment=FAFU arm station host
-Exec=AppRun
+Exec=gtk-probe
 Icon=FAFUArmStation
 Terminal=false
 Categories=Science;Engineering;
