@@ -43,11 +43,13 @@ def _fake_linux_install(tmp: str) -> Path:
 
 class PortableDetectTests(unittest.TestCase):
     def test_bundled_python_path_shape(self) -> None:
-        self.assertTrue(
-            looks_like_bundled_python(r"C:\Users\x\FAFUArmStation\runtime\python310\python.exe")
-        )
-        self.assertFalse(looks_like_bundled_python(r"C:\Users\x\AppData\Local\Programs\Python\Python310\python.exe"))
-        self.assertFalse(looks_like_bundled_python(r"C:\Python310\python.exe"))
+        # pathlib on POSIX cannot parse Windows drive paths; skip those there.
+        if os.name == "nt":
+            self.assertTrue(
+                looks_like_bundled_python(r"C:\Users\x\FAFUArmStation\runtime\python310\python.exe")
+            )
+            self.assertFalse(looks_like_bundled_python(r"C:\Users\x\AppData\Local\Programs\Python\Python310\python.exe"))
+            self.assertFalse(looks_like_bundled_python(r"C:\Python310\python.exe"))
         self.assertTrue(
             looks_like_bundled_python("/opt/FAFUArmStation/runtime/python310/bin/python3")
         )
