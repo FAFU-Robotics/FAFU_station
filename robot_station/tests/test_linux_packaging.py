@@ -57,6 +57,7 @@ class LinuxPackagingFilesTests(unittest.TestCase):
         self.assertIn("not wrapping a customer AppImage", script)
         self.assertNotIn("pyinstaller", script.lower())
         self.assertIn("appimagetool", script)
+        self.assertIn("appimagetool/releases/download/1.9.1/", script)
         self.assertIn("linuxdeploy", script)
         self.assertIn("gtk_probe", script)
         self.assertIn("APPIMAGE_EXTRACT_AND_RUN=1", script)

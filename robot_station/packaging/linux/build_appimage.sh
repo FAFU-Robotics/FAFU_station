@@ -11,7 +11,7 @@ PY_VER="${PY_VER:-3.10.15}"
 STANDALONE_TAG="${STANDALONE_TAG:-20241016}"
 # Pinned tools (never linuxdeploy/appimagetool "continuous" tags).
 LINUXDEPLOY_URL="${LINUXDEPLOY_URL:-https://github.com/linuxdeploy/linuxdeploy/releases/download/1-alpha-20250213-2/linuxdeploy-x86_64.AppImage}"
-APPIMAGETOOL_URL="${APPIMAGETOOL_URL:-https://github.com/AppImage/AppImageKit/releases/download/13/appimagetool-x86_64.AppImage}"
+APPIMAGETOOL_URL="${APPIMAGETOOL_URL:-https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage}"
 PLUGIN_GTK_URL="${PLUGIN_GTK_URL:-https://raw.githubusercontent.com/linuxdeploy/linuxdeploy-plugin-gtk/3b67a1d1c1b0c8268f57f2bce40fe2d33d409cea/linuxdeploy-plugin-gtk.sh}"
 ALLOW_NO_SDK=0
 SKIP_IMAGE=0
