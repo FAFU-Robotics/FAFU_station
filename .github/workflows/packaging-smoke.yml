@@ -38,6 +38,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.10"
+      - name: Install test deps
+        run: python -m pip install --upgrade pip websockets PyYAML numpy
       - name: Unit tests (footer, sources, csc stub)
         run: python -m unittest tests.test_single_exe tests.test_portable -v
       - name: Pack fake tree into FAFUEXE1 exe
@@ -65,6 +67,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.10"
+      - name: Install test deps
+        run: python -m pip install --upgrade pip websockets PyYAML numpy
       - name: Linux packaging unit tests
         run: python -m unittest tests.test_portable tests.test_linux_packaging tests.test_linux_preflight tests.test_camera_detect -v
 
@@ -111,7 +115,20 @@ jobs:
         env:
           FAFU_ARM_SDK: ${{ github.workspace }}/fafu_arm_sdk
           APPIMAGE_EXTRACT_AND_RUN: "1"
-        run: bash robot_station/packaging/linux/build_appimage.sh
+        run: |
+          set -euo pipefail
+          sed -i 's/\r$//' robot_station/packaging/linux/*.sh robot_station/packaging/linux/AppRun || true
+          mkdir -p robot_station/dist
+          bash robot_station/packaging/linux/build_appimage.sh 2>&1 | tee robot_station/dist/appimage-build.log
+          test "${PIPESTATUS[0]}" -eq 0
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: appimage-build-log
+          path: robot_station/dist/appimage-build.log
+          if-no-files-found: ignore
+          retention-days: 7
       - name: Upload AppImage
         uses: actions/upload-artifact@v4
         with:

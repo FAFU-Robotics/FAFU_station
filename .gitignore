@@ -15,6 +15,7 @@ robot_station/configs/station.yaml
 robot_station/urdf/.selected
 robot_station/dist/
 robot_station/packaging/windows/cache/
+robot_station/packaging/linux/cache/
 
 # SDK build intermediates (runtime .pyd/.dll stay tracked)
 build*/
