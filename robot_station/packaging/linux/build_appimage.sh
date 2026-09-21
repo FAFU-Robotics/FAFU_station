@@ -154,7 +154,8 @@ echo "Installing pip packages into private runtime"
 "$PY" -m pip install --no-warn-script-location --no-user -U pip setuptools wheel
 core_req="$(mktemp)"
 grep -vE '^[[:space:]]*(#|$)' "$REPO/requirements.txt" | grep -viE '^pyrealsense2' > "$core_req"
-"$PY" -m pip install --no-warn-script-location --no-user -r "$core_req" numpy pybind11 pycairo PyGObject
+"$PY" -m pip install --no-warn-script-location --no-user -r "$core_req" numpy pybind11 \
+  'pycairo>=1.20,<2' 'PyGObject>=3.42,<3.52'
 rm -f "$core_req"
 if ! "$PY" -m pip install --no-warn-script-location --no-user 'pyrealsense2>=2.54'; then
   echo "WARNING: pyrealsense2 not installed; camera stays mock until a cp310 Linux wheel is available"
