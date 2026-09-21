@@ -40,6 +40,36 @@ done
 echo "Repo:    $REPO"
 echo "AppDir:  $OUT_DIR"
 
+fetch_url() {
+  local url="$1" dest="$2"
+  echo "Downloading $url"
+  rm -f "$dest"
+  mkdir -p "$(dirname "$dest")"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fL --retry 5 --retry-delay 2 --connect-timeout 30 \
+      -A "FAFUArmStation-pack/1.0" -o "$dest" "$url"
+  else
+    wget -U "FAFUArmStation-pack/1.0" -O "$dest" "$url"
+  fi
+  if [ ! -s "$dest" ]; then
+    echo "download empty: $url" >&2
+    exit 1
+  fi
+}
+
+require_gzip() {
+  local f="$1"
+  local magic
+  magic="$(od -An -tx1 -N2 "$f" | tr -d ' \n')"
+  if [ "$magic" != "1f8b" ]; then
+    echo "not gzip: $f (magic $magic)" >&2
+    file "$f" >&2 || true
+    head -c 240 "$f" >&2 || true
+    echo >&2
+    exit 1
+  fi
+}
+
 find_sdk() {
   local c
   for c in \
@@ -94,17 +124,20 @@ install_python() {
   local zip="$CACHE/$tar"
   echo "Downloading relocatable CPython $PY_VER"
   if [ ! -f "$zip" ]; then
-    wget -O "$zip" "$url"
+    fetch_url "$url" "$zip"
   fi
+  require_gzip "$zip"
   rm -rf "$PYDIR"
   mkdir -p "$OUT_DIR/runtime"
   tar -xzf "$zip" -C "$OUT_DIR/runtime"
   if [ -d "$OUT_DIR/runtime/python" ] && [ ! -d "$PYDIR" ]; then
     mv "$OUT_DIR/runtime/python" "$PYDIR"
   fi
+  chmod +x "$PY" 2>/dev/null || true
   if [ ! -x "$PY" ]; then
     echo "python3 missing after extract: $PYDIR" >&2
     ls -la "$OUT_DIR/runtime" >&2 || true
+    ls -la "$PYDIR/bin" >&2 || true
     exit 1
   fi
 }
@@ -118,8 +151,14 @@ export PYTHONPATH="$OUT_DIR/app"
 
 echo "Installing pip packages into private runtime"
 "$PY" -m ensurepip --upgrade >/dev/null 2>&1 || true
-"$PY" -m pip install --no-warn-script-location --no-user -U pip
-"$PY" -m pip install --no-warn-script-location --no-user -r "$REPO/requirements.txt" numpy PyGObject pycairo pybind11
+"$PY" -m pip install --no-warn-script-location --no-user -U pip setuptools wheel
+core_req="$(mktemp)"
+grep -vE '^[[:space:]]*(#|$)' "$REPO/requirements.txt" | grep -viE '^pyrealsense2' > "$core_req"
+"$PY" -m pip install --no-warn-script-location --no-user -r "$core_req" numpy pybind11 pycairo PyGObject
+rm -f "$core_req"
+if ! "$PY" -m pip install --no-warn-script-location --no-user 'pyrealsense2>=2.54'; then
+  echo "WARNING: pyrealsense2 not installed; camera stays mock until a cp310 Linux wheel is available"
+fi
 
 echo "Copying app"
 copy_tree "$REPO/robot_station" "$OUT_DIR/app/robot_station"
@@ -250,15 +289,15 @@ LINUXDEPLOY="$CACHE/linuxdeploy-x86_64.AppImage"
 PLUGIN_GTK="$CACHE/linuxdeploy-plugin-gtk.sh"
 APPIMAGETOOL="$CACHE/appimagetool-x86_64.AppImage"
 if [ ! -f "$LINUXDEPLOY" ]; then
-  wget -O "$LINUXDEPLOY" "$LINUXDEPLOY_URL"
+  fetch_url "$LINUXDEPLOY_URL" "$LINUXDEPLOY"
   chmod +x "$LINUXDEPLOY"
 fi
 if [ ! -f "$PLUGIN_GTK" ]; then
-  wget -O "$PLUGIN_GTK" "$PLUGIN_GTK_URL"
+  fetch_url "$PLUGIN_GTK_URL" "$PLUGIN_GTK"
   chmod +x "$PLUGIN_GTK"
 fi
 if [ ! -f "$APPIMAGETOOL" ]; then
-  wget -O "$APPIMAGETOOL" "$APPIMAGETOOL_URL"
+  fetch_url "$APPIMAGETOOL_URL" "$APPIMAGETOOL"
   chmod +x "$APPIMAGETOOL"
 fi
 

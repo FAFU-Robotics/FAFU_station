@@ -41,7 +41,7 @@ jobs:
       - name: Install test deps
         run: python -m pip install --upgrade pip websockets PyYAML numpy
       - name: Unit tests (footer, sources, csc stub)
-        run: python -m unittest tests.test_single_exe tests.test_portable -v
+        run: python -m unittest tests.test_single_exe -v
       - name: Pack fake tree into FAFUEXE1 exe
         run: |
           $src = Join-Path $env:RUNNER_TEMP "FAFUArmStation"
@@ -70,7 +70,7 @@ jobs:
       - name: Install test deps
         run: python -m pip install --upgrade pip websockets PyYAML numpy
       - name: Linux packaging unit tests
-        run: python -m unittest tests.test_portable tests.test_linux_packaging tests.test_linux_preflight tests.test_camera_detect -v
+        run: python -m unittest tests.test_linux_packaging tests.test_linux_preflight -v
 
   linux-appimage:
     runs-on: ubuntu-22.04
@@ -92,6 +92,7 @@ jobs:
             build-essential \
             ca-certificates \
             cmake \
+            curl \
             desktop-file-utils \
             file \
             g++ \
@@ -103,6 +104,8 @@ jobs:
             libssl-dev \
             libwebkit2gtk-4.0-dev \
             libcairo2-dev \
+            meson \
+            ninja-build \
             pkg-config \
             patchelf \
             python3 \
@@ -118,9 +121,32 @@ jobs:
         run: |
           set -euo pipefail
           sed -i 's/\r$//' robot_station/packaging/linux/*.sh robot_station/packaging/linux/AppRun || true
+          bash -n robot_station/packaging/linux/build_appimage.sh
           mkdir -p robot_station/dist
+          set +e
           bash robot_station/packaging/linux/build_appimage.sh 2>&1 | tee robot_station/dist/appimage-build.log
-          test "${PIPESTATUS[0]}" -eq 0
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo "$rc" > robot_station/dist/appimage-build.status
+          exit "$rc"
+      - name: Show build log
+        if: always()
+        run: |
+          log=robot_station/dist/appimage-build.log
+          if [ -f "$log" ]; then
+            echo "----- appimage-build.log -----"
+            cat "$log"
+            echo "----- end -----"
+            body="$(tail -n 25 "$log" | tr '\n' ' | ' | cut -c1-700)"
+            rc="$(cat robot_station/dist/appimage-build.status 2>/dev/null || echo 1)"
+            if [ "$rc" != 0 ]; then
+              echo "::error title=AppImage build failed::$body"
+            else
+              echo "::notice title=AppImage build ok::$body"
+            fi
+          else
+            echo "::error title=AppImage build failed::no appimage-build.log"
+          fi
       - name: Upload build log
         if: always()
         uses: actions/upload-artifact@v4

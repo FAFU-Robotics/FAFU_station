@@ -66,6 +66,8 @@ class LinuxPackagingFilesTests(unittest.TestCase):
         self.assertIn("FAFUAPP1", script)
         self.assertIn("--plugin gtk", script)
         self.assertIn("cc and gtk+-3.0 are required", script)
+        self.assertIn("curl -fL", script)
+        self.assertIn("fetch_url", script)
         docker = (PACK / "Dockerfile").read_text(encoding="utf-8")
         self.assertIn("APPIMAGE_EXTRACT_AND_RUN=1", docker)
         entry = (PACK / "docker-entrypoint.sh").read_text(encoding="utf-8")
