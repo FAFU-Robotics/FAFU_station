@@ -131,12 +131,31 @@ if [ "$NO_PYTHON" -eq 0 ]; then
     fi
 
     PY_ROOT="$(cd "$(dirname "$PY_EXE")/.." && pwd)"
+    PY_LIB="$(ls "$PY_ROOT"/lib/libpython3*.so 2>/dev/null | head -n1 || true)"
+    PY_INC=""
+    for d in "$PY_ROOT"/include/python3*; do
+        if [ -d "$d" ]; then
+            PY_INC="$d"
+            break
+        fi
+    done
     CMAKE_ARGS+=(
         "-DPython3_EXECUTABLE=$PY_EXE"
         "-DPython3_ROOT_DIR=$PY_ROOT"
         "-DPYTHON_EXECUTABLE=$PY_EXE"
         "-Dpybind11_DIR=$PYBIND11_DIR"
+        "-DCMAKE_BUILD_RPATH=${PY_ROOT}/lib"
     )
+    if [ -n "$PY_LIB" ]; then
+        CMAKE_ARGS+=("-DPython3_LIBRARY=$PY_LIB")
+        echo "  Python lib:    $PY_LIB"
+    fi
+    if [ -n "$PY_INC" ]; then
+        CMAKE_ARGS+=("-DPython3_INCLUDE_DIR=$PY_INC")
+        echo "  Python inc:    $PY_INC"
+    fi
+    export LIBRARY_PATH="${PY_ROOT}/lib${LIBRARY_PATH:+:$LIBRARY_PATH}"
+    export LD_LIBRARY_PATH="${PY_ROOT}/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 fi
 
 echo "============================================================"

@@ -212,6 +212,7 @@ if SDK="$(find_sdk)"; then
   export Python3_ROOT_DIR="$(cd "$(dirname "$PY")/.." && pwd)"
   export CMAKE_PREFIX_PATH="${Python3_ROOT_DIR}${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}"
   export LD_LIBRARY_PATH="${Python3_ROOT_DIR}/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  export LIBRARY_PATH="${Python3_ROOT_DIR}/lib${LIBRARY_PATH:+:$LIBRARY_PATH}"
   "$PY" -m pip install --no-warn-script-location --no-user 'pybind11>=2.12,<3'
   bash "$OUT_DIR/app/vendor/fafu_arm_sdk/fafu_robot_cpp/linux/build.sh" \
     --module-only --python "$PY" --jobs 2
