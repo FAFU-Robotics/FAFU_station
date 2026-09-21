@@ -22,7 +22,7 @@ class LinuxPackagingFilesTests(unittest.TestCase):
         self.assertTrue((PACK / "fafu-arm-station.desktop").is_file())
         self.assertTrue((PACK / "gtk_probe.c").is_file())
         self.assertTrue((PACK / "99-fafu-debug-board.rules").is_file())
-        self.assertTrue((PACK / "build_appimage.bat").is_file())
+        self.assertTrue((PACK / "annotate_gha_log.py").is_file())
         self.assertTrue((ROOT / "robot_station" / "linux_preflight.py").is_file())
         self.assertFalse(
             (ROOT / "robot_station" / "preflight.py").is_file(),
