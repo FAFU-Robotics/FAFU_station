@@ -145,6 +145,7 @@ if [ "$NO_PYTHON" -eq 0 ]; then
         "-DPYTHON_EXECUTABLE=$PY_EXE"
         "-Dpybind11_DIR=$PYBIND11_DIR"
         "-DCMAKE_BUILD_RPATH=${PY_ROOT}/lib"
+        "-DCMAKE_POSITION_INDEPENDENT_CODE=ON"
     )
     if [ -n "$PY_LIB" ]; then
         CMAKE_ARGS+=("-DPython3_LIBRARY=$PY_LIB")

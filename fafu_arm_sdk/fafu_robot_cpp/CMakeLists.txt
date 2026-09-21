@@ -35,6 +35,8 @@ option(FAFU_BUILD_SDK_EXAMPLES     "Build sdk/examples/*.exe"                   
 set(CMAKE_CXX_STANDARD          17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS        OFF)
+# fafu_motor is a shared module; static helpers must be PIC on Linux.
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 if(MSVC)
     add_compile_options(/utf-8 /W3 /bigobj)
