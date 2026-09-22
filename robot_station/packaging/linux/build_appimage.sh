@@ -265,13 +265,16 @@ path.write_bytes(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", zl
 PY
 fi
 
-if ! command -v cc >/dev/null 2>&1 || ! pkg-config --exists gtk+-3.0 2>/dev/null; then
-  echo "cc and gtk+-3.0 are required to bundle GTK into the AppImage" >&2
+if ! command -v cc >/dev/null 2>&1 \
+  || ! pkg-config --exists gtk+-3.0 2>/dev/null \
+  || ! pkg-config --exists webkit2gtk-4.0 2>/dev/null; then
+  echo "cc, gtk+-3.0 and webkit2gtk-4.0 are required to bundle GTK/WebKit into the AppImage" >&2
   exit 1
 fi
-cc -O2 "$PACK_DIR/gtk_probe.c" -o "$OUT_DIR/usr/bin/gtk-probe" $(pkg-config --cflags --libs gtk+-3.0)
+cc -O2 "$PACK_DIR/gtk_probe.c" -o "$OUT_DIR/usr/bin/gtk-probe" \
+  $(pkg-config --cflags --libs gtk+-3.0 webkit2gtk-4.0)
 if [ ! -x "$OUT_DIR/usr/bin/gtk-probe" ]; then
-  echo "gtk-probe was not produced; refusing to wrap without a GTK hook" >&2
+  echo "gtk-probe was not produced; refusing to wrap without a GTK/WebKit hook" >&2
   exit 1
 fi
 
@@ -323,6 +326,11 @@ if ! "$LINUXDEPLOY" "${LD_ARGS[@]}"; then
 fi
 cp -f "$PACK_DIR/AppRun" "$OUT_DIR/AppRun"
 chmod +x "$OUT_DIR/AppRun"
+if ! find "$OUT_DIR/usr" -name 'libwebkit2gtk-4.0.so*' | grep -q . \
+  || ! find "$OUT_DIR/usr" -name 'libjavascriptcoregtk-4.0.so*' | grep -q .; then
+  echo "linuxdeploy did not bundle libwebkit2gtk / libjavascriptcoregtk; refusing customer AppImage" >&2
+  exit 1
+fi
 
 IMAGE_OUT="${IMAGE_OUT:-$REPO/dist/FAFUArmStation-x86_64.AppImage}"
 mkdir -p "$(dirname "$IMAGE_OUT")"
@@ -337,6 +345,12 @@ blob = image.read_bytes() if image.is_file() else b""
 digest = hashlib.sha256(blob).hexdigest() if blob else ""
 sdk_ctrl = appdir / "app/vendor/fafu_arm_sdk/fafu_robot_python/fafu_robot_controller.py"
 motors = sorted(p.name for p in (appdir / "app/vendor/fafu_arm_sdk/fafu_robot_python").glob("fafu_motor.cpython-310*-linux-gnu.so")) if sdk_ctrl.is_file() else []
+webkit = []
+jsc = []
+for folder in (appdir / "usr" / "lib", appdir / "usr" / "lib64", appdir / "usr" / "lib" / "x86_64-linux-gnu"):
+    if folder.is_dir():
+        webkit.extend(sorted(p.name for p in folder.rglob("libwebkit2gtk-4.0.so*")))
+        jsc.extend(sorted(p.name for p in folder.rglob("libjavascriptcoregtk-4.0.so*")))
 man = {
     "magic": "FAFUAPP1",
     "version": version,
@@ -345,6 +359,9 @@ man = {
     "image_sha256": digest,
     "sdk_present": sdk_ctrl.is_file(),
     "fafu_motor": motors[0] if motors else "",
+    "webkit_present": bool(webkit and jsc),
+    "webkit": webkit[0] if webkit else "",
+    "javascriptcore": jsc[0] if jsc else "",
     "uname_m": platform.machine(),
     "glibc": os.popen("ldd --version 2>/dev/null | head -n1").read().strip(),
 }

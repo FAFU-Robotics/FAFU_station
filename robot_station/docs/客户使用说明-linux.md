@@ -72,7 +72,7 @@ chmod +x FAFUArmStation-x86_64.AppImage
 
 ## 4. 常见问题
 
-- **窗口打不开**：确认是官方 AppImage；缺 FUSE 时用上面的 `libfuse2` / `--appimage-extract-and-run`。
+- **窗口打不开**：确认是官方 AppImage；缺 FUSE 时用上面的 `libfuse2` / `--appimage-extract-and-run`。不必安装 Python。若官方 AppImage 仍提示缺少 WebKitGTK，这是包装问题，请向发件方更换新包，不要自行 `apt install python3`。
 - **没有串口 / 无法 Connect**：安装 udev、确认 USB、排除 ModemManager。
 - **作业相机假画面**：确认 D405 已插上，不要用笔记本内置摄像头。
 - 日志：`~/.cache/fafu-station-app.log` 与 `/tmp` 下的 `fafu-station-host.log`（若有）。

@@ -29,21 +29,23 @@
 
 - [ ] 生成 `dist/FAFUArmStation.AppDir/`（含 `runtime/python310/bin/python3`、`app/vendor/fafu_arm_sdk/fafu_robot_python/fafu_robot_controller.py`）
 - [ ] 生成 **`dist/FAFUArmStation-x86_64.AppImage`**
-- [ ] 生成 **`dist/BUILD_MANIFEST.json`**（`magic=FAFUAPP1`，`image_sha256` 与文件一致，`sdk_present=true`）
+- [ ] 生成 **`dist/BUILD_MANIFEST.json`**（`magic=FAFUAPP1`，`image_sha256` 与文件一致，`sdk_present=true`，`webkit_present=true`）
 - [ ] 目录内无 `PUT_SDK_HERE.txt`
 - [ ] 存在 `fafu_motor.cpython-310-*-linux-gnu.so`
+- [ ] AppDir 内存在 `libwebkit2gtk-4.0.so*` 与 `libjavascriptcoregtk-4.0.so*`
 - [ ] `app/VERSION` 有版本号
-- [ ] `verify_appimage.sh` 退出码 0（含 `import fafu_motor`）
+- [ ] `verify_appimage.sh` 退出码 0（含 `import fafu_motor` 与 `WebKit2` GI）
 
 A 通过只说明包能打出来。还不能对客户说「验收过」。
 
 ## B. 干净 Ubuntu 上打开窗口（不要求真机）
 
-把 **A 产出的那一个 AppImage** 拷到目标机。
+把 **A 产出的那一个 AppImage** 拷到目标机。没有第二台 Linux 电脑时：U 盘做 Ubuntu 22.04 Desktop Live（试用、不安装），重启进入后拷入 AppImage。不要用 WSL 冒充本节。
 
 - [ ] `chmod +x FAFUArmStation-x86_64.AppImage` 后双击
 - [ ] 若缺 FUSE：安装 `libfuse2`，或 `--appimage-extract-and-run`
 - [ ] 立刻出现独立控制窗口（GTK，不是系统浏览器）
+- [ ] **不得**再提示安装 WebKitGTK / `gir1.2-webkit2-4.0`（若出现，视为包不合格，不要发给客户）
 - [ ] 本机浏览器可打开 `http://127.0.0.1:9400/`
 - [ ] 右侧可切到 **仿真臂**，拖滑条 +「发送位置」3D 会动
 - [ ] Ubuntu 24.04 用**同一份** 22.04 打的 AppImage 也能开窗
