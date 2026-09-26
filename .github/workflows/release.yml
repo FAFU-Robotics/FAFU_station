@@ -120,6 +120,7 @@ jobs:
     needs: [build-windows, build-linux]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           pattern: "*"
@@ -127,9 +128,22 @@ jobs:
           path: artifacts
       - name: List release files
         run: ls -lah artifacts
+      - name: Resolve release notes
+        id: notes
+        run: |
+          notes=".github/release-notes/${{ github.ref_name }}.md"
+          if [ -f "$notes" ]; then
+            echo "path=$notes" >> "$GITHUB_OUTPUT"
+            echo "use_file=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "use_file=false" >> "$GITHUB_OUTPUT"
+          fi
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          body_path: ${{ steps.notes.outputs.use_file == 'true' && steps.notes.outputs.path || '' }}
+          generate_release_notes: ${{ steps.notes.outputs.use_file != 'true' }}
           files: |
             artifacts/FAFUArmStation.exe
             artifacts/FAFUArmStation-x86_64.AppImage
-          generate_release_notes: true

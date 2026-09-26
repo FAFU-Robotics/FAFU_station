@@ -1,0 +1,57 @@
+name: sync-release-notes
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/release-notes/*.md"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to update (e.g. v1.6.1)"
+        required: true
+        default: v1.6.1
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve tag
+        id: meta
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tag="${{ github.event.inputs.tag }}"
+          else
+            tag=""
+            while IFS= read -r -d '' f; do
+              base="$(basename "$f" .md)"
+              if [ -f ".github/release-notes/${base}.md" ]; then
+                tag="$base"
+              fi
+            done < <(find .github/release-notes -maxdepth 1 -name '*.md' -print0)
+            if [ -z "$tag" ]; then
+              echo "No release notes file found." >&2
+              exit 1
+            fi
+          fi
+          notes=".github/release-notes/${tag}.md"
+          if [ ! -f "$notes" ]; then
+            echo "Missing $notes" >&2
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "notes=$notes" >> "$GITHUB_OUTPUT"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: ${{ steps.meta.outputs.tag }}
+          body_path: ${{ steps.meta.outputs.notes }}
+          draft: false
+          prerelease: false
+          make_latest: true
