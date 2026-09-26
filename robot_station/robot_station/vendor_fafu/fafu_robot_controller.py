@@ -4781,26 +4781,30 @@ class FafuRobotController:
             return cfg_path
 
     def _pick_serial_port(self, preferred: Optional[str]) -> str:
-        pref = (preferred or "").strip()
-        is_auto = (not pref) or pref.lower() == "auto"
         try:
             usb_ports = pm.find_likely_debug_boards()
         except Exception as e:
             print(f"[FafuRobot] failed to enumerate ports: {e}")
             return preferred or ""
-        if not is_auto:
-            for p in usb_ports:
-                if p.port == pref:
-                    return pref
-            print(
-                f"[FafuRobot] preferred port {pref!r} not found; "
-                f"falling back to auto"
-            )
-        if not usb_ports:
-            raise RuntimeError(
-                "no USB debug board detected; check the cable and try again"
-            )
-        return usb_ports[0].port
+        try:
+            from robot_station.adapters.fafu_arm import resolve_live_serial_port
+        except Exception:
+            pref = (preferred or "").strip()
+            is_auto = (not pref) or pref.lower() == "auto"
+            if not is_auto:
+                for p in usb_ports:
+                    if getattr(p, "port", p) == pref:
+                        return pref
+                print(
+                    f"[FafuRobot] preferred port {pref!r} not found; "
+                    f"falling back to auto"
+                )
+            if not usb_ports:
+                raise RuntimeError(
+                    "no USB debug board detected; check the cable and try again"
+                )
+            return usb_ports[0].port
+        return resolve_live_serial_port(preferred, usb_ports)
 
     def _mark_gripper_offline(self, reason: str) -> None:
         """Keep joint motion; a bad M7 is a warning, not an arm fault."""

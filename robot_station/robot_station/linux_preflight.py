@@ -24,6 +24,8 @@ UDEV_DEST = Path("/etc/udev/rules.d") / UDEV_NAME
 class LinuxPreflight:
     webview_ok: bool = False
     webview_detail: str = ""
+    motor_ok: bool = False
+    motor_detail: str = ""
     serial_ports: list[str] = field(default_factory=list)
     serial_writable: bool = False
     udev_installed: bool = False
@@ -166,6 +168,31 @@ def probe_webview() -> tuple[bool, str]:
     return False, "；".join(errors) or "WebKitGTK 不可用"
 
 
+def _truthy_env(name: str) -> bool:
+    return (os.environ.get(name) or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def probe_fafu_motor() -> tuple[bool, str]:
+    """Load fafu_motor without opening the serial port."""
+    try:
+        from robot_station.adapters.fafu_arm import import_fafu_sdk
+
+        pm, _ctrl = import_fafu_sdk()
+    except Exception as exc:
+        return False, str(exc)
+    boards: list[str] = []
+    try:
+        for item in list(pm.find_likely_debug_boards()):
+            port = str(getattr(item, "port", item) or "").strip()
+            if port:
+                boards.append(port)
+    except Exception as exc:
+        return True, f"已加载 fafu_motor（枚举调试板失败：{exc}）"
+    if boards:
+        return True, f"已加载 fafu_motor；调试板 {', '.join(boards)}"
+    return True, "已加载 fafu_motor；未枚举到调试板（可先用仿真臂）"
+
+
 def inspect() -> LinuxPreflight:
     result = LinuxPreflight()
     result.webview_ok, result.webview_detail = probe_webview()
@@ -213,6 +240,17 @@ def inspect() -> LinuxPreflight:
     if not result.udev_installed and ports:
         result.warnings.append("尚未安装 FAFU 调试板 udev 规则（/dev/fafu_debug_board）。")
         result.fixes.append("python3 -m robot_station.linux_preflight --install-udev")
+    should_probe = _truthy_env("STATION_PORTABLE") or bool((os.environ.get("FAFU_ARM_SDK") or "").strip())
+    if should_probe:
+        result.motor_ok, result.motor_detail = probe_fafu_motor()
+        if not result.motor_ok:
+            msg = "无法加载官方 fafu_motor（Linux 需要捆绑的 .so）。 " + result.motor_detail
+            if _truthy_env("STATION_PORTABLE"):
+                result.blockers.append(msg)
+                result.fixes.append("请使用官方 AppImage；源码模式请用 Python 3.10 编译 fafu_motor.so")
+            else:
+                result.warnings.append(msg + " 源码模式仍可开窗，先用仿真臂。")
+                result.fixes.append("bash fafu_arm_sdk/fafu_robot_cpp/linux/build.sh --module-only")
     return result
 
 

@@ -98,7 +98,7 @@ bash packaging/linux/build_appimage.sh --skip-image --allow-no-sdk
 |---|---|---|
 | Windows 开发 | 本机 unittest + 可选 Docker | 代码与脚本契约 |
 | GHA | ubuntu-22.04 打出 AppImage | 构建产物存在且 verify 通过 |
-| x86 Ubuntu 22.04/24.04 干净机 | 双击 AppImage | 窗口 / 仿真臂 / 24.04 兼容 |
+| x86 Ubuntu 22.04/24.04 干净机 | `handtest_open_window.sh` 后双击 / 仿真臂 | 窗口 / 仿真臂 / 24.04 兼容 |
 | Jetson 或工控机 | 源码 `启动真机.sh` + USB | 真机 100 Hz，**不是**客户包 |
 
 **GHA 绿 ≠ 客户验收过。** ACCEPTANCE B/C/D 仍须手测。不要在 Windows / WSL 上冒充客户双击验收。

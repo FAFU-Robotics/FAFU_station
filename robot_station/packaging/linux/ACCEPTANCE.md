@@ -40,7 +40,13 @@ A 通过只说明包能打出来。还不能对客户说「验收过」。
 
 ## B. 干净 Ubuntu 上打开窗口（不要求真机）
 
-把 **A 产出的那一个 AppImage** 拷到目标机。没有第二台 Linux 电脑时：U 盘做 Ubuntu 22.04 Desktop Live（试用、不安装），重启进入后拷入 AppImage。不要用 WSL 冒充本节。
+把 **A 产出的那一个 AppImage** 拷到目标机。没有第二台 Linux 电脑时：U 盘做 Ubuntu 22.04 Desktop Live（试用、不安装），重启进入后拷入 AppImage。不要用 WSL 冒充本节。旧的约 100MB 包不要发；必须是 `webkit_present=true` 的新包。
+
+在桌面终端执行（脚本会拒绝 WSL）：
+
+```bash
+bash packaging/linux/handtest_open_window.sh ./FAFUArmStation-x86_64.AppImage
+```
 
 - [ ] `chmod +x FAFUArmStation-x86_64.AppImage` 后双击
 - [ ] 若缺 FUSE：安装 `libfuse2`，或 `--appimage-extract-and-run`

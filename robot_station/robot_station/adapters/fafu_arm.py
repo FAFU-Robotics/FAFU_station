@@ -27,7 +27,7 @@ import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Iterable
 
 from robot_station.adapters.arm import ArmAdapter
 from robot_station.adapters.fafu_dyn import (
@@ -367,11 +367,16 @@ def import_fafu_sdk(sdk_root: Path | None = None) -> tuple[Any, Any]:
         tag = f"cp{sys.version_info.major}{sys.version_info.minor}"
         native = f"fafu_motor.{tag}-win_amd64.pyd" if os.name == "nt" else f"fafu_motor.{tag}-*-linux-gnu.so"
         have = sorted(p.name for p in py_dir.glob("fafu_motor.*"))
+        rebuild = (
+            "或在 fafu_robot_cpp 里对当前解释器重编 .pyd。"
+            if os.name == "nt"
+            else "或在 fafu_robot_cpp/linux 用当前解释器跑 build.sh 生成 .so。"
+        )
         raise RuntimeError(
             f"当前 Python {sys.version.split()[0]} 载不入 fafu_motor "
             f"（需要 {native}）。目录里现有: {have or '无'}。"
             " 官方预编译通常是 cp310；本机 3.11+ 须用 Python 3.10 启动站控，"
-            "或在 fafu_robot_cpp 里对当前解释器重编 .pyd。"
+            f"{rebuild}"
             f" 原始错误: {exc}"
         ) from exc
     abi = int(getattr(pm, "CORE_ABI_VERSION", 0) or 0)
@@ -380,11 +385,75 @@ def import_fafu_sdk(sdk_root: Path | None = None) -> tuple[Any, Any]:
     if not hasattr(pm, "HightorqueSerial"):
         raise RuntimeError("fafu_motor 不是官方调试板模块（缺少 HightorqueSerial）")
     if not hasattr(pm, "TORQUE_COEFF") and abi != REQUIRED_CORE_ABI:
-        raise RuntimeError(
-            f"fafu_motor 过旧（无 TORQUE_COEFF，ABI={abi}）。"
+        rebuild = (
             "请在 fafu_robot_cpp 对当前 Python 重编后覆盖 fafu_robot_python 里的 .pyd。"
+            if os.name == "nt"
+            else "请在 fafu_robot_cpp/linux 对当前 Python 跑 build.sh，覆盖 fafu_robot_python 里的 .so。"
+        )
+        raise RuntimeError(
+            f"fafu_motor 过旧（无 TORQUE_COEFF，ABI={abi}）。{rebuild}"
         )
     return pm, _load_fafu_controller()
+
+
+NO_DEBUG_BOARD = "no USB debug board detected; check the cable and try again"
+
+
+def _board_port_name(board: Any) -> str:
+    if isinstance(board, str):
+        return board.strip()
+    return str(getattr(board, "port", "") or "").strip()
+
+
+def resolve_live_serial_port(preferred: str | None, board_ports: Iterable[Any] | None) -> str:
+    """Pick a debug-board tty from SDK enum plus an optional preferred path.
+
+    Empty / ``auto`` uses the first enumerated board. On POSIX,
+    ``/dev/fafu_debug_board`` matches the udev symlink via ``realpath``.
+    Does not open the port.
+    """
+    ports: list[str] = []
+    seen: set[str] = set()
+    for board in board_ports or []:
+        name = _board_port_name(board)
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        ports.append(name)
+    pref = (preferred or "").strip()
+    is_auto = (not pref) or pref.lower() == "auto"
+
+    def _first() -> str:
+        if not ports:
+            raise RuntimeError(NO_DEBUG_BOARD)
+        return ports[0]
+
+    if is_auto:
+        return _first()
+    if pref in ports:
+        return pref
+    if os.name != "nt":
+        try:
+            pref_real = os.path.realpath(pref)
+        except OSError:
+            pref_real = ""
+        if pref_real:
+            for port in ports:
+                try:
+                    if os.path.realpath(port) == pref_real:
+                        return pref
+                except OSError:
+                    continue
+        try:
+            if os.path.exists(pref):
+                return pref
+        except OSError:
+            pass
+    print(
+        f"[FafuRobot] preferred port {pref!r} not found; falling back to auto",
+        flush=True,
+    )
+    return _first()
 
 
 def _unique_motor_ids(ids: list[int]) -> list[int]:
@@ -1376,13 +1445,23 @@ def _windows_short_path(path: str) -> str:
 
 def _ascii_cache_dir() -> Path:
     last_err: OSError | None = None
-    for raw in (
+    xdg = (os.environ.get("XDG_CACHE_HOME") or "").strip()
+    home_cache = ""
+    try:
+        home_cache = str(Path.home() / ".cache")
+    except OSError:
+        home_cache = ""
+    candidates = [
         os.environ.get("LOCALAPPDATA") or "",
         os.environ.get("TEMP") or "",
         os.environ.get("TMP") or "",
-        r"C:\Windows\Temp",
-        r"C:\FAFUArmStation",
-    ):
+        xdg,
+        home_cache if os.name != "nt" else "",
+        r"C:\Windows\Temp" if os.name == "nt" else "",
+        r"C:\FAFUArmStation" if os.name == "nt" else "",
+        "/tmp" if os.name != "nt" else "",
+    ]
+    for raw in candidates:
         if not (raw and _is_ascii_path(raw)):
             continue
         dest = Path(raw) / "FAFUArmStation" / "native"

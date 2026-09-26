@@ -36,6 +36,7 @@ class LinuxPreflightTests(unittest.TestCase):
         self.assertIn("webview_ok", payload)
         self.assertIn("serial_ports", payload)
         self.assertIn("fixes", payload)
+        self.assertIn("motor_ok", payload)
         json.dumps(payload)
 
     def test_bundled_udev_rules_are_found(self) -> None:
@@ -115,6 +116,47 @@ class LinuxPreflightTests(unittest.TestCase):
         self.assertTrue(result.webview_ok)
         self.assertFalse(result.blockers)
         self.assertTrue(any("DISPLAY" in w for w in result.warnings))
+
+    def test_portable_motor_import_failure_is_blocker(self) -> None:
+        with patch.dict(os.environ, {"STATION_PORTABLE": "1"}, clear=False):
+            with patch("robot_station.linux_preflight.probe_webview", return_value=(True, "ok")):
+                with patch("robot_station.linux_preflight.serial_candidates", return_value=[]):
+                    with patch(
+                        "robot_station.linux_preflight.probe_fafu_motor",
+                        return_value=(False, "missing .so"),
+                    ):
+                        result = inspect()
+        self.assertFalse(result.motor_ok)
+        self.assertTrue(any("fafu_motor" in b for b in result.blockers))
+        self.assertFalse(any("fafu_motor" in w for w in result.warnings))
+
+    def test_source_motor_import_failure_is_warning(self) -> None:
+        env = {k: v for k, v in os.environ.items() if k != "STATION_PORTABLE"}
+        env["FAFU_ARM_SDK"] = "/tmp/fake-sdk"
+        with patch.dict(os.environ, env, clear=True):
+            with patch("robot_station.linux_preflight.probe_webview", return_value=(True, "ok")):
+                with patch("robot_station.linux_preflight.serial_candidates", return_value=[]):
+                    with patch(
+                        "robot_station.linux_preflight.probe_fafu_motor",
+                        return_value=(False, "missing .so"),
+                    ):
+                        result = inspect()
+        self.assertFalse(result.motor_ok)
+        self.assertFalse(any("fafu_motor" in b for b in result.blockers))
+        self.assertTrue(any("fafu_motor" in w for w in result.warnings))
+
+    def test_portable_motor_ok_does_not_block_without_board(self) -> None:
+        with patch.dict(os.environ, {"STATION_PORTABLE": "1"}, clear=False):
+            with patch("robot_station.linux_preflight.probe_webview", return_value=(True, "ok")):
+                with patch("robot_station.linux_preflight.serial_candidates", return_value=[]):
+                    with patch(
+                        "robot_station.linux_preflight.probe_fafu_motor",
+                        return_value=(True, "已加载 fafu_motor；未枚举到调试板（可先用仿真臂）"),
+                    ):
+                        result = inspect()
+        self.assertTrue(result.motor_ok)
+        self.assertFalse(any("fafu_motor" in b for b in result.blockers))
+        self.assertTrue(any("串口" in w for w in result.warnings))
 
 
 if __name__ == "__main__":

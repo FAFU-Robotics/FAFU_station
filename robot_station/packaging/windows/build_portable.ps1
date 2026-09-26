@@ -1,12 +1,15 @@
-# Build a private-runtime folder for customers.
+﻿# Build a private-runtime folder for customers.
 # Does not install Python globally, does not write the user/system PATH.
 #
-# Output: <repo>\dist\FAFUArmStation\
+# Output: <repo>\dist\FAFUArmStation\  (portable tree)
+#         <repo>\dist\FAFUArmStation.exe  (send this one file; skipped with -SkipSingleExe)
 #
 # Usage:
 #   powershell -ExecutionPolicy Bypass -File packaging\windows\build_portable.ps1
 #   powershell -File packaging\windows\build_portable.ps1 -Force
 #   powershell -File packaging\windows\build_portable.ps1 -SkipSdk
+#   powershell -File packaging\windows\build_portable.ps1 -WithPinocchio
+#   powershell -File packaging\windows\build_portable.ps1 -SkipSingleExe
 
 [CmdletBinding()]
 param(
@@ -14,7 +17,9 @@ param(
     [string]$PythonVersion = "3.10.11",
     [switch]$Force,
     [switch]$SkipSdk,
-    [switch]$SkipPinocchio
+    [switch]$SkipPinocchio,
+    [switch]$WithPinocchio,
+    [switch]$SkipSingleExe
 )
 
 $ErrorActionPreference = "Stop"
@@ -205,10 +210,11 @@ finally {
 }
 
 $pinocchioPy = $null
-if (-not $SkipPinocchio) {
+$wantPinocchio = $WithPinocchio -and -not $SkipPinocchio
+if ($wantPinocchio) {
     $pinocchioPy = Find-PinocchioEnv
     if (-not $pinocchioPy) {
-        throw "pinocchio (Python 3.10) not found. Windows pip cannot install the real library. Use a conda env: conda create -n fafu-station -c conda-forge python=3.10 pinocchio  then rebuild, or set STATION_PYTHON / STATION_PINOCCHIO. Pass -SkipPinocchio to ship station G(q) only."
+        throw "pinocchio (Python 3.10) not found. Windows pip cannot install the real library. Use a conda env: conda create -n fafu-station -c conda-forge python=3.10 pinocchio  then rebuild, or set STATION_PYTHON / STATION_PINOCCHIO. Default builds skip pinocchio and use station G(q) + SDK apply_compensation_torque."
     }
     $bundlePy = Join-Path $PackDir "bundle_pinocchio.py"
     Write-Host "Bundling pinocchio from $pinocchioPy"
@@ -226,6 +232,8 @@ if (-not $SkipPinocchio) {
     } finally {
         $ErrorActionPreference = $prevEA
     }
+} else {
+    Write-Host "Skipping pinocchio (default). Gravity uses station G(q) + SDK apply_compensation_torque. Pass -WithPinocchio to bundle conda pinocchio."
 }
 
 Write-Host "Copying app"
@@ -240,15 +248,19 @@ $packagedYaml = Join-Path $app "configs\station.yaml"
 if (Test-Path $packagedYaml) {
     Remove-Item -Force $packagedYaml
 }
+$docsSrc = Join-Path $Repo "docs"
 $docsApp = Join-Path $app "docs"
 New-Item -ItemType Directory -Force -Path $docsApp | Out-Null
-foreach ($doc in @("客户使用说明.md", "使用说明.md", "SPEC.md")) {
-    $p = Join-Path $Repo "docs\$doc"
-    if (Test-Path $p) { Copy-Item -Force $p $docsApp }
+$customerReadme = $null
+Get-ChildItem -LiteralPath $docsSrc -Filter "*.md" | ForEach-Object {
+    Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $docsApp $_.Name) -Force
+    $text = Get-Content -LiteralPath $_.FullName -Raw -Encoding UTF8
+    if ($text -match "station-customer-readme") {
+        $customerReadme = $_.FullName
+    }
 }
-$customerReadme = Join-Path $Repo "docs\客户使用说明.md"
-if (-not (Test-Path $customerReadme)) { throw "docs/客户使用说明.md missing" }
-Copy-Item -Force $customerReadme (Join-Path $app "README.md")
+if (-not $customerReadme) { throw "docs/*.md customer readme (station-customer-readme) missing" }
+Copy-Item -LiteralPath $customerReadme -Destination (Join-Path $app "README.md") -Force
 
 $sdkDest = Join-Path $app "vendor\fafu_arm_sdk"
 $sdk = $null
@@ -270,8 +282,23 @@ Write-Host "Compiling FAFUArmStation.exe"
 $csc = Get-Csc
 $exe = Join-Path $OutDir "FAFUArmStation.exe"
 $cs = Join-Path $PackDir "PortableLauncher.cs"
-& $csc /nologo /target:winexe /platform:anycpu /utf8output /out:$exe /r:System.dll /r:System.Windows.Forms.dll /r:System.Drawing.dll $cs
+$ico = Join-Path $PackDir "FAFUArmStation.ico"
+$cscArgs = @("/nologo", "/target:winexe", "/platform:anycpu", "/utf8output", "/out:$exe", "/r:System.dll", "/r:System.Windows.Forms.dll", "/r:System.Drawing.dll")
+if (Test-Path $ico) { $cscArgs += "/win32icon:$ico" }
+& $csc @cscArgs $cs
 if ($LASTEXITCODE -ne 0) { throw "csc failed" }
+$verFile = Join-Path $app "VERSION"
+$pkgVer = "1.5.0"
+$initPy = Join-Path $Repo "robot_station\__init__.py"
+if (Test-Path $initPy) {
+    $m = Select-String -Path $initPy -Pattern '__version__\s*=\s*"([^"]+)"' | Select-Object -First 1
+    if ($m) { $pkgVer = $m.Matches[0].Groups[1].Value }
+}
+@(
+    $pkgVer,
+    ("packed " + (Get-Date -Format "yyyy-MM-dd HH:mm:ss")),
+    $(if ($pinocchioPy) { "pinocchio=bundled" } else { "pinocchio=skipped (station G(q)+MIT)" })
+) | Set-Content -Encoding ascii $verFile
 
 Copy-Item -Force (Join-Path $PackDir "install_shortcut.vbs") $OutDir
 Copy-Item -Force (Join-Path $PackDir "FAFUArmStation.ico") $OutDir
@@ -298,28 +325,40 @@ $readme = @"
 FAFU Arm Station — private runtime
 ===================================
 
+This folder is the unpacked runtime (USB stick / debug).
+The file to SEND to customers is the sibling:
+  dist\FAFUArmStation.exe
+They double-click that one file. They do not open this folder.
+
 This folder is self-contained. It does NOT install Python for Windows,
 does not add Python to PATH, and does not change other Python environments.
 
-First run
+First run of the sendable exe
 - Plug the arm USB into THIS PC
-- Double-click FAFUArmStation.exe (or 启动真机.bat)
-- First launch copies to %LOCALAPPDATA%\FAFUArmStation, creates a desktop shortcut, and opens the page
+- Double-click dist\FAFUArmStation.exe
+- It unpacks to %LOCALAPPDATA%\FAFUArmStation and opens the control window
+- A desktop shortcut is created in the background
 - After USB connects, the app Connects and enables the arm (motors hold pose)
+
+If you run THIS folder instead
+- Double-click FAFUArmStation.exe (or 启动真机.bat) here
+- Keep this whole folder together
 
 Later
 - Double-click the desktop FAFUArmStation shortcut
+- To update: send a new dist\FAFUArmStation.exe and double-click it
 
-Uninstall: Uninstall.bat in %LOCALAPPDATA%\FAFUArmStation, or delete that folder and the shortcut.
+Uninstall: run Uninstall.bat in the user directory, or delete
+%LOCALAPPDATA%\FAFUArmStation and the desktop shortcut.
 
 USB
 - Official fafu_arm_sdk must be inside app\vendor\fafu_arm_sdk
 - Windows must see a COM port (USB serial driver is system-wide; this package cannot isolate kernel drivers)
 
 Gravity
-- This build copies conda-forge pinocchio into the private runtime so live
-  Gravity / Gra+Fri use the SDK pinocchio loop (gravity_compensation_step).
-  Windows pip cannot install real Pinocchio.
+- Default build skips pinocchio. Live Gravity / Gra+Fri use station G(q)
+  plus SDK apply_compensation_torque. Pass -WithPinocchio on a conda py310
+  machine if you want SDK gravity_compensation_step.
 
 Simulation
 - Open the app and choose the sim arm on the right
@@ -327,9 +366,20 @@ Simulation
 $readme | Set-Content -Encoding utf8 (Join-Path $OutDir "Readme.txt")
 
 Write-Host ""
-Write-Host "OK: $OutDir"
+Write-Host "OK folder: $OutDir"
 Write-Host "Launcher: $exe"
 Write-Host "Python:   $pyExe"
 if ($sdk) { Write-Host "SDK:      $sdkDest" } else { Write-Host "SDK:      (missing)" }
 if ($pinocchioPy) { Write-Host "pinocchio: $pinocchioPy" } else { Write-Host "pinocchio: (skipped)" }
-Write-Host "Next: plug USB, then double-click FAFUArmStation.exe  (does not change PATH)"
+
+if ($SkipSingleExe) {
+    Write-Host "Skipped single-exe pack (-SkipSingleExe). Folder is for USB-stick / debug."
+} elseif (-not $sdk) {
+    Write-Warning "SDK missing; not packing the sendable exe (live USB would not work). Place fafu_arm_sdk next to the repo and rebuild. Folder is still at $OutDir"
+} else {
+    $packSingle = Join-Path $PackDir "pack_single_exe.ps1"
+    Write-Host "Packing sendable single exe..."
+    & $packSingle -SourceDir $OutDir
+    if ($LASTEXITCODE -ne 0) { throw "pack_single_exe.ps1 failed" }
+    Write-Host "Send: $(Join-Path (Split-Path $OutDir) 'FAFUArmStation.exe')"
+}

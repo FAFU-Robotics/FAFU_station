@@ -55,6 +55,8 @@ class StationLaunchFilesTests(unittest.TestCase):
         self.assertIn("runtime/python310", live_sh)
         self.assertIn("linux_preflight", live_sh)
         self.assertNotIn("setx", live_sh.lower())
+        alias = (ROOT / "start_live_arm.sh").read_text(encoding="utf-8")
+        self.assertIn("启动真机.sh", alias)
         self.assertTrue((ROOT / "packaging/windows/build_portable.ps1").is_file())
         self.assertTrue((ROOT / "packaging/windows/PortableLauncher.cs").is_file())
         desktop = (ROOT / "station_desktop.py").read_text(encoding="utf-8")

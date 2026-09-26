@@ -26,3 +26,11 @@ arm_cfg: ""
 arm_port: ""
 arm_allow_motion: false
 arm_gripper_id: 7
+
+# USB 热插拔监视：只在设备签名变化时才去认硬件；默认关闭。
+# Windows 便携启动器（FAFUArmStation.exe / 启动真机.bat）和 Linux
+# AppRun / 启动真机.sh 会自动打开这两个开关。
+# 效果是"先插臂先认臂"：没插调试板时用仿真臂，插上后自动切真机（不自动使能）。
+# Linux 端口：留空=auto；也可写 /dev/fafu_debug_board（udev 软链接）。
+arm_watch: false
+camera_watch: false

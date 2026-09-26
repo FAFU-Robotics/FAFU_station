@@ -8,6 +8,7 @@ if errorlevel 1 (
   exit /b 1
 )
 echo.
-echo Output: %~dp0..\..\dist\FAFUArmStation
+echo Folder: %~dp0..\..\dist\FAFUArmStation
+echo Send:   %~dp0..\..\dist\FAFUArmStation.exe
 pause
 exit /b 0

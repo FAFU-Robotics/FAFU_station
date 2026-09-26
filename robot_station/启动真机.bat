@@ -5,7 +5,6 @@ cd /d "%~dp0"
 REM Live arm: CPython 3.10 matches fafu_motor.cp310. ASCII-only so cmd.exe does not split UTF-8.
 
 set "STATION_ALLOW_LIVE_ARM=1"
-set "STATION_URDF_DIR=%~dp0urdf"
 
 if exist "%~dp0app\station_desktop.py" (
   set "APP_DIR=%~dp0app"
@@ -15,6 +14,12 @@ if exist "%~dp0app\station_desktop.py" (
   set "DESKTOP_PY=%~dp0station_desktop.py"
 )
 
+if exist "%APP_DIR%\urdf" (
+  set "STATION_URDF_DIR=%APP_DIR%\urdf"
+) else if exist "%~dp0urdf" (
+  set "STATION_URDF_DIR=%~dp0urdf"
+)
+
 if exist "%APP_DIR%\vendor\fafu_arm_sdk\fafu_robot_python\fafu_robot_controller.py" (
   set "FAFU_ARM_SDK=%APP_DIR%\vendor\fafu_arm_sdk"
 )
@@ -22,7 +27,7 @@ if not defined FAFU_ARM_SDK if exist "%~dp0vendor\fafu_arm_sdk\fafu_robot_python
   set "FAFU_ARM_SDK=%~dp0vendor\fafu_arm_sdk"
 )
 
-if exist "%~dp0runtime\python310\python.exe" if exist "%~dp0FAFUArmStation.exe" goto install_home
+REM Portable package: run in place. Do not robocopy the tree before the window.
 if exist "%~dp0runtime\python310\python.exe" goto portable
 
 if not defined FAFU_ARM_SDK (
@@ -36,18 +41,18 @@ if not defined FAFU_ARM_SDK (
   )
 )
 
-REM Windows pip cannot install real Pinocchio. Prefer a conda py310 that has it.
+REM Source tree: Python 3.10. Pinocchio is optional (station G(q)+MIT if missing).
 set "PY310="
 if defined STATION_PYTHON if exist "%STATION_PYTHON%" (
   "%STATION_PYTHON%" -c "import sys; assert sys.version_info[:2]==(3,10)" 1>nul 2>nul
   if not errorlevel 1 set "PY310=%STATION_PYTHON%"
 )
-if not defined PY310 call :pick_pinocchio
+if not defined PY310 call :pick_py310
 if not defined PY310 set "PY310=%LocalAppData%\Programs\Python\Python310\python.exe"
 if not exist "%PY310%" (
   echo Python 3.10 not found.
   echo Official fafu_motor is cp310. Do not use Python 3.11 for live USB.
-  echo Pinocchio on Windows: conda create -n fafu-station -c conda-forge python=3.10 pinocchio
+  echo Optional pinocchio: conda create -n fafu-station -c conda-forge python=3.10 pinocchio
   echo Then set STATION_PYTHON to that python.exe, or install: winget install Python.Python.3.10
   pause
   exit /b 1
@@ -80,25 +85,6 @@ echo E-stop: page button or unplug USB. Clear the workspace before Enable.
 if errorlevel 1 pause
 exit /b %ERRORLEVEL%
 
-:install_home
-set "DEST=%LOCALAPPDATA%\FAFUArmStation"
-set "HERE=%~dp0"
-if /i "%HERE%"=="%DEST%\" goto portable
-echo Installing private runtime to %DEST%
-echo Does not change system PATH.
-if not exist "%DEST%" mkdir "%DEST%"
-robocopy "%~dp0." "%DEST%" /E /XD cache /NFL /NDL /NJH /NJS /nc /ns /np
-if errorlevel 8 (
-  echo Copy failed, starting from this folder.
-  goto portable
-)
-if exist "%DEST%\install_shortcut.vbs" cscript //nologo "%DEST%\install_shortcut.vbs" "%DEST%"
-if exist "%DEST%\FAFUArmStation.exe" (
-  start "" "%DEST%\FAFUArmStation.exe"
-  exit /b 0
-)
-goto portable
-
 :portable
 set "STATION_PORTABLE=1"
 set "STATION_INSTALL_ROOT=%~dp0"
@@ -114,31 +100,34 @@ if exist "%~dp0runtime\python310\Library\bin" (
 ) else (
   set "PATH=%~dp0runtime\python310;%~dp0runtime\python310\Scripts;%PATH%"
 )
+if exist "%~dp0install_shortcut.vbs" (
+  start "" /b cscript //nologo "%~dp0install_shortcut.vbs" "%~dp0"
+)
 echo Live station: portable Python  STATION_ALLOW_LIVE_ARM=1  arm=fafu  allow-motion
 echo SDK=%FAFU_ARM_SDK%
-echo Private runtime. Does not change system PATH.
+echo Private runtime in place. Does not change system PATH.
 echo E-stop: page button or unplug USB. Clear the workspace before Enable.
 "%~dp0runtime\python310\python.exe" -u "%DESKTOP_PY%" %*
 if errorlevel 1 pause
 exit /b %ERRORLEVEL%
 
-:pick_pinocchio
+:pick_py310
 if defined CONDA_PREFIX if exist "%CONDA_PREFIX%\python.exe" (
-  "%CONDA_PREFIX%\python.exe" -c "import sys,pinocchio; assert sys.version_info[:2]==(3,10)" 1>nul 2>nul
+  "%CONDA_PREFIX%\python.exe" -c "import sys; assert sys.version_info[:2]==(3,10)" 1>nul 2>nul
   if not errorlevel 1 (
     set "PY310=%CONDA_PREFIX%\python.exe"
     goto :eof
   )
 )
 if exist "D:\Anaconda\envs\fafu-station\python.exe" (
-  "D:\Anaconda\envs\fafu-station\python.exe" -c "import sys,pinocchio; assert sys.version_info[:2]==(3,10)" 1>nul 2>nul
+  "D:\Anaconda\envs\fafu-station\python.exe" -c "import sys; assert sys.version_info[:2]==(3,10)" 1>nul 2>nul
   if not errorlevel 1 (
     set "PY310=D:\Anaconda\envs\fafu-station\python.exe"
     goto :eof
   )
 )
 if exist "D:\Anaconda\envs\panthera\python.exe" (
-  "D:\Anaconda\envs\panthera\python.exe" -c "import sys,pinocchio; assert sys.version_info[:2]==(3,10)" 1>nul 2>nul
+  "D:\Anaconda\envs\panthera\python.exe" -c "import sys; assert sys.version_info[:2]==(3,10)" 1>nul 2>nul
   if not errorlevel 1 (
     set "PY310=D:\Anaconda\envs\panthera\python.exe"
     goto :eof

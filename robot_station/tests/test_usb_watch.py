@@ -72,6 +72,22 @@ class UsbWatcherTests(unittest.TestCase):
         self.assertEqual(arms, [True, False])
         self.assertEqual(watcher.changes, 2)
 
+    def test_linux_tty_appears_then_disappears(self) -> None:
+        serial = Script(one([]), one(["/dev/ttyUSB0"]), one([]))
+        watcher, arms, _cams = self._watch(serial)
+        watcher.rescan()
+        watcher.rescan()
+        watcher.rescan()
+        self.assertEqual(arms, [True, False])
+        self.assertEqual(watcher.changes, 2)
+
+    def test_linux_udev_symlink_rename_reports_attached(self) -> None:
+        serial = Script(one(["/dev/ttyUSB0"]), one(["/dev/fafu_debug_board"]))
+        watcher, arms, _cams = self._watch(serial)
+        watcher.rescan()
+        watcher.rescan()
+        self.assertEqual(arms, [True])
+
     def test_port_rename_reports_attached(self) -> None:
         """Re-plugging on another port keeps attached=True so the arm can retry."""
         serial = Script(one(["COM3"]), one(["COM7"]))
