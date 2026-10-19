@@ -97,6 +97,20 @@ class TelemCodecTests(unittest.TestCase):
         self.assertIsNone(got["echo_t0"])
         self.assertFalse(math.isnan(got["arm"]["q_deg"][0]))
 
+    def test_watchdog_trip_roundtrip(self) -> None:
+        blob = pack_telem({"seq": 8, "safety": "WATCHDOG_TRIP", "arm": {"q_deg": [0] * 6}})
+        self.assertEqual(blob[10], 3)
+        got = unpack_telem(blob)
+        assert got is not None
+        self.assertEqual(got["safety"], "WATCHDOG_TRIP")
+        legacy = pack_telem({"seq": 8, "safety": "WATCHDOG", "arm": {}})
+        self.assertEqual(legacy[10], 3)
+        got = unpack_telem(legacy)
+        assert got is not None
+        self.assertEqual(got["safety"], "WATCHDOG_TRIP")
+        js = (ROOT / "robot_station" / "web" / "static" / "js" / "app.js").read_text(encoding="utf-8")
+        self.assertIn('3: "WATCHDOG_TRIP"', js)
+
     def test_rejects_wrong_size(self) -> None:
         self.assertIsNone(unpack_telem(b"short"))
 

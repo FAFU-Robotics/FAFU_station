@@ -11,6 +11,8 @@ from robot_station.adapters.fafu_kin import (
     forward,
     forward_pose,
     inverse_with_fallback,
+    orientation_ack_tol_rad,
+    orientation_error_rad,
     rpy_to_matrix,
 )
 from robot_station.grav_urdf import list_gravity_urdfs, persist_selected_urdf, resolve_gravity_urdf, selected_urdf_name
@@ -208,16 +210,22 @@ class MockArm(ArmAdapter):
             # Increment the commanded pose. IK from lagged measured q + 40°/s
             # catch-up is what made the default mock arm feel seconds late.
             q_rad = [math.radians(x) for x in self._tgt]
-        xyz, rot, _ = forward_pose(q_rad)
+        xyz, seed_rot, _ = forward_pose(q_rad)
+        want_ori = any(abs(float(x)) > 1e-3 for x in drpy_deg[:3])
         xyz, rot = apply_delta_pose(
             xyz,
-            rot,
+            seed_rot,
             [float(dxyz[i] if i < len(dxyz) else 0.0) for i in range(3)],
             [math.radians(float(drpy_deg[i] if i < len(drpy_deg) else 0.0)) for i in range(3)],
         )
         solved = inverse_with_fallback(xyz, seed_rad=q_rad, rotation=rot, is_euler=False)
         if solved is None:
             return "仿真 IK 无解（末端超出工作空间或靠近奇异位）"
+        if want_ori:
+            ori_tol = orientation_ack_tol_rad(orientation_error_rad(seed_rot, rot))
+            _p, got, _rpy = forward_pose(solved)
+            if orientation_error_rad(got, rot) > ori_tol:
+                return "仿真 IK 无解（末端超出工作空间或靠近奇异位）"
         self.apply_targets([math.degrees(x) for x in solved], self.default_speed, stream=True)
         return None
 
@@ -228,10 +236,16 @@ class MockArm(ArmAdapter):
         rpy = [math.radians(x) for x in clip_cart_rpy_deg(rpy_deg)]
         with self._lock:
             q_rad = [math.radians(x) for x in self._tgt]
+        _seed_p, seed_rot, _seed_rpy = forward_pose(q_rad)
+        goal_rot = rpy_to_matrix(rpy)
+        ori_tol = orientation_ack_tol_rad(orientation_error_rad(seed_rot, goal_rot))
         solved = inverse_with_fallback(
-            xyz, seed_rad=q_rad, rotation=rpy_to_matrix(rpy), is_euler=False
+            xyz, seed_rad=q_rad, rotation=goal_rot, is_euler=False
         )
         if solved is None:
+            return "仿真 IK 无解（末端超出工作空间或靠近奇异位）"
+        _p, got, _rpy = forward_pose(solved)
+        if orientation_error_rad(got, goal_rot) > ori_tol:
             return "仿真 IK 无解（末端超出工作空间或靠近奇异位）"
         return self.apply_targets([math.degrees(x) for x in solved], speed_deg_s, stream=False)
 

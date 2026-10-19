@@ -137,6 +137,51 @@ class FafuKinTests(unittest.TestCase):
         self.assertAlmostEqual(rpy[0], 180.0)
         self.assertAlmostEqual(rpy[1], -180.0)
 
+    def test_zero_orientation_only_is_not_a_6d_solution(self) -> None:
+        from robot_station.adapters.fafu_kin import apply_delta_pose, orientation_error_rad
+
+        q0 = [0.0] * 6
+        xyz, rot, _rpy = forward_pose(q0)
+        _xyz2, rot2 = apply_delta_pose(xyz, rot, [0.0, 0.0, 0.0], [0.0, 0.0, math.radians(170.0)])
+        self.assertIsNone(inverse(xyz, seed_rad=q0, rotation=rot2, is_euler=False))
+        q = [0.0, math.radians(40.0), math.radians(40.0), 0.0, 0.0, 0.0]
+        xyz, rot, _rpy = forward_pose(q)
+        _xyz2, rot2 = apply_delta_pose(xyz, rot, [0.0, 0.0, 0.0], [0.0, 0.0, math.radians(30.0)])
+        solved = inverse(xyz, seed_rad=q, rotation=rot2, is_euler=False)
+        self.assertIsNotNone(solved)
+        assert solved is not None
+        _p, got, _r = forward_pose(solved)
+        self.assertLess(orientation_error_rad(got, rot2), math.radians(3.0))
+
+    def test_small_orientation_request_cannot_succeed_without_moving(self) -> None:
+        from robot_station.adapters.fafu_kin import (
+            apply_delta_pose,
+            orientation_ack_tol_rad,
+            orientation_error_rad,
+        )
+
+        q0 = [0.0] * 6
+        xyz, rot, _rpy = forward_pose(q0)
+        # 2.9 deg used to return the seed unchanged (residual 2.9 < 3 deg) and
+        # look like a successful 6D solve. It must now be rejected.
+        _xyz2, rot2 = apply_delta_pose(xyz, rot, [0.0, 0.0, 0.0], [0.0, 0.0, math.radians(2.9)])
+        self.assertIsNone(inverse(xyz, seed_rad=q0, rotation=rot2, is_euler=False))
+
+        # The keyboard table value is 1.7 deg, but cartPulse multiplies it by
+        # 10 * dt: about 0.17 deg at 100 Hz. This is the real per-tick command.
+        tick_deg = 0.17
+        tick_rad = math.radians(tick_deg)
+        self.assertLess(orientation_ack_tol_rad(tick_rad), tick_rad)
+        _xyz3, rot3 = apply_delta_pose(xyz, rot, [0.0, 0.0, 0.0], [0.0, 0.0, tick_rad])
+        solved = inverse(xyz, seed_rad=q0, rotation=rot3, is_euler=False)
+        self.assertIsNotNone(solved)
+        assert solved is not None
+        _p, got, _r = forward_pose(solved)
+        self.assertLess(
+            orientation_error_rad(got, rot3),
+            orientation_ack_tol_rad(tick_rad),
+        )
+
     def test_step_cartesian_plus_x(self) -> None:
         from robot_station.adapters.fafu_kin import step_cartesian, xyz_err
 

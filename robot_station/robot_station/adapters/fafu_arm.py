@@ -69,6 +69,8 @@ from robot_station.adapters.fafu_kin import (
     inverse_with_fallback,
     load_cfg_limits,
     load_gripper_effort,
+    orientation_ack_tol_rad,
+    orientation_error_rad,
     rpy_to_matrix,
     step_cartesian,
     xyz_err,
@@ -4117,16 +4119,19 @@ class FafuArm(ArmAdapter):
             pos, ori = self._fk_xyz_rot(seed, robot)
         dpos = [float(dxyz[i] if i < len(dxyz) else 0.0) for i in range(3)]
         drpy = [math.radians(float(drpy_deg[i] if i < len(drpy_deg) else 0.0)) for i in range(3)]
+        want_ori = any(abs(x) > 1e-4 for x in drpy)
+        seed_rot = as_rotation(ori, is_euler=False)
         q = step_cartesian(seed or [], dpos, drpy)
+        xyz, rot = apply_delta_pose(
+            pos,
+            seed_rot,
+            dpos,
+            drpy,
+        )
+        ori_tol = orientation_ack_tol_rad(orientation_error_rad(seed_rot, rot)) if want_ori else 0.0
         if q is None:
-            xyz, rot = apply_delta_pose(
-                pos,
-                as_rotation(ori, is_euler=False),
-                dpos,
-                drpy,
-            )
             q = self._solve_pose(xyz, rot, seed)
-        if q is None:
+        if q is None or (want_ori and orientation_error_rad(self._fk_xyz_rot(q, robot)[1], rot) > ori_tol):
             # Keep holding the last pose. Ending servo here is what dropped
             # the arm at a raised shoulder when IK failed mid-keypress.
             self._hold_stream_pose()
@@ -4242,6 +4247,8 @@ class FafuArm(ArmAdapter):
             return "读关节失败"
         while len(seed) < self.n:
             seed.append(0.0)
+        _seed_pos, seed_ori = self._fk_xyz_rot(seed, robot)
+        ori_tol = orientation_ack_tol_rad(orientation_error_rad(seed_ori, rot))
         path = self._cartesian_joint_path(xyz, rot, seed)
         if not path:
             # RPC thread (ACK). Never run Trac-IK on the 100 Hz WASD/servo tick.
@@ -4255,12 +4262,14 @@ class FafuArm(ArmAdapter):
                 return "IK 无解（末端超出工作空间或靠近奇异位，可先把 J2/J3 抬离零位）"
             path = [list(q_trac)]
         q_goal = path[-1]
-        pos, _ori = self._fk_xyz_rot(q_goal, robot)
+        pos, ori_got = self._fk_xyz_rot(q_goal, robot)
         if xyz_err(pos, xyz) > CART_POSE_TOL_M * 2.0:
             return (
                 f"IK 未到目标（误差 {xyz_err(pos, xyz)*1000:.0f} mm）。"
                 "可先抬 J2/J3 再发，或减小步距。"
             )
+        if orientation_error_rad(ori_got, rot) > ori_tol:
+            return "IK 无解（末端超出工作空间或靠近奇异位，可先把 J2/J3 抬离零位）"
         self._start_joint_path(path, speed_deg_s)
         return None
 

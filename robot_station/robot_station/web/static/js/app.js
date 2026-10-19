@@ -222,11 +222,63 @@
     if (cartHeld.size) return true;
     return !!( $("armFollow") && $("armFollow").checked );
   }
+  const CMD_QUEUE_LIB = window.CmdQueue;
+  if (!CMD_QUEUE_LIB) console.error("cmdqueue.js 未加载：断线指令将不排队");
+  const cmdQueue = CMD_QUEUE_LIB
+    ? CMD_QUEUE_LIB.create({ ttlMs: 3000, maxItems: 16 })
+    : { enqueue: () => false, flush: () => true, sweep: () => {}, size: () => 0, hasEstop: () => false };
+  const QUEUED_UI_OPS = new Set([
+    "arm", "cart_go", "home", "power", "link", "arm_src", "clear", "path",
+    "replay", "rec_start", "rec_stop", "rec_delete", "rec_rename", "script",
+    "grip", "mode", "grav_urdf",
+  ]);
+
+  function dropQueued(obj, reason) {
+    const op = obj && obj.t;
+    if (!op) return;
+    // A queued target that is cancelled or preempted by estop must not keep
+    // the sliders marked dirty forever.
+    if (op === "arm") jointDirty = false;
+    if (op === "cart_go") cartDirty = false;
+    if (pendingCmd[op]) {
+      endCmd(op, false, reason);
+      return;
+    }
+    if (QUEUED_UI_OPS.has(op)) setAck(reason, false);
+  }
+
   function send(obj) {
     if (obj && (obj.t === "arm" || obj.t === "cart" || obj.t === "teach" || obj.t === "cart_go")) {
       obj.t0 = performance.now();
     }
-    if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj));
+    if (ws && ws.readyState === 1) {
+      try {
+        ws.send(JSON.stringify(obj));
+        return true;
+      } catch (e) {}
+    }
+    if (!CMD_QUEUE_LIB || CMD_QUEUE_LIB.shouldDrop(obj)) return false;
+    cmdQueue.enqueue(obj, dropQueued);
+    return false;
+  }
+
+  let flushTimer = 0;
+  function flushCmdQueue() {
+    if (!ws || ws.readyState !== 1) return;
+    const ok = cmdQueue.flush((obj) => {
+      try {
+        ws.send(JSON.stringify(obj));
+        return true;
+      } catch (e) {
+        return false;
+      }
+    }, dropQueued);
+    if (!ok && cmdQueue.size() && ws && ws.readyState === 1 && !flushTimer) {
+      flushTimer = setTimeout(() => {
+        flushTimer = 0;
+        flushCmdQueue();
+      }, 250);
+    }
   }
   function noteRtt(ms) {
     if (!Number.isFinite(ms) || ms < 0 || ms > 250) return;
@@ -710,10 +762,11 @@
       setAck("目标就是当前末端位姿。先拖滑条再发送，或用 WASD。", false);
       return;
     }
-    cartDirty = true;
-    send({ t: "cart_go", xyz: pose.xyz, rpy: pose.rpy, speed: Number($("armSpeed").value || 40) });
+    cartDirty = false;
+    const sent = send({ t: "cart_go", xyz: pose.xyz, rpy: pose.rpy, speed: Number($("armSpeed").value || 40) });
+    if (sent) cartDirty = true;
     flashHot("send", "发送位置");
-    setAck("笛卡尔目标已按 Speed 下发", true);
+    setAck(sent ? "笛卡尔目标已按 Speed 下发" : "未连接：目标已排队，连接恢复后下发", sent);
   }
   function bindCartSliders() {
     const box = $("cartList");
@@ -796,10 +849,11 @@
       setAck("目标就是当前角，臂不会动。先拖滑条再发送，或勾选实时跟随。", false);
       return;
     }
-    jointDirty = true;
-    send({ t: "arm", q: q, speed: Number($("armSpeed").value || 40) });
+    jointDirty = false;
+    const sent = send({ t: "arm", q: q, speed: Number($("armSpeed").value || 40) });
+    if (sent) jointDirty = true;
     flashHot("send", "发送位置");
-    setAck("关节目标已下发", true);
+    setAck(sent ? "关节目标已下发" : "未连接：目标已排队，连接恢复后下发", sent);
   }
 
   function kv(title, rows) {
@@ -881,8 +935,7 @@
     paintCartPose(a);
     if (d.echo_t0 != null) applyEchoRtt(d.echo_t0);
     const estop = d.safety === "ESTOP_LATCHED";
-    $("estopBanner").classList.toggle("on", estop);
-    $("safeTxt").textContent = d.safety || "—";
+    paintSafety(d);
     paintCmdErr(d, a);
     if ($("kbAck")) {
       if (a.ik_err) {
@@ -1171,6 +1224,13 @@
     if (prev) setTimeout(() => URL.revokeObjectURL(prev), 200);
   }
 
+  function paintSafety(d) {
+    const estop = !!(d && d.safety === "ESTOP_LATCHED");
+    const banner = $("estopBanner");
+    if (banner) banner.classList.toggle("on", estop);
+    if ($("safeTxt")) $("safeTxt").textContent = (d && d.safety) || "—";
+    if ($("btnEstop")) $("btnEstop").classList.toggle("is-on", estop);
+  }
   function parseTelem(buf) {
     if (!(buf instanceof ArrayBuffer) || buf.byteLength < TELEM_SIZE) return null;
     const v = new DataView(buf);
@@ -1186,7 +1246,7 @@
       tgt.push(v.getFloat32(44 + 4 * i, true));
     }
     for (let i = 0; i < 3; i++) ee.push(v.getFloat32(72 + 4 * i, true));
-    const names = { 0: "IDLE", 1: "OPERATING", 2: "ESTOP_LATCHED", 3: "WATCHDOG" };
+    const names = { 0: "IDLE", 1: "OPERATING", 2: "ESTOP_LATCHED", 3: "WATCHDOG_TRIP" };
     return {
       seq: v.getUint32(4, true),
       echo_t0: Number.isFinite(echo) ? echo : null,
@@ -1222,6 +1282,7 @@
     const a = last.arm || {};
     if (window.Arm3D) Arm3D.setPose(a.q_deg || [], a.gripper_deg, a.gripper_open);
     if (last.echo_t0 != null) applyEchoRtt(last.echo_t0);
+    paintSafety(last);
     if (teleopHot()) return;
     if (currentPage() === "arm") syncJointsFromSnap(a);
     paintCartPose(a);
@@ -1237,6 +1298,7 @@
     }
     const sock = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws/cmd");
     ws = sock;
+    sock.onopen = () => { if (ws === sock) flushCmdQueue(); };
     sock.onclose = () => {
       if (ws !== sock) return;
       setLink(false, "");
@@ -1314,6 +1376,7 @@
       if (msg.t === "hud" && msg.d) {
         if (teleopHot()) {
           last = mergeSnap(msg.d);
+          paintSafety(last);
           paintCmdErr(msg.d, last.arm || {});
           const a = last.arm || {};
           if (a.ik_err && $("kbAck")) {
@@ -1453,11 +1516,11 @@
   function fireEstop() {
     cartHeld.clear();
     stopFollowStream();
-    send({ t: "e" });
+    const sent = send({ t: "e" });
     pulseBtn($("btnEstop"));
     if ($("btnEstop")) $("btnEstop").classList.add("is-on");
     flashHot("estop", "急停");
-    setAck("急停：电机已刹车（不是位置保持，也不是断电卸力）", false);
+    setAck(sent ? "急停：电机已刹车（不是位置保持，也不是断电卸力）" : "急停尚未送到，连接恢复后补发", false);
   }
   function fireClearEstop() {
     if (!beginCmd("clear", {
@@ -1898,7 +1961,7 @@
     setHotkeyPop(false);
   });
 
-  setInterval(() => { if (live) sendTouch(); flushHz(); }, 100);
+  setInterval(() => { if (live) sendTouch(); flushHz(); cmdQueue.sweep(dropQueued); }, 100);
   setInterval(() => { if (live && !rttWorker) sendPing(); }, 250);
 
   buildJoints();

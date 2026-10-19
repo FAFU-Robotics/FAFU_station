@@ -54,7 +54,7 @@ button.danger {
   font-weight: 700; letter-spacing: .08em;
 }
 button.ghost { background: transparent; }
-<button:disabled { opacity: .45; cursor: not-allowed; }
+button:disabled { opacity: .45; cursor: not-allowed; }
 button:disabled:hover { border-color: var(--line-2); background: #1b2733; }
 .mode-btn:disabled.active { opacity: .45; }
 button.danger:active:not(:disabled) {

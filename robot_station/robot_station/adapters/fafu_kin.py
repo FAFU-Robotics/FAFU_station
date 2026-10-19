@@ -255,6 +255,41 @@ def xyz_err(a: Sequence[float], b: Sequence[float]) -> float:
     return math.sqrt(sum((float(a[i]) - float(b[i])) ** 2 for i in range(3)))
 
 
+# Explicit poses and rotation keys reject an ACK above this residual.
+ORI_ACK_TOL_RAD = math.radians(3.0)
+# A residual must also be small compared with what was asked for. Without this,
+# a 2.9 deg request that solved nothing (seed returned unchanged) passed the
+# absolute 3 deg check and looked like success. The floor must stay well below
+# the smallest real command: the keyboard sends ~0.17 deg per 100 Hz tick
+# (1.7 deg table value * 10 * dt), so a 0.5 deg floor would still hide a no-op.
+ORI_MIN_TOL_RAD = math.radians(0.02)
+ORI_PROGRESS_RATIO = 0.25
+
+
+def orientation_error_rad(r_cur: Any, r_goal: Any) -> float:
+    """Geodesic angle in radians between two rotations."""
+    a = as_rotation(r_cur, is_euler=False)
+    b = as_rotation(r_goal, is_euler=False)
+    trace = 0.0
+    for i in range(3):
+        for k in range(3):
+            trace += a[k][i] * b[k][i]
+    cosine = max(-1.0, min(1.0, (trace - 1.0) * 0.5))
+    return math.acos(cosine)
+
+
+def orientation_ack_tol_rad(requested_rad: float) -> float:
+    """Acceptable orientation residual for a solve that requested this angle.
+
+    ``min(3 deg, max(0.02 deg, 25% of the request))``: the tiny floor only
+    absorbs solver noise. It must stay below the smallest real command (the
+    keyboard's ~0.17 deg tick), otherwise "did not move" would still pass.
+    Large requests keep the original 3 deg absolute accuracy.
+    """
+    requested = max(0.0, float(requested_rad))
+    return min(ORI_ACK_TOL_RAD, max(ORI_MIN_TOL_RAD, ORI_PROGRESS_RATIO * requested))
+
+
 def step_cartesian(
     q_rad: Sequence[float],
     dxyz: Sequence[float],
@@ -380,8 +415,13 @@ def inverse(
     else:
         r_goal = as_rotation(rpy_rad, is_euler=True, is_radians=True)
     q = clip_rad(list(seed_rad or [0.0, math.radians(40.0), math.radians(40.0), 0.0, 0.0, 0.0]))
+    q_seed = list(q)
     p_goal = [x, y, z]
     ow = max(0.0, float(ori_weight))
+    ori_tol = ORI_ACK_TOL_RAD
+    if ow >= 1e-9:
+        _p_seed, r_seed, _rpy_seed = forward_pose(q_seed)
+        ori_tol = orientation_ack_tol_rad(orientation_error_rad(r_seed, r_goal))
     best_q = list(q)
     best_pos = 1e9
     for _ in range(max_iter):
@@ -410,8 +450,14 @@ def inverse(
         if step > 0.35:
             dq = [v * (0.35 / step) for v in dq]
         q = clip_rad([q[i] + dq[i] for i in range(6)])
-    if best_pos <= 0.001:
+    # Position-only solves may stop on XYZ. A 6D solve that never converged
+    # must not report success just because the seed already matches position.
+    if best_pos <= 0.001 and ow < 1e-9:
         return clip_rad(best_q)
+    if best_pos <= 0.001 and ow >= 1e-9:
+        _p_best, r_best, _rpy_best = forward_pose(best_q)
+        if orientation_error_rad(r_best, r_goal) <= ori_tol:
+            return clip_rad(best_q)
     return None
 
 

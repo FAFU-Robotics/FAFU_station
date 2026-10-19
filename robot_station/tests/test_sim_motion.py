@@ -63,10 +63,14 @@ class SimMotionTests(unittest.TestCase):
             while time.monotonic() < deadline:
                 snap = core.snapshot()["arm"]
                 q = snap["q_deg"]
-                if max(abs(x) for x in q[:3]) < 2.0 and not snap.get("moving"):
+                ee = snap.get("ee_m")
+                if ee and max(abs(x) for x in q[:3]) < 2.0 and not snap.get("moving"):
                     break
                 time.sleep(0.04)
-            x0 = core.snapshot()["arm"]["ee_m"][0]
+            ee0 = core.snapshot()["arm"]["ee_m"]
+            self.assertIsNotNone(ee0)
+            assert ee0 is not None
+            x0 = ee0[0]
             for _ in range(8):
                 err = core.on_cartesian("a", [0.008, 0.0, 0.0], [0.0, 0.0, 0.0])
                 self.assertIsNone(err, err)

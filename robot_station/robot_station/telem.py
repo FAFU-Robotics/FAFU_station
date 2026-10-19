@@ -25,8 +25,15 @@ FLAG_MOVING = 4
 FLAG_GRIP = 8
 FLAG_IK = 16
 
-_SAFETY = {"IDLE": 0, "OPERATING": 1, "ESTOP_LATCHED": 2, "WATCHDOG": 3}
-_SAFETY_NAME = {code: name for name, code in _SAFETY.items()}
+_SAFETY = {
+    "IDLE": 0,
+    "OPERATING": 1,
+    "ESTOP_LATCHED": 2,
+    "WATCHDOG": 3,
+    "WATCHDOG_TRIP": 3,
+}
+# Both names encode as 3. Decode always uses the Safety enum name.
+_SAFETY_NAME = {0: "IDLE", 1: "OPERATING", 2: "ESTOP_LATCHED", 3: "WATCHDOG_TRIP"}
 
 
 def _six(raw: Any) -> list[float]:

@@ -16,9 +16,14 @@ from robot_station.config import StationConfig
 from robot_station.safety import Safety, SafetyGate
 from robot_station.runtime import freeze_boot_code_rev
 from robot_station.telem import pack_telem
-from robot_station.world import World
+from robot_station.world import ArmSnap, World
 
 logger = logging.getLogger("station.motion")
+
+# Written to cmd_err when one 100 Hz tick raises. Kept as a constant so the
+# recovery path can recognise and clear exactly this message.
+TICK_ERR_TEXT = "运动拍异常，已跳过并继续"
+TICK_ERR_LOG_EVERY_S = 5.0
 
 
 def _is_vendor_enable_noise(text: str) -> bool:
@@ -135,6 +140,18 @@ class MotionCore:
             allow_motion=cfg.arm_allow_motion,
             gripper_id=cfg.arm_gripper_id,
         )
+        # Publish an honest offline snap before the first poll. The dataclass
+        # default is a connected mock arm, and telemetry sends seq 0 immediately.
+        n = int(cfg.arm_joints)
+        self.world.arm = ArmSnap(
+            online=False,
+            enabled=False,
+            backend=str(getattr(self.arm, "backend", "") or cfg.arm or "offline"),
+            n=n,
+            q_deg=[0.0] * n,
+            target_deg=[0.0] * n,
+            ok=[False] * n,
+        )
         self.camera = camera
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -148,6 +165,8 @@ class MotionCore:
         self._cart_pending = False
         self._ik_err = ""
         self._cmd_err = ""
+        self._tick_err_count = 0
+        self._tick_err_last_log = -1e9
         self._pub = threading.Condition()
         self._timer_armed = False
         self._rt_armed = False
@@ -1030,11 +1049,39 @@ class MotionCore:
             now_pc = time.perf_counter()
             dt = now_pc - last
             last = now_pc
-            self._step(time.monotonic(), dt)
+            try:
+                self._step(time.monotonic(), dt)
+            except Exception:
+                self._note_tick_error()
             next_tick += period
             if next_tick < now_pc - period:
                 next_tick = now_pc + period
             _sleep_until(next_tick)
+
+    def _note_tick_error(self) -> None:
+        """Keep the loop alive and make the failure visible to the HUD.
+
+        ``_set_cmd_err`` alone is not enough: telemetry waits for ``world.seq``
+        to move, and a persistent failure would freeze the page with no error.
+        Logging is rate limited so a 100 Hz failure cannot flood the host log.
+        """
+        now = time.monotonic()
+        self._tick_err_count += 1
+        if now - self._tick_err_last_log >= TICK_ERR_LOG_EVERY_S:
+            self._tick_err_last_log = now
+            if self._tick_err_count == 1:
+                logger.exception("100 Hz tick 异常，本拍跳过并继续")
+            else:
+                logger.error(
+                    "100 Hz tick 仍在异常（连续 %d 次），本拍跳过并继续",
+                    self._tick_err_count,
+                )
+        with self._lock:
+            self._cmd_err = TICK_ERR_TEXT
+            self.world.seq += 1
+            self.world.t_mono = now
+        with self._pub:
+            self._pub.notify_all()
 
     def _step(self, now: float, dt: float) -> None:
         with self._lock:
@@ -1103,9 +1150,11 @@ class MotionCore:
             writer_err = ""
         if writer_err:
             self._set_cmd_err(writer_err)
-        elif _live_joints_ok(arm):
+        else:
             stale = self._cmd_err or ""
-            if _is_vendor_enable_noise(stale):
+            if stale == TICK_ERR_TEXT:
+                self._set_cmd_err("")
+            elif _live_joints_ok(arm) and _is_vendor_enable_noise(stale):
                 self._set_cmd_err("")
         if self._ik_err:
             arm.ik_err = self._ik_err
@@ -1120,6 +1169,7 @@ class MotionCore:
             self.world.camera = cam
         with self._pub:
             self._pub.notify_all()
+        self._tick_err_count = 0
 
 
 def encode_line(obj: dict) -> bytes:

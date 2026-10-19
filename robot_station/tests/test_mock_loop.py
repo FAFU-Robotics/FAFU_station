@@ -12,6 +12,79 @@ from robot_station.service import Station
 
 
 class MockLoopTests(unittest.TestCase):
+    def test_tick_continues_after_poll_error(self) -> None:
+        from robot_station.motion import MotionCore
+
+        core = MotionCore(StationConfig(arm="mock", open_browser=False, control_hz=50))
+        core.start()
+        try:
+            orig = core.arm.poll
+            state = {"n": 0}
+
+            def flaky():
+                state["n"] += 1
+                if state["n"] <= 3:
+                    raise RuntimeError("io")
+                return orig()
+
+            core.arm.poll = flaky
+            time.sleep(0.2)
+            self.assertTrue(core._tick_th is not None and core._tick_th.is_alive())
+            self.assertGreater(state["n"], 3)
+            # The error is transient: the next healthy tick clears it.
+            self.assertNotIn("运动拍异常", core.snapshot().get("cmd_err") or "")
+        finally:
+            core.stop()
+
+    def test_tick_error_is_published_and_cleared(self) -> None:
+        from robot_station.motion import MotionCore, TICK_ERR_TEXT
+
+        core = MotionCore(StationConfig(arm="mock", open_browser=False, control_hz=50))
+        core.start()
+        try:
+            orig = core._step
+            seq0 = core.snapshot()["seq"]
+
+            def boom(now: float, dt: float) -> None:
+                raise RuntimeError("tick exploded")
+
+            core._step = boom
+            deadline = time.monotonic() + 1.0
+            while time.monotonic() < deadline:
+                snap = core.snapshot()
+                if snap["seq"] > seq0 and TICK_ERR_TEXT in (snap.get("cmd_err") or ""):
+                    break
+                time.sleep(0.02)
+            snap = core.snapshot()
+            self.assertGreater(snap["seq"], seq0)
+            self.assertIn(TICK_ERR_TEXT, snap.get("cmd_err") or "")
+
+            core._step = orig
+            deadline = time.monotonic() + 1.0
+            while time.monotonic() < deadline:
+                if not (core.snapshot().get("cmd_err") or ""):
+                    break
+                time.sleep(0.02)
+            self.assertNotIn(TICK_ERR_TEXT, core.snapshot().get("cmd_err") or "")
+        finally:
+            core.stop()
+
+    def test_mock_cartesian_rejects_small_orientation_noop(self) -> None:
+        arm = MockArm()
+        arm.teach_pose([0.0] * 6)
+        # At the zero pose the 24-iteration fallback solver returns the seed;
+        # before the adaptive tolerance that looked like success.
+        err = arm.apply_cartesian([0.0, 0.0, 0.0], [0.0, 0.0, 2.9])
+        self.assertIsNotNone(err)
+        self.assertIn("IK 无解", err or "")
+        # Away from the singularity a 1.7 deg step is a real solution and must
+        # still be accepted (the tolerance is 0.5 deg for this request).
+        arm.teach_pose([0.0, 40.0, 40.0, 0.0, 0.0, 0.0])
+        before = list(arm._tgt)
+        err = arm.apply_cartesian([0.0, 0.0, 0.0], [0.0, 0.0, 1.7])
+        self.assertIsNone(err, err)
+        self.assertNotEqual(before, list(arm._tgt))
+
     def test_png_header(self) -> None:
         blob = rgb_png(b"\x00\x80\xff" * 4, 2, 2)
         self.assertTrue(blob.startswith(b"\x89PNG"))

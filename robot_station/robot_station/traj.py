@@ -21,10 +21,16 @@ REPLAY_RATE_MAX = 1.0
 _UNSAFE_NAME = re.compile(r'[\\/:*?"<>|\x00-\x1f]+')
 
 
-def recordings_dir() -> Path:
-    override = (os.environ.get("STATION_RECORDINGS_DIR") or "").strip()
-    if override:
-        return Path(override)
+def source_recordings_dir() -> Path:
+    """Repo folder next to ``run_station.py``, outside the importable package.
+
+    Packaging copies the package tree and must not ship this directory.
+    """
+    return Path(__file__).resolve().parents[1] / "recordings"
+
+
+def user_recordings_dir() -> Path:
+    """Customer install data. Outside the exe zip; updates keep this folder."""
     local = (os.environ.get("LOCALAPPDATA") or "").strip()
     if local:
         return Path(local) / "FAFUArmStation" / "recordings"
@@ -32,6 +38,17 @@ def recordings_dir() -> Path:
     if xdg:
         return Path(xdg) / "FAFUArmStation" / "recordings"
     return Path.home() / ".local" / "share" / "FAFUArmStation" / "recordings"
+
+
+def recordings_dir() -> Path:
+    override = (os.environ.get("STATION_RECORDINGS_DIR") or "").strip()
+    if override:
+        return Path(override)
+    from robot_station.portable import install_root
+
+    if install_root() is not None:
+        return user_recordings_dir()
+    return source_recordings_dir()
 
 
 def sanitize_traj_name(name: str | None) -> str:

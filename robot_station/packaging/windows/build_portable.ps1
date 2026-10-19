@@ -108,7 +108,7 @@ function Find-PinocchioEnv {
 function Copy-Tree($src, $dst, [string[]]$ExtraXd = @()) {
     if (-not (Test-Path $src)) { throw "missing $src" }
     New-Item -ItemType Directory -Force -Path $dst | Out-Null
-    $xd = @("__pycache__", ".git", ".venv", "venv", "dist", "build") + @($ExtraXd)
+    $xd = @("__pycache__", ".git", ".venv", "venv", "dist", "build", "recordings") + @($ExtraXd)
     $xf = @("*.pyc", "*.pyo")
     $args = @($src, $dst, "/E", "/NFL", "/NDL", "/NJH", "/NJS", "/nc", "/ns", "/np", "/XD") + $xd + @("/XF") + $xf
     & robocopy @args | Out-Null

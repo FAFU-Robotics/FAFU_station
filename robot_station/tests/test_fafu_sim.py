@@ -70,6 +70,10 @@ class FafuSimTests(unittest.TestCase):
         _attach_fake(core)
         core.start()
         try:
+            # The first snapshot is intentionally offline; wait for the first
+            # successful poll instead of relying on the old dataclass default.
+            seq, _snap = core.wait_snap(0, 2.0)
+            self.assertGreater(seq, 0)
             self.assertIn("只读", core.on_arm_targets("a", [1, 0, 0, 0, 0, 0], 10.0) or "")
             self.assertIn("只读", core.on_home("a", 10.0) or "")
             self.assertIn("只读", core.on_gripper("a", False) or "")

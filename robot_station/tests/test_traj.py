@@ -7,6 +7,7 @@ import time
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
+from unittest.mock import patch
 
 from robot_station.traj import (
     TrajectoryWriter,
@@ -20,6 +21,7 @@ from robot_station.traj import (
     resolve_traj_path,
     sample_at,
     sanitize_traj_name,
+    source_recordings_dir,
     list_recordings,
 )
 
@@ -132,6 +134,40 @@ class TrajFileTests(unittest.TestCase):
             with self.assertRaises(FileNotFoundError):
                 resolve_traj_path("missing.jsonl")
             self.assertTrue(str(recordings_dir()).endswith("recordings") or recordings_dir().is_dir())
+
+    def test_source_tree_uses_repo_recordings(self) -> None:
+        old = os.environ.pop("STATION_RECORDINGS_DIR", None)
+        try:
+            with patch("robot_station.portable.install_root", return_value=None):
+                path = recordings_dir()
+            self.assertEqual(path, source_recordings_dir())
+            self.assertEqual(path.name, "recordings")
+            self.assertTrue((path.parent / "run_station.py").is_file())
+        finally:
+            if old is not None:
+                os.environ["STATION_RECORDINGS_DIR"] = old
+
+    def test_portable_install_uses_user_data_dir(self) -> None:
+        old_rec = os.environ.pop("STATION_RECORDINGS_DIR", None)
+        old_local = os.environ.get("LOCALAPPDATA")
+        os.environ["LOCALAPPDATA"] = r"C:\Users\Test\AppData\Local"
+        try:
+            with patch("robot_station.portable.install_root", return_value=Path(r"C:\install\FAFUArmStation")):
+                path = recordings_dir()
+            self.assertEqual(
+                path,
+                Path(r"C:\Users\Test\AppData\Local") / "FAFUArmStation" / "recordings",
+            )
+            self.assertNotEqual(path, source_recordings_dir())
+        finally:
+            if old_rec is None:
+                os.environ.pop("STATION_RECORDINGS_DIR", None)
+            else:
+                os.environ["STATION_RECORDINGS_DIR"] = old_rec
+            if old_local is None:
+                os.environ.pop("LOCALAPPDATA", None)
+            else:
+                os.environ["LOCALAPPDATA"] = old_local
 
 
 if __name__ == "__main__":

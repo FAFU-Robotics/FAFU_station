@@ -11,7 +11,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from websockets.datastructures import Headers
 from websockets.http11 import Request, Response
@@ -120,7 +120,9 @@ def serve_http(station: Station, cfg: StationConfig, stop_event: threading.Event
     asyncio.set_event_loop(loop)
 
     def dispatch(path: str, method: str, headers: Headers) -> Response | None:
-        path = urlsplit(path).path
+        parsed = urlsplit(path)
+        query = parse_qs(parsed.query)
+        path = parsed.path
         method = method.upper()
         upgrade = (headers.get("Upgrade") or "").lower()
 
@@ -214,11 +216,11 @@ def serve_http(station: Station, cfg: StationConfig, stop_event: threading.Event
 
             return _json(200, {"ok": True, "files": list_recordings()})
         if path.split("?", 1)[0] == "/api/traj" and method == "DELETE":
-            from urllib.parse import parse_qs
-
             from robot_station.traj import delete_recording
 
-            qs = parse_qs(urlsplit(path).query)
+            # path has already been reduced to parsed.path above; re-parsing it
+            # would silently drop the query string and leave name empty.
+            qs = query
             name = str((qs.get("name") or qs.get("file") or [""])[0] or "")
             try:
                 gone = delete_recording(name)
@@ -228,11 +230,9 @@ def serve_http(station: Station, cfg: StationConfig, stop_event: threading.Event
                 return _json(400, {"ok": False, "error": f"删除失败: {exc}"})
             return _json(200, {"ok": True, "name": gone.name})
         if path.split("?", 1)[0] == "/api/traj" and method == "PATCH":
-            from urllib.parse import parse_qs
-
             from robot_station.traj import rename_recording
 
-            qs = parse_qs(urlsplit(path).query)
+            qs = query
             name = str((qs.get("name") or qs.get("file") or [""])[0] or "")
             dest = str((qs.get("to") or qs.get("dest") or [""])[0] or "")
             try:

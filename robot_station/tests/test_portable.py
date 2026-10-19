@@ -306,6 +306,8 @@ class PortablePackagingFilesTests(unittest.TestCase):
         self.assertIn("Find-PinocchioEnv", ps1)
         self.assertIn("FAFUArmStation.ico", ps1)
         self.assertIn("station-customer-readme", ps1)
+        self.assertIn('"recordings"', ps1)
+        self.assertRegex(ps1, r'\$xd = @\([^)]*"recordings"')
         self.assertIn("README.md", ps1)
         self.assertTrue((ROOT / "docs" / "客户使用说明.md").is_file())
         customer = (ROOT / "docs" / "客户使用说明.md").read_text(encoding="utf-8")
