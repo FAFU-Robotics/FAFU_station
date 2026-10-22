@@ -702,6 +702,23 @@ def _prepare_live_servo_session(
     return live
 
 
+def _position_servo_slot_max(live: list[int], gripper_id: int | None) -> int:
+    """Keep an explicit no-op slot for the gripper in 0x8090 frames.
+
+    Six 6-byte motor slots plus the 2-byte query are rounded to a 48-byte
+    CAN-FD payload.  A motor at ID 7 can interpret the bytes immediately after
+    the six joint slots as its own command, so its slot must contain the
+    protocol NAN/no-op value instead of CAN-FD padding.  The MIT stream still
+    stops at the last joint because seven 10-byte MIT slots do not fit.
+    """
+    ids = [int(mid) for mid in live]
+    if gripper_id is not None:
+        ids.append(int(gripper_id))
+    if not ids:
+        raise RuntimeError("没有电机槽位，无法开始伺服")
+    return int(max(ids))
+
+
 def _lift_false_dead(robot: Any) -> bool:
     """Undo a DEAD latch caused by a silent gripper while joints still reply."""
     value = str(
@@ -1149,8 +1166,30 @@ def _read_motor_or_none(ht: Any, mid: int, timeout_s: float) -> Any:
         return None
 
 
+def _stop_gripper_on_connect(robot: Any) -> None:
+    """Cancel a stale gripper target with PWM off before startup probing.
+
+    Do not use MODE_BRAKE here.  Some gripper firmware actively resists in
+    brake mode, which is still continuous force.  MODE_STOP is the only safe
+    startup state when the new arm's zero, direction, and range are unknown.
+    """
+    grip = getattr(robot, "_gripper_motor_id", None)
+    if grip is None or not bool(getattr(robot, "_has_gripper", False)):
+        return
+    ht = getattr(robot, "_ht", None)
+    stop = getattr(ht, "stop", None) if ht is not None else None
+    if not callable(stop):
+        return
+    try:
+        stop(int(grip))
+        logger.info("连接时夹爪 M%s 先切 STOP（PWM 关闭），等待显式开合指令", int(grip))
+    except Exception:
+        logger.warning("连接时夹爪 M%s 切 STOP 失败", int(grip), exc_info=True)
+
+
 def _soft_precheck_communication(robot: Any) -> None:
     """Ping motors. Never raise: a silent joint must not fail Connect."""
+    _stop_gripper_on_connect(robot)
     ht = getattr(robot, "_ht", None)
     cfg = getattr(robot, "_cfg", None)
     ids = list(getattr(cfg, "motor_ids", []) or [])
@@ -1306,7 +1345,7 @@ def _patch_controller_partial_axis(controller_cls: type) -> type:
         if callable(_orig_servo_start):
             _orig_servo_start(self, opts)
         if live:
-            self._servo_max_motor_id = int(max(live))
+            self._servo_max_motor_id = _position_servo_slot_max(live, grip)
             self._servo_mit_max_motor_id = int(max(live))
 
     controller_cls._precheck_communication = _precheck
@@ -1403,7 +1442,7 @@ def _with_soft_precheck(controller_cls: type) -> type:
             )
             super().servo_start(opts)
             if live:
-                self._servo_max_motor_id = int(max(live))
+                self._servo_max_motor_id = _position_servo_slot_max(live, grip)
                 self._servo_mit_max_motor_id = int(max(live))
 
     SoftPrecheckController.__name__ = str(getattr(controller_cls, "__name__", "Controller"))
@@ -1846,7 +1885,10 @@ class FafuArm(ArmAdapter):
                 self._brake_latched = False
                 self._brake_applied = False
                 self._offline_ids = list(missing)
-            self._start_reprobe(robot, list(self._full_joint_ids))
+            reprobe_ids = list(self._full_joint_ids)
+            if self.has_gripper and int(self.gripper_id) not in reprobe_ids:
+                reprobe_ids.append(int(self.gripper_id))
+            self._start_reprobe(robot, reprobe_ids)
             self._make_servo_opts()
             logger.info(
                 "FAFU 臂%s已开 state=%s joints=%s enabled=%s allow_motion=%s dyn=%s",
@@ -2053,6 +2095,7 @@ class FafuArm(ArmAdapter):
                     return
                 if not _hardware_link_up(robot):
                     return
+                self._restore_gripper_online_if_answering(robot)
                 ht = getattr(robot, "_ht", None)
                 if ht is None or not hasattr(ht, "get_cached_state"):
                     return
@@ -2075,6 +2118,7 @@ class FafuArm(ArmAdapter):
                     robot._missing_motors = still
                 except Exception:
                     pass
+                self._restore_gripper_online_if_answering(robot)
                 _restart_live_polling(robot, list(ids))
 
         self._reprobe_th = threading.Thread(target=_loop, name="fafu-reprobe", daemon=True)
@@ -2097,7 +2141,11 @@ class FafuArm(ArmAdapter):
         if robot is None:
             return
         try:
-            robot.close_connection(joint_release="hold", gripper_release="hold")
+            # Joints must keep their pose while the host is replaced.  The
+            # gripper uses STOP/PWM-off: POSITION hold can drive a differently
+            # calibrated arm into an end stop, while BRAKE can still exert
+            # continuously on some gripper firmware.
+            robot.close_connection(joint_release="hold", gripper_release="stop")
         except TypeError:
             try:
                 robot.close_connection()
@@ -2137,7 +2185,9 @@ class FafuArm(ArmAdapter):
                 self._robot = None
                 self._offline_ids = []
         try:
-            robot.close_connection(joint_release="hold", gripper_release="hold")
+            # Leave the disconnected gripper in STOP/PWM-off.  Both POSITION
+            # hold and vendor-specific BRAKE behavior can apply force.
+            robot.close_connection(joint_release="hold", gripper_release="stop")
         except TypeError:
             try:
                 robot.close_connection()
@@ -2839,10 +2889,66 @@ class FafuArm(ArmAdapter):
             return self._joints_enabled(states, ids, robot)
         return self._flag_enabled(robot)
 
+    def _restore_gripper_online_if_answering(self, robot: Any) -> bool:
+        """Clear a stale startup-offline latch once M7 answers without a fault."""
+        if not self.has_gripper:
+            return False
+        gid = int(self.gripper_id)
+        ht = getattr(robot, "_ht", None)
+        if ht is None:
+            return False
+        state = None
+        if hasattr(ht, "get_cached_state"):
+            try:
+                state = ht.get_cached_state(gid)
+            except Exception:
+                state = None
+        if _gripper_state_unusable(state) and hasattr(ht, "read_motor_state"):
+            try:
+                state = ht.read_motor_state(gid, 0.12)
+            except Exception:
+                state = None
+        if _gripper_state_unusable(state):
+            return False
+
+        was_latched = (
+            not bool(getattr(robot, "_gripper_online", True))
+            or gid in set(self._offline_ids)
+            or gid in set(getattr(robot, "_missing_motors", None) or [])
+            or gid in set(getattr(robot, "_station_offline_ids", None) or [])
+        )
+        try:
+            robot._gripper_online = True
+        except Exception:
+            pass
+        self._offline_ids = [mid for mid in self._offline_ids if int(mid) != gid]
+        for attr in ("_missing_motors", "_station_offline_ids"):
+            values = [
+                int(mid)
+                for mid in (getattr(robot, attr, None) or [])
+                if int(mid) != gid
+            ]
+            try:
+                setattr(robot, attr, values)
+            except Exception:
+                pass
+        if was_latched:
+            ids = list(self._full_joint_ids)
+            if gid not in ids:
+                ids.append(gid)
+            _restart_live_polling(robot, ids)
+            logger.info("夹爪 M%s 已恢复在线，重新允许显式开合指令", gid)
+        return True
+
     def _gripper_offline_reason(self, robot: Any) -> str | None:
-        if self.has_gripper and not bool(getattr(robot, "_gripper_online", True)):
-            return "夹爪离线，无法控制；在线轴仍可运动"
-        if int(self.gripper_id) in set(self._absent_motor_ids(robot)):
+        if not self.has_gripper:
+            return None
+        gid = int(self.gripper_id)
+        latched = (
+            not bool(getattr(robot, "_gripper_online", True))
+            or gid in set(self._absent_motor_ids(robot))
+        )
+        if latched and not self._restore_gripper_online_if_answering(robot):
             return "夹爪离线，无法控制；在线轴仍可运动"
         return None
 
@@ -3065,7 +3171,12 @@ class FafuArm(ArmAdapter):
                 return
             cmds = build(targets, vel_rps=0.0)
             ids = list(cfg.motor_ids) or list(targets)
-            ht.set_many_pos_vel_tqe(cmds, pm.PosUnit.Turns, int(max(int(m) for m in ids)), 0.05)
+            grip = getattr(robot, "_gripper_motor_id", None)
+            max_slot = _position_servo_slot_max(
+                [int(m) for m in ids],
+                int(grip) if grip is not None else None,
+            )
+            ht.set_many_pos_vel_tqe(cmds, pm.PosUnit.Turns, max_slot, 0.05)
             self._servo_cmd_rad = list(q_rad[: self.n])
             self._stream_q_rad = list(self._servo_cmd_rad)
             self._target_deg = [math.degrees(float(x)) for x in q_rad[: self.n]]

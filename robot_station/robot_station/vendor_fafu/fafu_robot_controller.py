@@ -2151,10 +2151,24 @@ class FafuRobotController:
         self._servo_hold_ids_np = hold_ids_np
         self._servo_active_pos_np = active_pos_np
         self._servo_active_vel_np = active_vel_np
-        # Slot count is joints + hold motors. Never include the gripper:
-        # M7 in the 0x8090 bitmap makes a 7-slot 72B frame (>64B) and
-        # servo_j sends nothing.
+        # Position frames use 6 bytes per motor, so M7 fits: 7*6+2 = 44B.
+        # Include its slot but leave it absent from active_ids/hold_ids, which
+        # makes the C++ encoder write NAN_INT16 ("no operation"). This is
+        # necessary even though the gripper is not controlled by servo_j:
+        # six slots plus the query are rounded to a 48B CAN-FD payload, and
+        # some M7 firmware interprets the following 0x50 padding bytes as its
+        # own position/velocity/torque command. An explicit NAN slot prevents
+        # the gripper from driving whenever the arm stream sends 0x8090.
+        #
+        # MIT remains capped at six joints above because it uses 10B per slot;
+        # seven MIT slots plus the query would be 72B and exceed CAN-FD.
         frame_ids = list(self._joint_motor_ids) + [int(m) for m in hold_motor_ids]
+        if (
+            not opts.use_mit
+            and self._has_gripper
+            and self._gripper_motor_id is not None
+        ):
+            frame_ids.append(int(self._gripper_motor_id))
         self._servo_max_motor_id = int(max(frame_ids)) if frame_ids else int(
             max(self._joint_motor_ids)
         )

@@ -66,6 +66,132 @@ class FafuArmTests(unittest.TestCase):
         self.assertFalse(snap.online)
         self.assertFalse(snap.enabled)
 
+    def test_gripper_starts_and_disconnects_with_pwm_off(self) -> None:
+        from robot_station.adapters.fafu_arm import _stop_gripper_on_connect
+
+        class Ht:
+            def __init__(self) -> None:
+                self.stopped: list[int] = []
+
+            def stop(self, motor_id: int) -> None:
+                self.stopped.append(int(motor_id))
+
+        startup = type(
+            "StartupRobot",
+            (),
+            {
+                "_has_gripper": True,
+                "_gripper_motor_id": 7,
+                "_ht": Ht(),
+            },
+        )()
+        _stop_gripper_on_connect(startup)
+        self.assertEqual(startup._ht.stopped, [7])
+
+        class Dummy:
+            sim_teach = False
+
+            def __init__(self) -> None:
+                self.close_kwargs: dict[str, object] = {}
+
+            def close_connection(self, **kwargs: object) -> None:
+                self.close_kwargs = dict(kwargs)
+
+        arm = FafuArm(required=False, allow_motion=False)
+        dummy = Dummy()
+        arm._robot = dummy
+        arm.stop()
+        self.assertEqual(dummy.close_kwargs.get("joint_release"), "hold")
+        self.assertEqual(dummy.close_kwargs.get("gripper_release"), "stop")
+
+        arm = FafuArm(required=False, allow_motion=False)
+        dummy = Dummy()
+        arm._robot = dummy
+        arm._drop_lost_live_link()
+        self.assertEqual(dummy.close_kwargs.get("joint_release"), "hold")
+        self.assertEqual(dummy.close_kwargs.get("gripper_release"), "stop")
+
+    def test_zero_velocity_arm_frame_keeps_m7_noop_slot(self) -> None:
+        import sys
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        sent: list[tuple[object, object, int, float]] = []
+
+        class Ht:
+            def set_many_pos_vel_tqe(
+                self,
+                cmds: object,
+                unit: object,
+                max_motor_id: int,
+                timeout_s: float,
+            ) -> None:
+                sent.append((cmds, unit, int(max_motor_id), float(timeout_s)))
+
+        robot = SimpleNamespace(
+            _joint_motor_ids=[1, 2, 3, 4, 5, 6],
+            _gripper_motor_id=7,
+            _cfg=SimpleNamespace(motor_ids=[1, 2, 3, 4, 5, 6]),
+            _ht=Ht(),
+            _build_many_cmds_holding_others=lambda targets, vel_rps: [
+                (dict(targets), float(vel_rps))
+            ],
+        )
+        fake_pm = SimpleNamespace(PosUnit=SimpleNamespace(Turns="turns"))
+        arm = FafuArm(required=False, allow_motion=True)
+        arm.allow_motion = True
+        arm._robot = robot
+        arm._full_joint_ids = [1, 2, 3, 4, 5, 6]
+
+        with patch.dict(sys.modules, {"fafu_motor": fake_pm}):
+            arm._send_zero_vel_hold([0.0] * 6)
+
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0][2], 7)
+
+    def test_answering_m7_clears_stale_startup_offline_latch(self) -> None:
+        from types import SimpleNamespace
+
+        class Ht:
+            def __init__(self, state: object | None) -> None:
+                self.state = state
+                self.polled: list[int] = []
+
+            def get_cached_state(self, motor_id: int) -> object | None:
+                return self.state if int(motor_id) == 7 else None
+
+            def read_motor_state(self, motor_id: int, _timeout_s: float) -> object | None:
+                return self.get_cached_state(motor_id)
+
+            def start_state_polling(self, ids: list[int], _hz: float) -> None:
+                self.polled = [int(mid) for mid in ids]
+
+        arm = FafuArm(required=False, allow_motion=True, has_gripper=True, gripper_id=7)
+        arm._offline_ids = [7]
+        arm._full_joint_ids = [1, 2, 3, 4, 5, 6]
+        ht = Ht(SimpleNamespace(online=True, fault=0, mode=0))
+        robot = SimpleNamespace(
+            _ht=ht,
+            _cfg=SimpleNamespace(control_rate_hz=100.0),
+            _gripper_online=False,
+            _missing_motors=[7],
+            _station_offline_ids=[7],
+        )
+
+        self.assertIsNone(arm._gripper_offline_reason(robot))
+        self.assertTrue(robot._gripper_online)
+        self.assertNotIn(7, arm._offline_ids)
+        self.assertNotIn(7, robot._missing_motors)
+        self.assertNotIn(7, robot._station_offline_ids)
+        self.assertEqual(ht.polled, [1, 2, 3, 4, 5, 6, 7])
+
+        arm._offline_ids = [7]
+        robot._gripper_online = False
+        robot._missing_motors = [7]
+        robot._station_offline_ids = [7]
+        ht.state = None
+        self.assertIn("夹爪离线", arm._gripper_offline_reason(robot) or "")
+
     def test_native_openable_path_keeps_ascii(self) -> None:
         import tempfile
         from pathlib import Path

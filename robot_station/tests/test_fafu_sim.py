@@ -284,7 +284,7 @@ class FafuSimTests(unittest.TestCase):
         obj = _with_soft_precheck(OverlayLike)()
         self.assertEqual(list(getattr(obj, "_missing_motors", []) or []), [])
 
-    def test_wrapped_enable_skips_offline_gripper(self) -> None:
+    def test_wrapped_enable_skips_gripper_but_keeps_noop_frame_slot(self) -> None:
         from types import SimpleNamespace
 
         from robot_station.adapters.fafu_arm import _with_soft_precheck
@@ -296,12 +296,10 @@ class FafuSimTests(unittest.TestCase):
                 self.mode = mode
                 self.online = True
 
-        cache = {i: Motor(0) for i in range(1, 7)}
+        cache = {i: Motor(0) for i in range(1, 8)}
 
         class Ht:
             def read_motor_state(self, mid: int, _t: float) -> Motor | None:
-                if int(mid) == 7:
-                    return None
                 return cache.get(int(mid))
 
             def get_cached_state(self, mid: int) -> Motor | None:
@@ -356,7 +354,11 @@ class FafuSimTests(unittest.TestCase):
         obj.servo_start()
         self.assertTrue(obj.started)
         self.assertEqual(obj.servo_slots, 6)
-        self.assertEqual(obj._servo_max_motor_id, 6)
+        # 0x8090 is still an arm-only command, but M7 needs an explicit
+        # NAN/no-op slot. Otherwise the 48-byte CAN-FD padding is parsed by
+        # some gripper firmware as an M7 command on every servo tick.
+        self.assertEqual(obj._servo_max_motor_id, 7)
+        self.assertEqual(obj._servo_mit_max_motor_id, 6)
         self.assertNotIn(7, list(obj._cfg.motor_ids))
 
     def test_silent_gripper_dropped_before_vendor_enable(self) -> None:
