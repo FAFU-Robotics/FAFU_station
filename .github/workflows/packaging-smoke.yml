@@ -11,6 +11,8 @@ on:
       - "robot_station/tests/test_linux_preflight.py"
       - "robot_station/.github/workflows/packaging-smoke.yml"
       - ".github/workflows/packaging-smoke.yml"
+      - "fafu_arm_sdk"
+      - ".gitmodules"
       - "fafu_arm_sdk/**"
       - "robot_station/requirements.txt"
   pull_request:
@@ -23,6 +25,8 @@ on:
       - "robot_station/tests/test_linux_preflight.py"
       - "robot_station/.github/workflows/packaging-smoke.yml"
       - ".github/workflows/packaging-smoke.yml"
+      - "fafu_arm_sdk"
+      - ".gitmodules"
       - "fafu_arm_sdk/**"
       - "robot_station/requirements.txt"
   workflow_dispatch:
@@ -35,6 +39,8 @@ jobs:
         working-directory: robot_station
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - uses: actions/setup-python@v5
         with:
           python-version: "3.10"
@@ -64,6 +70,8 @@ jobs:
         working-directory: robot_station
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - uses: actions/setup-python@v5
         with:
           python-version: "3.10"
@@ -77,6 +85,8 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - name: Require fafu_arm_sdk
         run: |
           set -euo pipefail

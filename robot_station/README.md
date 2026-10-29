@@ -18,7 +18,7 @@
 |---|---|---|
 | 客户 Windows（推荐） | 插 USB 后双击收到的 `FAFUArmStation.exe` | 解到用户目录并打开控制页；后台建桌面快捷方式 |
 | 客户 Ubuntu（推荐） | 插 USB 后双击 `FAFUArmStation-x86_64.AppImage` | 独立 GTK 窗口；`chmod +x`；缺 FUSE 时 `--appimage-extract-and-run` |
-| 开发机 Windows | 双击 `启动真机.bat` | 优先目录内私有 `runtime\python310`；否则本机 Python 3.10 |
+| 开发机 Windows | 双击 `启动真机.bat` | 优先私有 `runtime\python310`；源码开发可用 Python 3.12 / 3.10，须有匹配的 SDK 扩展 |
 | 开发机 Ubuntu | `bash 启动真机.sh` | 优先私有 `runtime/python310/bin/python3`；否则本机 Python 3.10 |
 | 任意平台命令行 | `python run_station.py` | 运动进程 `:9470` + 网页 `:9400` |
 | 只看总览、不控臂 | `python tools/status_panel.py` | 需站控已在本机运行 |
@@ -43,7 +43,26 @@ python run_station.py
 python run_station.py --arm sim
 ```
 
-官方 [fafu_arm_sdk](https://github.com/FAFU-Robotics/fafu_arm_sdk) 预编译 `fafu_motor` 是 **cp310**。本机若是 Python 3.11，不要用系统 Python 开真串口。请用：
+Windows 开发支持 Python **3.12 / 3.10**，SDK 中须有匹配的 `cp312` / `cp310`
+扩展。源码启动脚本会先检查 `STATION_PYTHON` 或当前虚拟环境，再依次尝试
+Python 3.12、3.10 和 PATH 中的 Python，只有能够导入 SDK 的解释器才会被选中。
+便携包继续使用私有 Python 3.10。
+
+在本仓库根目录为当前 Python 安装依赖并重新编译 SDK（需要 VS2022 C++ 工具和 CMake）：
+
+```bat
+python -m pip install -r robot_station\requirements.txt -r fafu_arm_sdk\fafu_robot_python\requirements.txt
+robot_station\scripts\rebuild_fafu_motor.bat
+```
+
+`STATION_PYTHON` 可指定解释器。只检查启动脚本选中的 Python，不打开站控或连接机械臂：
+
+```bat
+cd robot_station
+start_live_arm.bat --check-python
+```
+
+运行真机窗口：
 
 ```bat
 启动真机.bat

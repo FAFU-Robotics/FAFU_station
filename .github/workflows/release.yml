@@ -16,6 +16,8 @@ jobs:
         working-directory: robot_station
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - name: Require fafu_arm_sdk
         shell: pwsh
         run: |
@@ -43,6 +45,8 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - name: Require fafu_arm_sdk
         run: |
           set -euo pipefail
@@ -121,6 +125,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - uses: actions/download-artifact@v4
         with:
           pattern: "*"

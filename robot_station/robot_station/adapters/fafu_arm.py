@@ -377,7 +377,7 @@ def import_fafu_sdk(sdk_root: Path | None = None) -> tuple[Any, Any]:
         raise RuntimeError(
             f"当前 Python {sys.version.split()[0]} 载不入 fafu_motor "
             f"（需要 {native}）。目录里现有: {have or '无'}。"
-            " 官方预编译通常是 cp310；本机 3.11+ 须用 Python 3.10 启动站控，"
+            " Windows 支持 cp310 / cp312；请选择匹配的 Python，"
             f"{rebuild}"
             f" 原始错误: {exc}"
         ) from exc

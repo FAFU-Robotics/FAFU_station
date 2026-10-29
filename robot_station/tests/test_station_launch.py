@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -12,6 +16,29 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class StationLaunchFilesTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "nt", "Windows batch launcher")
+    def test_live_launcher_checks_selected_python_without_starting_station(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="fafu sdk ") as raw:
+            sdk = Path(raw)
+            py_dir = sdk / "fafu_robot_python"
+            py_dir.mkdir()
+            (py_dir / "fafu_motor.py").write_text("", encoding="ascii")
+            controller = py_dir / "fafu_robot_controller.py"
+            controller.write_text("", encoding="ascii")
+            env = dict(os.environ, STATION_PYTHON=sys.executable, FAFU_ARM_SDK=str(sdk))
+            launcher = ROOT / "start_live_arm.bat"
+            command = ["cmd.exe", "/d", "/c", "call", str(launcher), "--check-python"]
+            result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=15)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn(sys.executable, result.stdout)
+
+            # Fail without opening the desktop or connecting hardware when the
+            # explicitly selected interpreter cannot load this SDK.
+            controller.write_text("raise ImportError('SDK ABI mismatch')\n", encoding="ascii")
+            result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=15)
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("No Python could import", result.stdout)
+
     def test_pc_host_kit_exists(self) -> None:
         self.assertFalse((ROOT / "station_client_laptop").exists())
         self.assertFalse((ROOT / "launch").exists())
@@ -83,7 +110,7 @@ class StationLaunchFilesTests(unittest.TestCase):
         self.assertIn("_wait_ready(host, port, WAIT_S", desktop)
         self.assertIn("HOST_LOG", desktop)
         self.assertIn("fafu-station-host.log", desktop)
-        self.assertIn(b"pick_py310", live)
+        self.assertIn(b"pick_python", live)
         self.assertIn(b"pinocchio", live)
         self.assertIn(b"PINOCCHIO_WINDOWS_DLL_PATH", live)
         self.assertIn(b"Library\\bin", live)

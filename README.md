@@ -5,10 +5,31 @@
 ```
 FAFU_station/
 ├── robot_station/    # PC 本机站控：网页、3D 参考臂、USB 真机
-└── fafu_arm_sdk/     # 官方 C++ / Python SDK（含预编译 fafu_motor）
+└── fafu_arm_sdk/     # Git 子模块：官方 C++ / Python SDK
 ```
 
-站控会自动查找**仓库旁**的 `fafu_arm_sdk`。克隆本仓库后，这两个目录已经是兄弟关系，一般不必再设 `FAFU_ARM_SDK`。
+站控会自动查找同一仓库中的 `fafu_arm_sdk` 子模块，一般不必再设 `FAFU_ARM_SDK`。
+
+首次克隆（同时拉取 SDK）：
+
+```bash
+git clone --recurse-submodules https://github.com/FAFU-Robotics/FAFU_station.git
+```
+
+已有工作目录初始化 SDK，或切换主仓库提交后同步 SDK：
+
+```bash
+git submodule update --init --recursive
+```
+
+更新 SDK 到上游 `main`，然后在主仓库记录新的 SDK 提交：
+
+```bash
+git submodule update --remote fafu_arm_sdk
+git add fafu_arm_sdk
+```
+
+SDK 的改动须先在子模块中提交并推送，再提交主仓库中的子模块指针。
 
 各自的独立仓库仍在：
 
@@ -35,7 +56,16 @@ python run_station.py
 
 ## SDK
 
-预编译 `fafu_motor` 是 **cp310**。Python API、C++ 构建与例程见 [`fafu_arm_sdk/README.md`](fafu_arm_sdk/README.md)。
+Windows x64 支持 Python **3.10 / 3.12**，分别加载 `cp310` / `cp312` 扩展。
+开发机安装依赖并为当前 Python 构建 SDK：
+
+```bat
+python -m pip install -r robot_station\requirements.txt -r fafu_arm_sdk\fafu_robot_python\requirements.txt
+robot_station\scripts\rebuild_fafu_motor.bat
+```
+
+构建需要 VS2022 C++ 工具和 CMake。`STATION_PYTHON` 可指定目标解释器。
+Python API、C++ 构建与例程见 [`fafu_arm_sdk/README.md`](fafu_arm_sdk/README.md)。
 
 ## 验收
 
