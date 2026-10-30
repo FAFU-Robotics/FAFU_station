@@ -196,7 +196,7 @@ cp -f "$customer" "$OUT_DIR/app/README.md"
 
 cp -f "$PACK_DIR/99-fafu-debug-board.rules" "$OUT_DIR/usr/share/fafu/99-fafu-debug-board.rules"
 
-pkg_ver="1.7.0"
+pkg_ver="1.7.1"
 if grep -q '__version__' "$REPO/robot_station/__init__.py"; then
   pkg_ver="$(python3 -c "import pathlib,re; t=pathlib.Path('$REPO/robot_station/__init__.py').read_text(encoding='utf-8'); print(re.search(r'__version__\\s*=\\s*\"([^\"]+)\"', t).group(1))")"
 fi

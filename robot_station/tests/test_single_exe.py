@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -162,6 +164,131 @@ class SingleFileCompileTests(unittest.TestCase):
             proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             self.assertTrue(out.is_file())
+
+
+@unittest.skipUnless(sys.platform == "win32", "Windows file locking")
+class InstallReplacementTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        windir = Path(os.environ.get("WINDIR", r"C:\Windows"))
+        csc = windir / "Microsoft.NET/Framework64/v4.0.30319/csc.exe"
+        if not csc.is_file():
+            raise unittest.SkipTest("csc.exe not found")
+        cls.build = tempfile.TemporaryDirectory(prefix="fafu-installer-tests-")
+        cls.addClassCleanup(cls.build.cleanup)
+        cls.probe = Path(cls.build.name) / "InstallerProbe.exe"
+        source = Path(cls.build.name) / "InstallerProbe.cs"
+        source.write_text(r'''
+using System;
+using System.IO;
+using System.Reflection;
+internal static class InstallerProbe {
+    static int Main(string[] args) {
+        if (args[0] == "hold") {
+            Console.WriteLine("READY"); Console.ReadLine(); return 0;
+        }
+        FileStream locked = null;
+        try {
+            if (args.Length > 3)
+                locked = new FileStream(args[3], FileMode.Open, FileAccess.Read, FileShare.None);
+            MethodInfo replace = typeof(SingleFileLauncher).GetMethod("ReplaceInstall", BindingFlags.Static | BindingFlags.NonPublic);
+            replace.Invoke(null, new object[] {args[1], args[2]});
+            Console.WriteLine("OK"); return 0;
+        } catch (TargetInvocationException ex) {
+            Console.WriteLine("ERROR " + ex.InnerException.Message); return 2;
+        } finally { if (locked != null) locked.Dispose(); }
+    }
+}
+''', encoding="utf-8")
+        args = [str(csc), "/nologo", "/target:exe", "/main:InstallerProbe", "/utf8output",
+                f"/out:{cls.probe}", "/r:System.dll", "/r:System.Windows.Forms.dll", "/r:System.Drawing.dll",
+                f"/r:{csc.parent / 'System.IO.Compression.dll'}",
+                f"/r:{csc.parent / 'System.IO.Compression.FileSystem.dll'}",
+                str(PACK / "SingleFileLauncher.cs"), str(source)]
+        result = subprocess.run(args, capture_output=True, text=True, timeout=60)
+        if result.returncode:
+            raise AssertionError(result.stdout + result.stderr)
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory(prefix="fafu-replace-")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.install, self.staging = self.root / "install", self.root / "staging"
+        self.native = self.install / "app/vendor/sdk/fafu_motor.cp310-win_amd64.pyd"
+        for relative, body in {
+            "FAFUArmStation.exe": b"old-launcher", ".bundle_sha256": b"old-stamp",
+            "app/obsolete.py": b"old-code", "runtime/python310/python.exe": b"old-python",
+            "app/vendor/sdk/fafu_motor.cp310-win_amd64.pyd": b"native-extension",
+            "recordings/traj.jsonl": b"user-trajectory",
+            "recordings/workspace/programs/pick.json": b"user-program",
+        }.items():
+            file = self.install / relative
+            file.parent.mkdir(parents=True, exist_ok=True)
+            file.write_bytes(body)
+        for relative, body in {
+            "FAFUArmStation.exe": b"new-launcher", ".bundle_sha256": b"new-stamp",
+            "app/new.py": b"new-code", "runtime/python310/python.exe": b"new-python",
+        }.items():
+            file = self.staging / relative
+            file.parent.mkdir(parents=True, exist_ok=True)
+            file.write_bytes(body)
+
+    def snapshot(self):
+        return {file.relative_to(self.install).as_posix(): file.read_bytes()
+                for file in self.install.rglob("*") if file.is_file()}
+
+    def replace(self, locked=None):
+        args = [str(self.probe), "replace", str(self.staging), str(self.install)]
+        if locked is not None:
+            args.append(str(locked))
+        return subprocess.run(args, capture_output=True, text=True, timeout=30,
+                              creationflags=subprocess.CREATE_NO_WINDOW)
+
+    def test_locked_native_extension_leaves_old_install_intact(self):
+        before = self.snapshot()
+        result = self.replace(self.native)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.snapshot(), before, "locked DLL must be found before any old file is removed")
+
+    def test_failed_copy_rolls_back_old_install(self):
+        before = self.snapshot()
+        result = self.replace(self.staging / "app/new.py")
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.snapshot(), before, "a failed update must restore the old launcher, code, runtime and stamp")
+
+    def test_success_replaces_code_and_preserves_user_data(self):
+        result = self.replace()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        files = self.snapshot()
+        self.assertNotIn("app/obsolete.py", files)
+        self.assertEqual(files["app/new.py"], b"new-code")
+        self.assertEqual(files[".bundle_sha256"], b"new-stamp")
+        self.assertEqual(files["recordings/traj.jsonl"], b"user-trajectory")
+        self.assertEqual(files["recordings/workspace/programs/pick.json"], b"user-program")
+
+    def test_running_private_runtime_blocks_update_before_mutation(self):
+        runtime = self.install / "runtime/python310/python.exe"
+        shutil.copyfile(self.probe, runtime)
+        child = subprocess.Popen([str(runtime), "hold"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                 text=True, creationflags=subprocess.CREATE_NO_WINDOW)
+        try:
+            self.assertEqual(child.stdout.readline().strip(), "READY")
+            before = self.snapshot()
+            result = self.replace()
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn(str(child.pid), result.stdout)
+            self.assertEqual(self.snapshot(), before)
+        finally:
+            child.communicate("\n", timeout=10)
+
+    def test_payload_cannot_overwrite_recordings(self):
+        source = self.staging / "recordings/traj.jsonl"
+        source.parent.mkdir()
+        source.write_bytes(b"must-not-overwrite")
+        before = self.snapshot()
+        result = self.replace()
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.snapshot(), before)
 
 
 if __name__ == "__main__":

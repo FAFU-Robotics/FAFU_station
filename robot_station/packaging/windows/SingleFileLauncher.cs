@@ -9,6 +9,8 @@
 //   [8-byte int64 zip length]
 //   [8-byte magic "FAFUEXE1"]
 using System;
+using System.Collections.Generic;
+using System.Diagnostics;
 using System.Drawing;
 using System.IO;
 using System.IO.Compression;
@@ -143,6 +145,7 @@ internal static class SingleFileLauncher
 
         splash.SetStatus("正在安装机械臂站控（只需这一次）…");
         Application.DoEvents();
+        EnsureInstallAvailable(dest);
         VerifyPayload(self, zipOffset, zipLen, hash);
 
         string staging = Path.Combine(Path.GetTempPath(), "FAFUArmStation-unpack-" + Guid.NewGuid().ToString("N"));
@@ -154,14 +157,20 @@ internal static class SingleFileLauncher
             ExtractZip(tmpZip, staging);
             if (!File.Exists(Path.Combine(staging, "FAFUArmStation.exe")))
                 throw new InvalidOperationException("安装包内没有 FAFUArmStation.exe");
+            File.WriteAllText(Path.Combine(staging, StampName), hex + "\r\n", Encoding.ASCII);
             ReplaceInstall(staging, dest);
-            File.WriteAllText(stampPath, hex + "\r\n", Encoding.ASCII);
             Log(logPath, "unpacked " + zipLen + " bytes sha256=" + hex);
         }
         catch (IOException ex)
         {
             throw new InvalidOperationException(
                 "无法写入安装目录。请先关闭已打开的机械臂站控再运行此文件。\n" + ex.Message,
+                ex);
+        }
+        catch (UnauthorizedAccessException ex)
+        {
+            throw new InvalidOperationException(
+                "安装文件正在使用或不可写。请关闭旧版站控及其后台进程后重试。\n" + ex.Message,
                 ex);
         }
         finally
@@ -279,27 +288,148 @@ internal static class SingleFileLauncher
 
     static void ReplaceInstall(string staging, string dest)
     {
-        // Wipe the previous tree so deleted files do not linger, but keep
-        // recordings (traj jsonl lives here, not inside the payload).
+        staging = Path.GetFullPath(staging).TrimEnd(Path.DirectorySeparatorChar);
+        dest = Path.GetFullPath(dest).TrimEnd(Path.DirectorySeparatorChar);
+        string parent = Path.GetDirectoryName(dest);
+        if (string.IsNullOrEmpty(parent) || IsWithin(staging, dest) || IsWithin(dest, staging))
+            throw new InvalidOperationException("安装暂存目录与目标目录不能重叠。");
+        // A payload must never replace user programs, waypoints or trajectories.
+        if (Directory.Exists(Path.Combine(staging, "recordings")) || File.Exists(Path.Combine(staging, "recordings")))
+            throw new InvalidOperationException("安装包不能包含 recordings 用户数据目录。");
+        EnsureInstallAvailable(dest);
         Directory.CreateDirectory(dest);
-        foreach (string child in Directory.GetFileSystemEntries(dest))
+        string backup = Path.Combine(parent, Path.GetFileName(dest) + "-previous-" + Guid.NewGuid().ToString("N"));
+        List<string> moved = new List<string>();
+        List<string> copied = new List<string>();
+        Directory.CreateDirectory(backup);
+        try
         {
-            string name = Path.GetFileName(child);
-            if (string.Equals(name, "recordings", StringComparison.OrdinalIgnoreCase))
-                continue;
-            try
+            foreach (string child in InstallEntries(dest))
             {
-                if (Directory.Exists(child))
-                    Directory.Delete(child, true);
-                else
-                    File.Delete(child);
+                string name = Path.GetFileName(child);
+                MoveEntry(child, Path.Combine(backup, name));
+                moved.Add(name);
             }
-            catch (IOException ex)
+            foreach (string child in Directory.GetFileSystemEntries(staging))
             {
-                throw new IOException("无法更新 " + name + "。请先关闭机械臂站控再运行此文件。", ex);
+                string name = Path.GetFileName(child);
+                copied.Add(name); // Track partial copies as well.
+                string target = Path.Combine(dest, name);
+                if (Directory.Exists(child))
+                    CopyTree(child, target);
+                else
+                    File.Copy(child, target, false);
             }
         }
-        CopyTree(staging, dest);
+        catch (Exception installError)
+        {
+            try
+            {
+                foreach (string name in copied)
+                    DeleteEntry(Path.Combine(dest, name));
+                foreach (string name in moved)
+                    MoveEntry(Path.Combine(backup, name), Path.Combine(dest, name));
+                Directory.Delete(backup);
+            }
+            catch (Exception rollbackError)
+            {
+                throw new InvalidOperationException(
+                    "更新失败，旧版备份保留在：\n" + backup + "\n用户录制目录未改动。\n" +
+                    installError.Message + "\n恢复失败：" + rollbackError.Message, installError);
+            }
+            throw new InvalidOperationException(
+                "更新失败，旧版文件已恢复，用户录制目录未改动。\n" + installError.Message, installError);
+        }
+        // The new runtime is complete, including its stamp. A delayed antivirus
+        // handle on the backup must not turn a successful update into a failure.
+        try { Directory.Delete(backup, true); }
+        catch (Exception ex)
+        {
+            Log(Path.Combine(Path.GetTempPath(), "fafu-station-setup.log"), "old backup cleanup " + backup + ": " + ex.Message);
+        }
+    }
+
+    static bool IsWithin(string path, string root)
+    {
+        return string.Equals(path, root, StringComparison.OrdinalIgnoreCase) ||
+            path.StartsWith(root + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
+    }
+
+    static IEnumerable<string> InstallEntries(string root)
+    {
+        foreach (string child in Directory.GetFileSystemEntries(root))
+            if (!string.Equals(Path.GetFileName(child), "recordings", StringComparison.OrdinalIgnoreCase))
+                yield return child;
+    }
+
+    static IEnumerable<string> InstallFiles(string entry)
+    {
+        if ((File.GetAttributes(entry) & FileAttributes.ReparsePoint) != 0)
+            throw new InvalidOperationException("安装目录中存在链接，不能自动替换：" + entry);
+        if (!Directory.Exists(entry))
+        {
+            yield return entry;
+            yield break;
+        }
+        foreach (string child in Directory.GetFileSystemEntries(entry))
+            foreach (string file in InstallFiles(child))
+                yield return file;
+    }
+
+    static void EnsureInstallAvailable(string dest)
+    {
+        if (!Directory.Exists(dest)) return;
+        string root = Path.GetFullPath(dest).TrimEnd(Path.DirectorySeparatorChar);
+        List<string> running = new List<string>();
+        foreach (Process process in Process.GetProcesses())
+        {
+            using (process)
+            {
+                try
+                {
+                    string exe = process.MainModule.FileName;
+                    if (IsWithin(Path.GetFullPath(exe), root))
+                        running.Add(process.ProcessName + "（PID " + process.Id + "）");
+                }
+                catch { } // Other users' protected processes need not be inspected.
+            }
+        }
+        if (running.Count > 0)
+            throw new InvalidOperationException(
+                "旧版站控后台仍在运行，尚未修改安装文件。\n" + string.Join("、", running.ToArray()) +
+                "\n\n关闭窗口不会结束后台服务。请确认机械臂停止并可靠支撑，关闭旧版后台后重试。" +
+                "\n安装程序不会自动结束机械臂控制进程。");
+        foreach (string entry in InstallEntries(root))
+        {
+            foreach (string file in InstallFiles(entry))
+            {
+                try
+                {
+                    // Opening without writing detects locked native modules and
+                    // read-only files before any installed file can be moved.
+                    using (FileStream probe = new FileStream(file, FileMode.Open, FileAccess.ReadWrite, FileShare.None)) { }
+                }
+                catch (Exception ex)
+                {
+                    if (!(ex is IOException) && !(ex is UnauthorizedAccessException)) throw;
+                    throw new InvalidOperationException(
+                        "安装文件正在使用或不可写，尚未修改安装文件：\n" + file +
+                        "\n请关闭旧版站控及其后台进程后重试。", ex);
+                }
+            }
+        }
+    }
+
+    static void MoveEntry(string source, string target)
+    {
+        if (Directory.Exists(source)) Directory.Move(source, target);
+        else File.Move(source, target);
+    }
+
+    static void DeleteEntry(string path)
+    {
+        if (Directory.Exists(path)) Directory.Delete(path, true);
+        else if (File.Exists(path)) File.Delete(path);
     }
 
     static void CopyTree(string src, string dest)

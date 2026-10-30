@@ -1,6 +1,6 @@
 # FAFU 机械臂站控
 
-当前版本：**v1.7.0**。安装包与更新说明见 [GitHub Release](https://github.com/FAFU-Robotics/FAFU_station/releases/tag/v1.7.0)。
+当前版本：**v1.7.1**。安装包与更新说明见 [GitHub Release](https://github.com/FAFU-Robotics/FAFU_station/releases/tag/v1.7.1)。
 
 本仓库是 FAFU 自研机械臂的软件集合，包含站控宿主和官方 SDK：
 

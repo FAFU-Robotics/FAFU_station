@@ -35,7 +35,7 @@ powershell -ExecutionPolicy Bypass -File packaging\windows\pack_single_exe.ps1
 | `app\vendor\fafu_arm_sdk\` | 私有 SDK |
 | `Install.bat` / `Uninstall.bat` | 从已解压目录拷到用户目录 / 卸载 |
 
-单个 exe 的格式：`SingleFileLauncher` 外壳 + zip 载荷 + 48 字节页脚（SHA-256、长度、魔数 `FAFUEXE1`）。第一次双击解压到 `%LOCALAPPDATA%\FAFUArmStation`，以后校验戳相同则直接启动。新版本会**替换**该目录（保留 `recordings\`）。
+单个 exe 的格式：`SingleFileLauncher` 外壳 + zip 载荷 + 48 字节页脚（SHA-256、长度、魔数 `FAFUEXE1`）。第一次双击解压到 `%LOCALAPPDATA%\FAFUArmStation`，以后校验戳相同则直接启动。新版本先检查后台进程及文件占用，再备份并替换程序文件；失败时恢复旧文件。`recordings\` 及其中的程序、路点和轨迹历史不参与替换。
 
 薄启动器启动前检测 WebView2、VC++ 运行库、串口；缺项会弹窗说明。
 
@@ -52,7 +52,7 @@ powershell -ExecutionPolicy Bypass -File packaging\windows\pack_single_exe.ps1
 
 第一次会看到「正在安装…」，随后打开控制页，并在桌面建立快捷方式。在「总览与连接」选择串口并点击「连接」，检查反馈后再点击「使能」。连接不会自动使能。操作说明在安装后的 `app\README.md`。
 
-更新：把新的单个 exe 发给对方，再双击一次即可覆盖。控制路径变了会自动换运动进程。
+更新：确认机械臂停止并可靠支撑后，关闭旧版窗口及后台站控服务，再双击新 exe。关闭窗口会保留机械臂后台服务；如果仍有占用，安装程序会列出相关 PID，安装文件保持原样，也不会自动结束机械臂进程。解除占用后重试即可；v1.7.0 更新中断造成的程序文件缺失也可用新安装包恢复。
 
 卸载：运行用户目录里的 `Uninstall.bat`，或删除 `%LOCALAPPDATA%\FAFUArmStation` 和桌面快捷方式。
 

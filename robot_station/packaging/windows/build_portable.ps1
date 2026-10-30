@@ -288,7 +288,7 @@ if (Test-Path $ico) { $cscArgs += "/win32icon:$ico" }
 & $csc @cscArgs $cs
 if ($LASTEXITCODE -ne 0) { throw "csc failed" }
 $verFile = Join-Path $app "VERSION"
-$pkgVer = "1.7.0"
+$pkgVer = "1.7.1"
 $initPy = Join-Path $Repo "robot_station\__init__.py"
 if (Test-Path $initPy) {
     $m = Select-String -Path $initPy -Pattern '__version__\s*=\s*"([^"]+)"' | Select-Object -First 1
