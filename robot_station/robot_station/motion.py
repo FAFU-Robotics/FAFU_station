@@ -3,20 +3,25 @@
 from __future__ import annotations
 
 import json
+import functools
 import logging
+import math
 import os
+import secrets
 import socket
 import threading
 import time
 from typing import Any
 
-from robot_station.adapters.arm import ArmAdapter, build_arm
+from robot_station.adapters.arm import ArmAdapter, DisconnectedArm, build_arm
 from robot_station.adapters.camera import CameraBank
 from robot_station.config import StationConfig
+from robot_station.connection import connection_kind, target_backend, serial_endpoint, needs_session, rejected
 from robot_station.safety import Safety, SafetyGate
 from robot_station.runtime import freeze_boot_code_rev
 from robot_station.telem import pack_telem
 from robot_station.world import ArmSnap, World
+from robot_station.programs import ProgramRunner, WorkbenchStore, format_script, parse_script, validate_tree, number
 
 logger = logging.getLogger("station.motion")
 
@@ -24,6 +29,8 @@ logger = logging.getLogger("station.motion")
 # recovery path can recognise and clear exactly this message.
 TICK_ERR_TEXT = "运动拍异常，已跳过并继续"
 TICK_ERR_LOG_EVERY_S = 5.0
+ENDPOINT_HOLD_TIMEOUT_S = 0.35
+ENDPOINT_TOLERANCE_DEG = 0.25
 
 
 def _is_vendor_enable_noise(text: str) -> bool:
@@ -123,6 +130,21 @@ def _sleep_until(deadline: float) -> None:
             return
 
 
+def manual_control(fn):
+    @functools.wraps(fn)
+    def guarded(self, *args, **kwargs):
+        if self._arm_switching:
+            return "连接操作正在进行，请等待完成"
+        with self._arm_lock:
+            if self._link_disconnected and fn.__name__ != "on_clear_estop":
+                return "设备未连接，请先连接目标设备"
+            if self.program.active:
+                return "程序占用机械臂，请先停止程序再进行手动操作"
+            self._stop_endpoint_hold()
+            return fn(self, *args, **kwargs)
+    return guarded
+
+
 class MotionCore:
     def __init__(self, cfg: StationConfig, camera: CameraBank | None = None) -> None:
         self.cfg = cfg
@@ -163,6 +185,7 @@ class MotionCore:
         self._cart_dxyz = [0.0, 0.0, 0.0]
         self._cart_drpy = [0.0, 0.0, 0.0]
         self._cart_pending = False
+        self._cart_follow_owner: str | None = None
         self._ik_err = ""
         self._cmd_err = ""
         self._tick_err_count = 0
@@ -172,7 +195,17 @@ class MotionCore:
         self._rt_armed = False
         self._arm_lock = threading.RLock()
         self._arm_switching = False
+        self._connection_session = secrets.token_hex(12)
+        self._session_required = False
+        self._link_disconnected = False
+        self._enable_required = False
+        self._publish_connection("disconnected")
         self._watch: Any = None
+        self.program = ProgramRunner()
+        self._program_owner = ""
+        self._program_touch = 0.0
+        self._program_scale = 1.0
+        self._endpoint_hold: dict | None = None
 
     def _note_echo(self, t0: object) -> None:
         if t0 is None or t0 == "":
@@ -183,22 +216,30 @@ class MotionCore:
             return
 
     def start(self) -> None:
-        wanted = str(self.cfg.arm or "").strip().lower()
-        try:
-            self.arm.start()
-        except Exception as exc:
-            if wanted == "fafu":
-                logger.error("真机连接失败，改用仿真以便打开页面: %s", exc)
-                self._adopt_sim(str(exc))
-            else:
-                raise
+        self._session_required = True
+        serial = self.arm_kind() == "fafu"
+        if not serial or self.cfg.arm_connect_on_start:
+            try:
+                self.arm.start()
+                snap = self.arm.poll()
+                if snap.online:
+                    self._prepare_connection()
+                    if serial and snap.serial_port:
+                        self.cfg.arm_port = snap.serial_port
+                    self._link_disconnected = False
+                    with self._lock:
+                        self.world.arm = snap
+                    self._publish_connection("connected")
+                else:
+                    self._link_disconnected = True
+                    self._publish_connection("error", snap.link_err or "设备未连接")
+            except Exception as exc:
+                self._link_disconnected = True
+                self._publish_connection("error", str(exc))
+                logger.error("连接失败，保留当前目标（不切换仿真）: %s", exc)
         else:
-            if wanted == "fafu" and getattr(self.arm, "_robot", None) is None:
-                err = str(getattr(self.arm, "_link_error", "") or "真机未连接")
-                logger.error("真机未连上，改用仿真以便打开页面: %s", err)
-                self._adopt_sim(err)
-            else:
-                self._boot_live_arm()
+            self._link_disconnected = True
+            self._publish_connection("disconnected")
         try:
             if self.camera is not None:
                 self.camera.start()
@@ -211,67 +252,9 @@ class MotionCore:
         self._tick_th = threading.Thread(target=self._tick_loop, name="station-tick", daemon=True)
         self._tick_th.start()
         self._start_watch()
-        logger.info(
-            "tick %s Hz  臂=%s  相机=%s",
-            self.cfg.control_hz,
-            getattr(self.arm, "backend", "?"),
-            "local" if self.camera is not None else "网页进程",
-        )
+        logger.info("tick %s Hz 臂=%s（连接与使能独立）", self.cfg.control_hz, self.arm_kind())
 
-    def _boot_live_arm(self) -> None:
-        """After a live USB start, Connect is already done; enable so the page is ready.
 
-        SDK construction stays auto_enable=False. Switching 仿真→真机 in the UI
-        still does not auto-enable.
-        """
-        if str(getattr(self.arm, "backend", "") or "") != "fafu":
-            return
-        if getattr(self.arm, "_robot", None) is None:
-            return
-        if not bool(self.cfg.arm_allow_motion):
-            return
-        from robot_station.serial_guard import live_serial_allowed
-
-        if not live_serial_allowed():
-            return
-        err = self.arm.set_powered(True)
-        snap = None
-        try:
-            snap = self.arm.poll()
-        except Exception:
-            snap = None
-        motors = list(getattr(snap, "motors", None) or []) if snap is not None else []
-        offline = [str(m.get("name") or m.get("id") or "") for m in motors if not m.get("online")]
-        if err:
-            self._cmd_err = f"已连接真机，使能失败：{err}"
-            logger.error("%s", self._cmd_err)
-        elif offline:
-            logger.warning("已使能在线轴；离线：%s", "、".join(offline))
-            self._cmd_err = ""
-        else:
-            self._cmd_err = ""
-            logger.info("真机已连接并使能")
-
-    def _adopt_sim(self, reason: str) -> None:
-        try:
-            self.arm.stop()
-        except Exception:
-            logger.exception("关闭失败的真机适配器失败")
-        nxt = build_arm(
-            "sim",
-            self.cfg.arm_joints,
-            self.cfg.arm_speed_deg_s,
-            self.cfg.arm_has_gripper,
-            sdk=self.cfg.arm_sdk,
-            cfg_path=self.cfg.arm_cfg,
-            port=self.cfg.arm_port,
-            allow_motion=True,
-            gripper_id=self.cfg.arm_gripper_id,
-        )
-        nxt.start()
-        self.arm = nxt
-        self.cfg.arm = "sim"
-        self._cmd_err = f"真机未连上，已切仿真：{reason}"
 
     # ---- USB 热插拔监视（默认关闭；cfg.arm_watch / camera_watch 打开） ----
     #
@@ -316,9 +299,7 @@ class MotionCore:
     def note_device_change(self) -> None:
         """Tell the watcher to re-read now, without waiting for its interval.
 
-        Called after a manual 臂源 switch so the watcher does not immediately
-        undo it, and after a successful hot-plug switch so the debounce state
-        follows reality.
+        Discovery only records changes; it cannot replace a connection target.
         """
         watch = self._watch
         if watch is None:
@@ -329,38 +310,8 @@ class MotionCore:
             logger.debug("USB 监视重读失败", exc_info=True)
 
     def _watch_arm(self, attached: bool) -> None:
-        """USB debug board set changed: adopt the live arm when we are on sim/mock.
-
-        Two rules that are deliberately conservative:
-
-        * **Unplug keeps ``backend=fafu``.** The page reads connected/not from the
-          adapter itself (``_drop_lost_live_link``). Silently swapping to the sim
-          arm would let an operator believe the metal arm is still the one being
-          commanded.
-        * **Never touch the adapter while it reports connected.** A re-enumeration
-          on another COM port mid-session is logged only; the 100 Hz loop keeps
-          running, and the existing unplug detection marks the link down. The
-          next change callback (or a manual Connect) re-opens on the new port.
-        """
-        if self.arm_kind() not in ("mock", "sim"):
-            logger.info(
-                "调试板签名已变化（%s），当前仍连着真机；未打断控制回路",
-                "已接上" if attached else "已拔出",
-            )
-            return
-        if not attached:
-            logger.info("调试板已拔出；保持仿真，等待重新插上")
-            return
-        if not self.gate.motion_allowed():
-            logger.info("急停锁存中，暂不自动切真机；解除后或重新插拔即可")
-            return
-        err = self.on_arm_src("usb-watch", "fafu")
-        self._set_cmd_err(err)
-        if err is None:
-            logger.info("检测到调试板已插上，臂源已切到真机（未自动使能）")
-            self.note_device_change()
-        else:
-            logger.warning("检测到调试板但切换真机失败：%s", err)
+        """Discovery is informational; it never changes the active endpoint."""
+        logger.info("USB 设备已%s；保留当前连接目标，等待用户选择串口并连接", "插入" if attached else "拔出")
 
     def _watch_camera(self, attached: bool) -> None:
         """USB camera set changed: re-run the work-camera pick and swap backend."""
@@ -405,77 +356,8 @@ class MotionCore:
         return str(getattr(self.arm, "backend", "") or self.cfg.arm or "mock")
 
     def on_arm_src(self, cid: str, kind: str) -> str | None:
-        """Switch between live USB (fafu) and in-process sim. Does not auto-enable."""
-        name = (kind or "").strip().lower()
-        if name not in ("sim", "fafu"):
-            return f"未知臂源 {kind!r}，请用 sim 或 fafu"
-        current = self.arm_kind()
-        if name == current:
-            return None
-        if name == "fafu":
-            from robot_station.serial_guard import live_serial_allowed
-
-            if not live_serial_allowed():
-                return "未允许真机串口（请用「启动真机.bat」或 Ubuntu 的「启动真机.sh」，需 STATION_ALLOW_LIVE_ARM=1）"
-        q_keep = list(self.world.arm.q_deg)
-        self._arm_switching = True
-        try:
-            with self._arm_lock:
-                try:
-                    self.arm.hold()
-                except Exception:
-                    logger.exception("切换臂源前 hold 失败")
-                try:
-                    self.arm.stop()
-                except Exception:
-                    logger.exception("切换臂源时关闭旧臂失败")
-                allow = True if name == "sim" else bool(self.cfg.arm_allow_motion)
-                try:
-                    nxt = build_arm(
-                        name,
-                        self.cfg.arm_joints,
-                        self.cfg.arm_speed_deg_s,
-                        self.cfg.arm_has_gripper,
-                        sdk=self.cfg.arm_sdk,
-                        cfg_path=self.cfg.arm_cfg,
-                        port=self.cfg.arm_port,
-                        allow_motion=allow,
-                        gripper_id=self.cfg.arm_gripper_id,
-                    )
-                    nxt.start()
-                except Exception as exc:
-                    logger.exception("切换到 %s 失败，回退仿真", name)
-                    nxt = build_arm(
-                        "sim",
-                        self.cfg.arm_joints,
-                        self.cfg.arm_speed_deg_s,
-                        self.cfg.arm_has_gripper,
-                        sdk=self.cfg.arm_sdk,
-                        cfg_path=self.cfg.arm_cfg,
-                        port=self.cfg.arm_port,
-                        allow_motion=True,
-                        gripper_id=self.cfg.arm_gripper_id,
-                    )
-                    nxt.start()
-                    self.arm = nxt
-                    self.cfg.arm = "sim"
-                    self._seed_sim_pose(q_keep)
-                    return f"真机连接失败，已留在仿真：{exc}"
-                if name == "fafu" and getattr(nxt, "_robot", None) is None:
-                    err = str(getattr(nxt, "_link_error", "") or "真机未连接")
-                    self.arm = nxt
-                    self.cfg.arm = name
-                    return err
-                self.arm = nxt
-                self.cfg.arm = name
-                if name == "sim":
-                    self._seed_sim_pose(q_keep)
-                self._drop_cart()
-                logger.info("臂源已切换为 %s", name)
-                return None
-        finally:
-            self._arm_switching = False
-            self.note_device_change()
+        """Legacy entry point; the same disconnect-before-connect rule applies."""
+        return self.on_link(cid, "connect", kind, self.cfg.arm_port or None)
 
     def _seed_sim_pose(self, q_deg: list[float]) -> None:
         if not q_deg:
@@ -493,10 +375,23 @@ class MotionCore:
 
     def drop_client(self, cid: str) -> None:
         with self._lock:
+            was_registered = cid in self.clients
             self.clients.discard(cid)
             empty = not self.clients
-        if empty:
+        with self._arm_lock:
+            if self._endpoint_hold and self._endpoint_hold["owner"] == cid:
+                self._stop_endpoint_hold()
+        if self.program.active and cid == self._program_owner:
+            self.program.stop("程序控制窗口已断开")
             self.arm.hold(abort_path=True)
+        if empty:
+            with self._arm_lock:
+                self.arm.hold(abort_path=True)
+                self._drop_cart()
+                if was_registered:
+                    self._connection_session = secrets.token_hex(12)
+                    connection = self.world.connection
+                    self._publish_connection(connection.get("status", "disconnected"), connection.get("error", ""))
 
     def _note(self) -> None:
         with self._lock:
@@ -504,20 +399,32 @@ class MotionCore:
         self.gate.note_command()
 
     def on_touch(self, cid: str) -> None:
+        if cid == self._program_owner:
+            self._program_touch = time.monotonic()
         self._note()
 
     def on_park(self, cid: str) -> None:
+        if self.program.active or self._endpoint_hold:
+            return
+        if self._cart_follow_owner == cid:
+            self._cart_follow_owner = None
+            self.arm.hold(abort_path=True)
+            return
         park = getattr(self.arm, "park_stream", None)
         if callable(park):
             park()
 
     def on_estop(self, reason: str = "operator") -> None:
+        self._endpoint_hold = None
         self.arm.emergency_stop()
         self.gate.estop(reason)
+        if self.program.active:
+            self.program.stop("急停已触发，程序停止")
         with self._lock:
             self.world.safety = self.gate.state.name
             self.world.safety_reason = self.gate.reason
 
+    @manual_control
     def on_clear_estop(self, cid: str) -> str | None:
         self.gate.clear()
         self.arm.resume_motion()
@@ -526,6 +433,7 @@ class MotionCore:
             self.world.safety_reason = self.gate.reason
         return None
 
+    @manual_control
     def on_arm_targets(
         self, cid: str, q_deg: list[float], speed: float, stream: bool = False, t0: float | None = None
     ) -> str | None:
@@ -539,6 +447,7 @@ class MotionCore:
             return "请先切回 Position 再发送位置"
         if self.arm_mode() == "Impedance" and self._sdk_float_active():
             return "阻抗环运行中请先切回 Position"
+        self._drop_cart()
         err = self.arm.apply_targets(q_deg, speed, stream=stream)
         if err:
             return err
@@ -555,6 +464,7 @@ class MotionCore:
     def arm_mode(self) -> str:
         return str(getattr(self.arm, "_ctrl_mode", None) or "Position")
 
+    @manual_control
     def on_mode(self, cid: str, mode: str) -> str | None:
         if not self.gate.motion_allowed():
             return "急停锁存中"
@@ -564,10 +474,14 @@ class MotionCore:
         err = self.arm.set_ctrl_mode(mode)
         if err:
             return err
+        self._drop_cart()
         self._note()
         return None
 
+    @manual_control
     def on_grav_urdf(self, cid: str, name: str) -> str | None:
+        if self.arm.poll().recording:
+            return "录制期间不能切换重力模型，请先停止录制"
         fn = getattr(self.arm, "set_grav_urdf", None)
         if not callable(fn):
             return "此后端不支持选择 URDF"
@@ -577,6 +491,7 @@ class MotionCore:
         self._note()
         return None
 
+    @manual_control
     def on_teach(self, cid: str, q_deg: list[float], t0: float | None = None) -> str | None:
         self._note_echo(t0)
         if not self.gate.motion_allowed():
@@ -586,10 +501,13 @@ class MotionCore:
             return blocked
         if self.arm_mode() not in ("Gravity", "Gra+Fri"):
             return "示教仅在 Gravity / Gra+Fri 下可用"
-        self.arm.teach_pose(q_deg)
+        err = self.arm.teach_pose(q_deg)
+        if err:
+            return err
         self._note()
         return None
 
+    @manual_control
     def on_cartesian(
         self, cid: str, dxyz: list[float], drpy_deg: list[float], t0: float | None = None
     ) -> str | None:
@@ -604,6 +522,7 @@ class MotionCore:
         if self.arm_mode() == "Impedance" and self._sdk_float_active():
             return "阻抗环运行中请先切回 Position"
         with self._lock:
+            self._cart_follow_owner = None
             for i in range(3):
                 self._cart_dxyz[i] += float(dxyz[i]) if i < len(dxyz) else 0.0
                 self._cart_drpy[i] += float(drpy_deg[i]) if i < len(drpy_deg) else 0.0
@@ -611,6 +530,7 @@ class MotionCore:
         self._note()
         return None
 
+    @manual_control
     def on_cartesian_pose(
         self,
         cid: str,
@@ -618,6 +538,7 @@ class MotionCore:
         rpy_deg: list[float],
         speed: float,
         t0: float | None = None,
+        *, stream: bool = False,
     ) -> str | None:
         self._note_echo(t0)
         if not self.gate.motion_allowed():
@@ -635,11 +556,13 @@ class MotionCore:
             self._ik_err = err
             return err
         self._ik_err = ""
+        self._cart_follow_owner = cid if stream else None
         self._note()
         return None
 
     def _drop_cart(self) -> None:
         with self._lock:
+            self._cart_follow_owner = None
             self._cart_pending = False
             self._cart_dxyz = [0.0, 0.0, 0.0]
             self._cart_drpy = [0.0, 0.0, 0.0]
@@ -658,6 +581,7 @@ class MotionCore:
         err = self.arm.apply_cartesian(dxyz, drpy)
         self._ik_err = err or ""
 
+    @manual_control
     def on_path(
         self,
         cid: str,
@@ -672,12 +596,14 @@ class MotionCore:
             return blocked
         if self.arm_mode() != "Position":
             return "请先切回 Position 再跑路点"
+        self._drop_cart()
         err = self.arm.run_path(waypoints, speed, durations_s=durations)
         if err:
             return err
         self._note()
         return None
 
+    @manual_control
     def on_rec_start(self, cid: str, name: str | None = None, teach: str | None = None) -> str | None:
         if not self.gate.motion_allowed():
             return "急停锁存中"
@@ -690,6 +616,7 @@ class MotionCore:
             err = fn(name)
         if err:
             return err
+        self._drop_cart()
         self._note()
         return None
 
@@ -731,6 +658,7 @@ class MotionCore:
             return None
         return fn()
 
+    @manual_control
     def on_replay(
         self,
         cid: str,
@@ -747,12 +675,14 @@ class MotionCore:
         if not callable(fn):
             return "此后端不支持轨迹回放"
         spd = float(speed if speed is not None else self.cfg.arm_speed_deg_s)
+        self._drop_cart()
         err = fn(path, rate=float(rate), speed_deg_s=spd)
         if err:
             return err
         self._note()
         return None
 
+    @manual_control
     def on_home(self, cid: str, speed: float) -> str | None:
         if self.gate.state == Safety.ESTOP_LATCHED:
             self.gate.clear()
@@ -767,12 +697,14 @@ class MotionCore:
         if self.arm_mode() == "Impedance" and self._sdk_float_active():
             return "阻抗环运行中请先切回 Position"
         self._note()
+        self._drop_cart()
         err = self.arm.home(speed)
         if err:
             return err
         self._note()
         return None
 
+    @manual_control
     def on_gripper(
         self, cid: str, open_: bool | None = None, deg: float | None = None, effort: int | None = None
     ) -> str | None:
@@ -802,31 +734,110 @@ class MotionCore:
         self._note()
         return None
 
-    def on_link(self, cid: str, action: str) -> str | None:
-        act = (action or "").strip().lower()
-        if act == "connect":
-            try:
-                self.arm.start()
-            except Exception as exc:
-                return str(exc)
-            if getattr(self.arm, "_robot", None) is None:
-                return str(getattr(self.arm, "_link_error", "") or "机械臂未连接")
-            snap = self.arm.poll()
-            motors = list(getattr(snap, "motors", None) or [])
-            offline = [str(m.get("name") or m.get("id") or "") for m in motors if not m.get("online")]
-            if offline:
-                logger.warning("已连接调试板，离线：%s", "、".join(offline))
-            self._cmd_err = ""
-            return None
-        if act == "disconnect":
-            try:
-                self.arm.hold()
-            except Exception:
-                logger.exception("断开前 hold 失败")
-            self.arm.stop()
-            return None
-        return f"未知连接动作 {action!r}"
+    def _prepare_connection(self) -> None:
+        prepare = getattr(self.arm, "prepare_connection", None)
+        self._enable_required = callable(prepare)
+        if callable(prepare):
+            prepare()
 
+    def _publish_connection(self, status: str, error: str = "") -> None:
+        with self._lock:
+            self.world.connection = {
+                "kind": connection_kind(self.arm_kind()),
+                "port": str(self.cfg.arm_port or "") if self.arm_kind() == "fafu" else "",
+                "status": status, "error": error, "session": self._connection_session,
+                "enable_required": self._enable_required,
+            }
+            if status != "connected":
+                self.world.arm.online = False
+                self.world.arm.enabled = False
+                self.world.arm.moving = False
+                self.world.arm.backend = self.arm_kind()
+                self.world.arm.link_err = error
+
+    def on_link(self, cid: str, action: str, kind: str | None = None, port: str | None = None) -> str | None:
+        act = str(action or "").strip().lower()
+        if act not in ("connect", "disconnect"):
+            return "未知连接动作"
+        if self._arm_switching:
+            return "连接操作正在进行，请等待完成"
+        with self._arm_lock:
+            if self.program.active:
+                return "程序占用机械臂，请先停止程序"
+            if act == "connect":
+                try:
+                    name = target_backend(kind) if kind is not None else self.arm_kind()
+                    requested = serial_endpoint(port if port is not None else self.cfg.arm_port) if name == "fafu" else ""
+                except ValueError as exc:
+                    return str(exc)
+                snap = self.arm.poll()
+                online = snap.online and not self._link_disconnected
+                current_port = str(snap.serial_port or self.cfg.arm_port or "")
+                if online:
+                    if name == self.arm_kind() and (name != "fafu" or requested == current_port):
+                        return None
+                    return "请先断开当前连接，再连接其它串口或仿真"
+                if name == "fafu":
+                    from robot_station.serial_guard import live_serial_allowed
+                    if not live_serial_allowed():
+                        return "当前进程未允许真机串口，请使用真机启动器后连接；不会改连仿真"
+            else:
+                snap = self.arm.poll()
+                if snap.recording or snap.replay_active:
+                    return "请先停止录制或回放，再断开设备"
+                if self._link_disconnected:
+                    return None
+
+            self._arm_switching = True
+            self._connection_session = secrets.token_hex(12)
+            self._enable_required = True
+            self._session_required = True
+            self._stop_endpoint_hold()
+            self._drop_cart()
+            self._ik_err = ""
+            self._cmd_err = ""
+            self._link_disconnected = True
+            self._publish_connection("connecting" if act == "connect" else "disconnecting")
+            try:
+                # Hold/stop run on the existing adapter before opening any new port.
+                # Disconnect preserves support; it never silently removes motor torque.
+                self.arm.hold(abort_path=True)
+                self.arm.stop()
+                if act == "disconnect":
+                    self._publish_connection("disconnected")
+                    return None
+                self.cfg.arm, self.cfg.arm_port = name, requested
+                self.arm = DisconnectedArm(name, self.cfg.arm_joints)
+                self.arm = build_arm(name, self.cfg.arm_joints, self.cfg.arm_speed_deg_s,
+                    self.cfg.arm_has_gripper, sdk=self.cfg.arm_sdk, cfg_path=self.cfg.arm_cfg,
+                    port=requested, allow_motion=name=="sim" or bool(self.cfg.arm_allow_motion),
+                    gripper_id=self.cfg.arm_gripper_id)
+                self.world.arm = ArmSnap(online=False, enabled=False, backend=name,
+                    n=self.cfg.arm_joints, ok=[False]*self.cfg.arm_joints)
+                self._publish_connection("connecting")
+                self.arm.start()
+                snap = self.arm.poll()
+                if not snap.online:
+                    raise RuntimeError(snap.link_err or "设备未响应")
+                self._prepare_connection()
+                self._link_disconnected = False
+                with self._lock:
+                    self.world.arm = snap
+                self._publish_connection("connected")
+                logger.info("已连接 %s %s，等待显式使能", name, requested)
+                return None
+            except Exception as exc:
+                try:
+                    self.arm.stop()
+                except Exception:
+                    logger.exception("连接失败后的资源释放失败")
+                self._publish_connection("error", str(exc))
+                return str(exc)
+            finally:
+                self._arm_switching = False
+                self.note_device_change()
+
+    @manual_control
     def on_script(self, cid: str, name: str) -> str | None:
         from robot_station.adapters.fafu_arm import map_script
 
@@ -851,10 +862,14 @@ class MotionCore:
         self._note()
         return None
 
+    @manual_control
     def on_power(self, cid: str, on: bool) -> str | None:
         if not self.gate.motion_allowed():
             return "急停锁存中"
-        blocked = self.arm.refuse_motion()
+        # Explicit enable is allowed through the disabled-motion interlock;
+        # connection/read-only refusal still applies to every adapter.
+        check = getattr(self.arm, "refuse_power_change", self.arm.refuse_motion)
+        blocked = check()
         if blocked:
             return blocked
         err = self.arm.set_powered(bool(on))
@@ -863,11 +878,13 @@ class MotionCore:
                 snap = self.arm.poll()
             except Exception:
                 snap = None
-            if _live_joints_ok(snap):
-                logger.warning("使能报错已忽略（J1–J6 在线）: %s", err)
+            if snap is not None and bool(snap.enabled):
+                logger.warning("使能报错已忽略（反馈确认电机已使能）: %s", err)
                 err = None
         if err:
             return err
+        self._enable_required = not bool(on)
+        self._publish_connection("connected")
         self._note()
         return None
 
@@ -878,7 +895,206 @@ class MotionCore:
         with self._lock:
             data = self.world.as_dict()
             data["cmd_err"] = self._cmd_err
+            data["program"] = {**self.program.snapshot(), "speed_scale": self._program_scale}
+            hold = self._endpoint_hold
+            data["trajectory"] = {"endpoint_hold_id": hold["id"] if hold else ""}
             return data
+
+    def _stop_endpoint_hold(self) -> None:
+        if self._endpoint_hold:
+            self._endpoint_hold = None
+            self.arm.hold(abort_path=True)
+
+    @staticmethod
+    def _endpoint_reached(snap, target: list[float]) -> bool:
+        actual = getattr(snap, "feedback_deg", None) or snap.q_deg
+        return len(actual) == len(target) and max(abs(a-b) for a,b in zip(actual,target)) <= ENDPOINT_TOLERANCE_DEG
+
+    def on_workbench(self, cid: str, msg: dict) -> dict:
+        """Asset editing and program control share one request/response channel."""
+        reply = {"t": "ack", "op": "workbench", "request_id": msg.get("request_id")}
+        try:
+            store = WorkbenchStore()
+            action = str(msg.get("action") or "")
+            if action == "catalog":
+                result = store.catalog()
+            elif action == "points_save":
+                result = {"waypoints": store.save_points(msg.get("points"))}
+            elif action == "point_capture":
+                snap = self.arm.poll()
+                if not snap.online:
+                    raise ValueError("请先连接机械臂或仿真臂")
+                q = (snap.target_deg if msg.get("source") == "target"
+                     else (getattr(snap, "feedback_deg", None) or snap.q_deg))
+                result = {"q": list(q)}
+            elif action == "parse":
+                nodes = parse_script(msg.get("script", "")) if "script" in msg else validate_tree(msg.get("nodes"))
+                result = {"nodes": nodes, "script": format_script(nodes)}
+            elif action == "save":
+                result = store.save(msg.get("name"), msg.get("nodes"))
+            elif action == "load":
+                result = store.load(msg.get("name"))
+            elif action == "delete":
+                store.delete(msg.get("name"))
+                result = store.catalog()
+            elif action.startswith("traj_"):
+                result = self._trajectory_action(cid, action, msg)
+            else:
+                with self._arm_lock:
+                    result = self._program_control(cid, action, msg, store)
+            return {**reply, "ok": True, "data": result}
+        except (ValueError, OSError, TypeError, KeyError) as exc:
+            return {**reply, "ok": False, "error": str(exc)}
+
+    def _trajectory_action(self, cid: str, action: str, msg: dict) -> dict:
+        from robot_station.trajectory_workspace import process_trajectory, validate_frames
+        from robot_station.traj import load_traj, resolve_traj_path
+
+        name = str(msg.get("file") or "")
+        frames = None
+        if action in ("traj_execute", "traj_endpoint"):
+            _, raw = load_traj(resolve_traj_path(name))
+            frames = validate_frames(raw)
+        with self._arm_lock:
+            snap = self.arm.poll()
+            if action in ("traj_endpoint_touch", "traj_endpoint_stop"):
+                hold = self._endpoint_hold
+                matches = bool(hold and hold["owner"] == cid and hold["id"] == msg.get("hold_id"))
+                if matches:
+                    if action == "traj_endpoint_stop":
+                        self._stop_endpoint_hold()
+                    elif time.monotonic() - hold["touch"] >= ENDPOINT_HOLD_TIMEOUT_S:
+                        self._stop_endpoint_hold()
+                    else:
+                        hold["touch"] = time.monotonic()
+                return {"active": bool(matches and self._endpoint_hold)}
+            if action == "traj_record_stop":
+                error = self.on_rec_stop(cid)
+                if error:
+                    raise ValueError(error)
+                return {"name": self.arm.poll().traj_file}
+            busy = snap.recording or snap.replay_active or self.program.active or self._endpoint_hold
+            if busy:
+                raise ValueError("请先停止录制、回放或程序，再操作轨迹文件")
+            if action == "traj_record":
+                if not self.gate.motion_allowed():
+                    raise ValueError("急停锁存中")
+                if snap.moving or bool(getattr(self.arm, "is_homing", False)):
+                    raise ValueError("请先停止当前运动")
+                if name:
+                    error = self.arm.record_start(msg.get("name"), teach=msg.get("teach"), append_from=name)
+                else:
+                    error = self.on_rec_start(cid, msg.get("name"), msg.get("teach"))
+                if error:
+                    raise ValueError(error)
+                self._drop_cart()
+                return {"name": self.arm.poll().traj_file}
+            if action == "traj_execute":
+                if snap.moving or bool(getattr(self.arm, "is_homing", False)):
+                    raise ValueError("请先停止当前运动")
+                error = self.on_replay(cid, name, number(msg.get("rate", 0.5), 0.5, 1, "回放倍率"),
+                                       number(msg.get("speed", 10), 5, 30, "起点速度"))
+                if error:
+                    raise ValueError(error)
+                return {"name": name}
+            if action == "traj_endpoint":
+                hold_id = msg.get("hold_id")
+                if not isinstance(hold_id, str) or not 1 <= len(hold_id) <= 96:
+                    raise ValueError("请使用新版界面的按住移动按钮")
+                if snap.moving or bool(getattr(self.arm, "is_homing", False)):
+                    raise ValueError("请先停止当前运动")
+                target = [math.degrees(x) for x in frames[-1]["pos"]]
+                if self._endpoint_reached(snap, target):
+                    return {"name": name, "active": False, "reached": True}
+                error = self.on_path(cid, [target], 10)
+                if error:
+                    raise ValueError(error)
+                self._endpoint_hold = {"id": hold_id, "owner": cid, "touch": time.monotonic(), "target": target}
+                return {"name": name, "active": True, "reached": False}
+            if action == "traj_rename":
+                error = self.on_rec_rename(cid, name, str(msg.get("name") or ""))
+                if error:
+                    raise ValueError(error)
+                from robot_station.traj import sanitize_traj_name
+                return {"name": sanitize_traj_name(msg.get("name"))}
+            if action == "traj_delete":
+                error = self.on_rec_delete(cid, name)
+                if error:
+                    raise ValueError(error)
+                return {}
+            if action != "traj_process":
+                raise ValueError("未知轨迹操作")
+        # Editing is CPU/file work: keep it off the 100 Hz motion lock.
+        return process_trajectory(name, msg.get("operations"), save=bool(msg.get("save")),
+                                  dest=str(msg.get("name") or ""), future=msg.get("future"))
+
+    def _program_control(self, cid: str, action: str, msg: dict, store: WorkbenchStore) -> dict:
+        if action == "stop":
+            self._stop_endpoint_hold()
+            self.program.stop()
+            self._program_owner = ""
+            if self.arm.poll().recording:
+                self.arm.record_stop()
+            self.arm.hold(abort_path=True)
+            self._drop_cart()
+        elif action == "pause":
+            self.program.pause()
+            if self.program.active:
+                self.arm.hold(abort_path=True)
+        elif action in ("run", "step", "resume"):
+            if self._endpoint_hold:
+                raise ValueError("请先松开移动到末点按钮")
+            snap = self.arm.poll()
+            blocked = self.arm.refuse_motion()
+            if not self.gate.motion_allowed() or blocked:
+                raise ValueError(blocked or "请先解除急停")
+            if not snap.online or not snap.enabled:
+                raise ValueError("请先连接并使能机械臂")
+            if self.arm_mode() != "Position":
+                raise ValueError("程序需要 Position 模式")
+            if snap.recording:
+                raise ValueError("请先停止示教录制")
+            if self.program.status == "paused" and action in ("step", "resume"):
+                if cid != self._program_owner:
+                    raise ValueError("请在启动程序的窗口中继续")
+                self.program.resume(single=action == "step")
+            else:
+                if self.program.active or snap.moving or snap.replay_active or bool(getattr(self.arm, "is_homing", False)):
+                    raise ValueError("请先停止当前动作或程序")
+                self._program_scale = number(msg.get("speed_scale", 1), 0.1, 1, "速度倍率")
+                prepared = ProgramRunner()
+                prepared.start(str(msg.get("name") or "未命名程序"), msg.get("nodes"),
+                               store.points(), snap.limits, single=action == "step")
+                self.arm.hold(abort_path=True)
+                self._drop_cart()
+                self.program = prepared
+                self._program_owner = cid
+            self._program_touch = time.monotonic()
+            self._note()
+        else:
+            raise ValueError(f"未知工作台操作：{action}")
+        return self.program.snapshot()
+
+    def _dispatch_program_node(self, node: dict) -> str | None:
+        if not self.gate.motion_allowed():
+            return "急停已锁存"
+        kind = node["type"]
+        speed = max(5, float(node.get("speed", 20)) * self._program_scale)
+        if kind == "movej":
+            return self.arm.run_path([node["q"]], speed)
+        if kind == "gripper":
+            snap = self.arm.poll()
+            if not snap.has_gripper or any(m.get("name") == "夹爪" and not m.get("online") for m in snap.motors):
+                return "夹爪未连接，程序已停止"
+            setter = getattr(self.arm, "set_gripper_effort", None)
+            if callable(setter):
+                error = setter(node["effort"])
+                if error:
+                    return error
+            return self.arm.set_gripper_open(node["open"])
+        if kind == "replay":
+            return self.arm.replay_start(node["file"], node["rate"], speed)
+        return None
 
     def wait_snap(self, last_seq: int, timeout_s: float = 0.25) -> tuple[int, dict]:
         """Block until world.seq moves past last_seq, then return (seq, snapshot)."""
@@ -905,6 +1121,15 @@ class MotionCore:
 
     def handle(self, msg: dict[str, Any]) -> dict[str, Any] | None:
         try:
+            if needs_session(msg):
+                if self._arm_switching:
+                    return rejected(msg, "连接操作正在进行，请等待完成")
+                with self._arm_lock:
+                    if self._session_required and msg.get("session") != self._connection_session:
+                        if msg.get("t") in ("touch", "park"):
+                            return None
+                        return rejected(msg, "连接会话已变化，请等待最新设备状态后重试；旧指令未执行")
+                    return self._handle(msg)
             return self._handle(msg)
         except Exception as exc:
             logger.exception("运动指令失败")
@@ -914,10 +1139,12 @@ class MotionCore:
         kind = msg.get("t")
         cid = str(msg.get("cid") or "")
         if self._arm_switching and kind not in ("add", "drop", "touch", "rtt", "e", "park", "arm_src"):
-            return {"t": "ack", "ok": False, "error": "正在切换仿真/真机", "op": str(kind or "")}
+            return {"t": "ack", "ok": False, "error": "连接操作正在进行", "op": str(kind or "")}
         if kind == "add":
             if cid:
                 self.add_client(cid)
+        elif kind == "workbench":
+            return self.on_workbench(cid, msg)
         elif kind == "drop":
             if cid:
                 self.drop_client(cid)
@@ -987,7 +1214,7 @@ class MotionCore:
             xyz = [float(x) for x in (msg.get("xyz") or [0, 0, 0])]
             rpy = [float(x) for x in (msg.get("rpy") or [0, 0, 0])]
             speed = float(msg.get("speed") or self.cfg.arm_speed_deg_s)
-            err = self.on_cartesian_pose(cid, xyz, rpy, speed, t0=msg.get("t0"))
+            err = self.on_cartesian_pose(cid, xyz, rpy, speed, t0=msg.get("t0"), stream=bool(msg.get("stream")))
             self._set_cmd_err(err)
             return {"t": "ack", "ok": err is None, "error": err, "op": "cart_go"}
         elif kind == "path":
@@ -1029,8 +1256,8 @@ class MotionCore:
             self._set_cmd_err(err)
             return {"t": "ack", "ok": err is None, "error": err, "op": "replay"}
         elif kind == "link":
-            err = self.on_link(cid, str(msg.get("action") or ""))
-            return {"t": "ack", "ok": err is None, "error": err, "op": "link"}
+            err = self.on_link(cid, str(msg.get("action") or ""), msg.get("kind"), msg.get("port"))
+            return {"t": "ack", "ok": err is None, "error": err, "op": "link", "request_id":msg.get("request_id")}
         elif kind == "script":
             err = self.on_script(cid, str(msg.get("name") or ""))
             return {"t": "ack", "ok": err is None, "error": err, "op": "script"}
@@ -1066,6 +1293,14 @@ class MotionCore:
         Logging is rate limited so a 100 Hz failure cannot flood the host log.
         """
         now = time.monotonic()
+        with self._arm_lock:
+            self._stop_endpoint_hold()
+        if self.program.active:
+            self.program.stop("运动拍异常，程序已停止")
+            try:
+                self.arm.hold(abort_path=True)
+            except Exception:
+                logger.exception("程序异常后的保持失败")
         self._tick_err_count += 1
         if now - self._tick_err_last_log >= TICK_ERR_LOG_EVERY_S:
             self._tick_err_last_log = now
@@ -1107,6 +1342,16 @@ class MotionCore:
             self._arm_lock.release()
 
     def _step_arm(self, now: float, dt: float, ncli: int, moving: bool) -> None:
+        hold = self._endpoint_hold
+        if hold and (now - hold["touch"] >= ENDPOINT_HOLD_TIMEOUT_S or
+                     not self.gate.motion_allowed() or
+                     self._endpoint_reached(self.arm.poll(), hold["target"])):
+            self._stop_endpoint_hold()
+        if self.program.active and now - self._program_touch > 2.0:
+            self.program.stop("程序控制连接超时")
+            self.arm.hold(abort_path=True)
+        if self.program.status == "running":
+            self.gate.note_command()
         homing = bool(getattr(self.arm, "is_homing", False))
         parked = bool(getattr(self.arm, "_parked", False))
         streaming = bool(getattr(self.arm, "_servoing", False))
@@ -1142,6 +1387,28 @@ class MotionCore:
         self.arm.servo(dt)
         writer_err = str(getattr(self.arm, "_writer_err", "") or "")
         arm = self.arm.poll()
+        if self._link_disconnected:
+            arm.online = arm.enabled = arm.moving = False
+        elif not arm.online and self.world.connection.get("status") == "connected":
+            self._connection_session = secrets.token_hex(12)
+            self._enable_required = True
+            self._link_disconnected = True
+            self._drop_cart()
+            self._endpoint_hold = None
+            if self.program.active:
+                self.program.stop("设备连接已断开，程序已停止")
+            self._publish_connection("error", arm.link_err or "设备连接已断开，请检查后重新连接")
+        if self.world.connection.get("status") == "connected":
+            self._publish_connection("connected")
+        if self.program.status == "running":
+            if writer_err or not arm.online or not arm.enabled:
+                self.program.stop(writer_err or "机械臂连接或使能状态丢失")
+            else:
+                self.program.tick(now, arm, self._dispatch_program_node, self._program_scale)
+            if self.program.status in ("error", "completed"):
+                self.arm.hold(abort_path=True)
+            if self.program.error:
+                self._set_cmd_err(self.program.error)
         if writer_err and _is_vendor_enable_noise(writer_err) and _live_joints_ok(arm):
             try:
                 self.arm._writer_err = ""

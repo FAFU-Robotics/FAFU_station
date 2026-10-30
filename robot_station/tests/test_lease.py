@@ -63,6 +63,7 @@ class LocalControlTests(unittest.TestCase):
         st.start()
         try:
             st.add_client("a")
+            self.assertIsNone(st.on_power("a", True))
             deadline = time.monotonic() + 0.9
             while time.monotonic() < deadline:
                 st.on_touch("a")

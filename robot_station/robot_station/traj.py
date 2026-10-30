@@ -151,19 +151,31 @@ def is_header(obj: dict[str, Any]) -> bool:
 
 
 class TrajectoryWriter:
-    def __init__(self, path: Path, *, teach: str, mode: str, n: int) -> None:
+    def __init__(self, path: Path, *, teach: str, mode: str, n: int, prefix: list[dict] | None = None,
+                 edit_history: dict | None = None) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         self.path = path
         self.teach = teach
         self.mode = mode
         self.n = int(n)
         self.t0 = time.monotonic()
+        self._perf0 = time.perf_counter()
+        self._last_t = -1.0
         self.count = 0
         self._lock = threading.Lock()
         self._closed = False
-        self._fh = path.open("w", encoding="utf-8")
+        self._fh = path.open("x", encoding="utf-8")
         header = {"v": 1, "kind": "traj", "teach": teach, "mode": mode, "n": int(n)}
+        if edit_history is not None:
+            header["edit_history"] = edit_history
         self._fh.write(json.dumps(header, ensure_ascii=False) + "\n")
+        if prefix:
+            for row in prefix:
+                self._fh.write(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n")
+            self.count = len(prefix)
+            self.t0 = time.monotonic() - float(prefix[-1]["t"]) - PLAYBACK_DT
+            self._perf0 = time.perf_counter() - float(prefix[-1]["t"]) - PLAYBACK_DT
+            self._last_t = float(prefix[-1]["t"])
         self._fh.flush()
 
     def log(
@@ -174,16 +186,18 @@ class TrajectoryWriter:
         gripper_vel: float | None = None,
     ) -> None:
         rec = {
-            "t": time.monotonic() - self.t0,
+            "t": time.perf_counter() - self._perf0,
             "pos": [float(x) for x in pos],
             "vel": [float(x) for x in vel],
             "gpos": None if gripper_pos is None else float(gripper_pos),
             "gvel": 0.0 if gripper_vel is None else float(gripper_vel),
         }
-        line = json.dumps(rec, ensure_ascii=False) + "\n"
         with self._lock:
             if self._closed:
                 return
+            rec["t"] = max(rec["t"], self._last_t + 1e-5)
+            self._last_t = rec["t"]
+            line = json.dumps(rec, ensure_ascii=False) + "\n"
             self._fh.write(line)
             self.count += 1
             if self.count % 10 == 0:

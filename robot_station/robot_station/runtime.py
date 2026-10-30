@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import os
+import sysconfig
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -15,6 +17,13 @@ CODE_REV_FILES = (
     "robot_station/adapters/fafu_dyn.py",
     "robot_station/vendor_fafu/fafu_robot_controller.py",
     "robot_station/motion.py",
+    "robot_station/connection.py",
+    "robot_station/config.py",
+    "robot_station/serial_guard.py",
+    "robot_station/world.py",
+    "robot_station/programs.py",
+    "robot_station/trajectory_workspace.py",
+    "robot_station/traj.py",
     "robot_station/grav_urdf.py",
     "robot_station/web/server.py",
     "robot_station/service.py",
@@ -37,6 +46,12 @@ def station_code_rev(root: Path | None = None) -> str:
         except OSError:
             digest.update(b"missing")
         digest.update(b"\0")
+    # SDK updates must also invalidate an already running motion process.
+    sdk = Path(os.environ.get("FAFU_ARM_SDK") or base.parent / "fafu_arm_sdk") / "fafu_robot_python"
+    for filename in ("fafu_robot_controller.py", "fafu_motor" + (sysconfig.get_config_var("EXT_SUFFIX") or ".pyd")):
+        path = sdk / filename
+        digest.update(filename.encode("utf-8"))
+        digest.update(path.read_bytes() if path.is_file() else b"missing-sdk")
     return digest.hexdigest()[:12]
 
 

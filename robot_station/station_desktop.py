@@ -342,7 +342,7 @@ def _spawn_local_station(web_only: bool = False, *, replace_web: bool = False) -
     except Exception:
         env = os.environ.copy()
     if _live_arm_wanted():
-        # USB 热插拔：调试板插上时自动把臂源切到真机（不自动使能），
+        # USB 热插拔：记录调试板变化，不自动连接或切换目标；
         # 作业相机插拔时自动重认。见 robot_station/usb_watch.py。
         env["STATION_ARM_WATCH"] = "1"
         env["STATION_CAMERA_WATCH"] = "1"

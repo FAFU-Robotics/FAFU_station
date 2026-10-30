@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Live arm on Ubuntu: CPython 3.10 matches fafu_motor cp310.
+# Source launch selects a Python matching the built SDK extension.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
@@ -26,26 +26,27 @@ elif [ -f "$ROOT/vendor/fafu_arm_sdk/fafu_robot_python/fafu_robot_controller.py"
   export FAFU_ARM_SDK="$ROOT/vendor/fafu_arm_sdk"
 fi
 
-pick_py310() {
-  if [ -n "${STATION_PYTHON:-}" ] && [ -x "$STATION_PYTHON" ]; then
-    if "$STATION_PYTHON" -c "import sys; assert sys.version_info[:2]==(3,10)" 2>/dev/null; then
-      echo "$STATION_PYTHON"
-      return 0
-    fi
+supports_sdk() {
+  local candidate="$1"
+  [ -x "$candidate" ] || return 1
+  LD_LIBRARY_PATH="${FAFU_ARM_SDK:+$FAFU_ARM_SDK/fafu_robot_python:}${LD_LIBRARY_PATH:-}" \
+    "$candidate" -c "import sys; sys.path.insert(0, sys.argv[1]); import fafu_motor; import fafu_robot_controller" \
+    "${FAFU_ARM_SDK:-}/fafu_robot_python" >/dev/null 2>&1
+}
+
+pick_python() {
+  if [ -n "${STATION_PYTHON:-}" ]; then
+    supports_sdk "$STATION_PYTHON" || return 1
+    echo "$STATION_PYTHON"
+    return 0
   fi
-  if [ -n "${CONDA_PREFIX:-}" ] && [ -x "$CONDA_PREFIX/bin/python" ]; then
-    if "$CONDA_PREFIX/bin/python" -c "import sys; assert sys.version_info[:2]==(3,10)" 2>/dev/null; then
-      echo "$CONDA_PREFIX/bin/python"
-      return 0
-    fi
-  fi
-  for cand in python3.10 python3; do
-    if command -v "$cand" >/dev/null 2>&1; then
-      if "$cand" -c "import sys; assert sys.version_info[:2]==(3,10)" 2>/dev/null; then
-        command -v "$cand"
-        return 0
-      fi
-    fi
+  for candidate in "${VIRTUAL_ENV:-}/bin/python" "${CONDA_PREFIX:-}/bin/python"; do
+    if supports_sdk "$candidate"; then echo "$candidate"; return 0; fi
+  done
+  for candidate in python3.12 python3.10 python3; do
+    local executable
+    executable="$(command -v "$candidate" || true)"
+    if [ -n "$executable" ] && supports_sdk "$executable"; then echo "$executable"; return 0; fi
   done
   return 1
 }
@@ -88,30 +89,32 @@ if [ -z "${FAFU_ARM_SDK:-}" ]; then
   done
 fi
 
-PY310="$(pick_py310 || true)"
-if [ -z "$PY310" ]; then
-  echo "Python 3.10 not found."
-  echo "Official fafu_motor is cp310. Do not use Python 3.11 for live USB."
-  echo "Install: sudo apt install python3.10 python3.10-venv"
-  echo "Or set STATION_PYTHON to a 3.10 interpreter."
+STATION_PY="$(pick_python || true)"
+if [ -z "$STATION_PY" ]; then
+  echo "No Python could import the selected SDK extension."
+  echo "Build fafu_motor for the target Python first, including Python 3.12."
+  echo "Build: bash ../fafu_arm_sdk/fafu_robot_cpp/linux/build.sh --python python3.12"
+  echo "Or set STATION_PYTHON to a compatible interpreter."
   exit 1
 fi
 
-if ! "$PY310" -c "import websockets, yaml, numpy" 2>/dev/null; then
-  echo "Installing station deps for Python 3.10 ..."
-  "$PY310" -m pip install -q websockets PyYAML pywebview numpy pyrealsense2 PyGObject
+if [ "${1:-}" = "--check-python" ]; then echo "$STATION_PY"; exit 0; fi
+
+if ! "$STATION_PY" -c "import websockets, yaml, numpy, webview" 2>/dev/null; then
+  echo "Installing station dependencies ..."
+  "$STATION_PY" -m pip install -q websockets PyYAML pywebview numpy pyrealsense2 PyGObject
 fi
 
 PIN=NO
-if "$PY310" -c "import pinocchio" 2>/dev/null; then
+if "$STATION_PY" -c "import pinocchio" 2>/dev/null; then
   PIN=YES
 fi
 
 export PYTHONPATH="$APP_DIR${PYTHONPATH:+:$PYTHONPATH}"
-echo "Live station: Python 3.10  STATION_ALLOW_LIVE_ARM=1  arm=fafu  allow-motion"
-echo "PY=$PY310"
+echo "Live station: source Python  STATION_ALLOW_LIVE_ARM=1  arm=fafu  allow-motion"
+echo "PY=$STATION_PY"
 echo "pinocchio=$PIN"
 echo "SDK=${FAFU_ARM_SDK:-}"
 echo "E-stop: page button or unplug USB. Clear the workspace before Enable."
-run_preflight "$PY310"
-exec "$PY310" -u "$DESKTOP_PY" "$@"
+run_preflight "$STATION_PY"
+exec "$STATION_PY" -u "$DESKTOP_PY" "$@"

@@ -101,14 +101,14 @@ class FafuArmTests(unittest.TestCase):
         dummy = Dummy()
         arm._robot = dummy
         arm.stop()
-        self.assertEqual(dummy.close_kwargs.get("joint_release"), "hold")
+        self.assertEqual(dummy.close_kwargs.get("joint_release"), "preserve")
         self.assertEqual(dummy.close_kwargs.get("gripper_release"), "stop")
 
         arm = FafuArm(required=False, allow_motion=False)
         dummy = Dummy()
         arm._robot = dummy
         arm._drop_lost_live_link()
-        self.assertEqual(dummy.close_kwargs.get("joint_release"), "hold")
+        self.assertEqual(dummy.close_kwargs.get("joint_release"), "preserve")
         self.assertEqual(dummy.close_kwargs.get("gripper_release"), "stop")
 
     def test_zero_velocity_arm_frame_keeps_m7_noop_slot(self) -> None:

@@ -4,6 +4,7 @@ import inspect
 import os
 import time
 import unittest
+from unittest.mock import patch
 
 from pathlib import Path
 
@@ -18,6 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 def _attach_fake(core: MotionCore) -> None:
     FakeFafuController.last = None
     core.arm._controller_cls = FakeFafuController
+    core.cfg.arm_connect_on_start = True
 
 
 def _motion_calls(fake: FakeFafuController) -> list[str]:
@@ -685,7 +687,7 @@ class FafuSimTests(unittest.TestCase):
             def __init__(self, *args, **kwargs):
                 raise RuntimeError("no USB debug board detected")
 
-        core = MotionCore(StationConfig(arm="auto", open_browser=False))
+        core = MotionCore(StationConfig(arm="auto", arm_connect_on_start=True, open_browser=False))
         core.arm._controller_cls = Boom
         core.start()
         try:
@@ -696,20 +698,20 @@ class FafuSimTests(unittest.TestCase):
         finally:
             core.stop()
 
-    def test_fafu_start_failure_falls_back_to_sim(self) -> None:
+    def test_fafu_start_failure_keeps_serial_target_offline(self) -> None:
         class Boom:
             def __init__(self, *args, **kwargs):
                 raise RuntimeError("motors did not respond within 500ms")
 
-        core = MotionCore(StationConfig(arm="fafu", open_browser=False))
+        core = MotionCore(StationConfig(arm="fafu", arm_connect_on_start=True, open_browser=False))
         core.arm._controller_cls = Boom
         core.arm.required = True
         core.start()
         try:
             self.assertIsNotNone(core._tick_th)
-            self.assertEqual(core.arm_kind(), "sim")
-            self.assertIn("仿真", core._cmd_err)
-            self.assertIn("motors", core._cmd_err)
+            self.assertEqual(core.arm_kind(), "fafu")
+            self.assertFalse(core.snapshot()["arm"]["online"])
+            self.assertIn("motors", core.snapshot()["connection"]["error"])
         finally:
             core.stop()
 
@@ -777,8 +779,10 @@ class FafuSimTests(unittest.TestCase):
                 raise RuntimeError("motors [7] did not respond within 500ms")
 
         core = MotionCore(StationConfig(arm="fafu", open_browser=False))
-        core.arm = FafuArm(required=False, allow_motion=True, controller_cls=Boom)
-        err = core.on_link("c", "connect")
+        arm = FafuArm(required=False, allow_motion=True, controller_cls=Boom)
+        arm.backend = "fafu"
+        with patch("robot_station.motion.build_arm",return_value=arm), patch("robot_station.serial_guard.live_serial_allowed",return_value=True):
+            err = core.on_link("c", "connect", "serial", "COM9")
         self.assertIsNotNone(err)
         self.assertIn("motors", err or "")
         self.assertIsNone(core.arm._robot)

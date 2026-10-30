@@ -50,7 +50,7 @@ powershell -ExecutionPolicy Bypass -File packaging\windows\pack_single_exe.ps1
 1. 插上机械臂 USB
 2. 双击该 exe
 
-第一次会看到「正在安装…」，随后打开控制页，并在桌面建立快捷方式。USB 连上后自动 Connect 并使能。操作说明在安装后的 `app\README.md`。
+第一次会看到「正在安装…」，随后打开控制页，并在桌面建立快捷方式。在「总览与连接」选择串口并点击「连接」，检查反馈后再点击「使能」。连接不会自动使能。操作说明在安装后的 `app\README.md`。
 
 更新：把新的单个 exe 发给对方，再双击一次即可覆盖。控制路径变了会自动换运动进程。
 

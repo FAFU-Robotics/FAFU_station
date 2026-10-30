@@ -288,7 +288,7 @@ if (Test-Path $ico) { $cscArgs += "/win32icon:$ico" }
 & $csc @cscArgs $cs
 if ($LASTEXITCODE -ne 0) { throw "csc failed" }
 $verFile = Join-Path $app "VERSION"
-$pkgVer = "1.5.0"
+$pkgVer = "1.7.0"
 $initPy = Join-Path $Repo "robot_station\__init__.py"
 if (Test-Path $initPy) {
     $m = Select-String -Path $initPy -Pattern '__version__\s*=\s*"([^"]+)"' | Select-Object -First 1
@@ -338,7 +338,8 @@ First run of the sendable exe
 - Double-click dist\FAFUArmStation.exe
 - It unpacks to %LOCALAPPDATA%\FAFUArmStation and opens the control window
 - A desktop shortcut is created in the background
-- After USB connects, the app Connects and enables the arm (motors hold pose)
+- In Overview and Connection, choose the serial port and click Connect
+- Check feedback, then click Enable; connecting does not enable the motors
 
 If you run THIS folder instead
 - Double-click FAFUArmStation.exe (or 启动真机.bat) here
@@ -361,7 +362,7 @@ Gravity
   machine if you want SDK gravity_compensation_step.
 
 Simulation
-- Open the app and choose the sim arm on the right
+- In Overview and Connection, choose Local Simulation, then click Connect
 "@
 $readme | Set-Content -Encoding utf8 (Join-Path $OutDir "Readme.txt")
 

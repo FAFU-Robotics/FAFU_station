@@ -10,7 +10,7 @@ on:
       tag:
         description: "Release tag to update (e.g. v1.6.1)"
         required: true
-        default: v1.6.1
+        default: v1.7.0
 
 permissions:
   contents: write
@@ -20,38 +20,29 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Resolve tag
-        id: meta
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            tag="${{ github.event.inputs.tag }}"
-          else
-            tag=""
-            while IFS= read -r -d '' f; do
-              base="$(basename "$f" .md)"
-              if [ -f ".github/release-notes/${base}.md" ]; then
-                tag="$base"
-              fi
-            done < <(find .github/release-notes -maxdepth 1 -name '*.md' -print0)
-            if [ -z "$tag" ]; then
-              echo "No release notes file found." >&2
-              exit 1
-            fi
-          fi
-          notes=".github/release-notes/${tag}.md"
-          if [ ! -f "$notes" ]; then
-            echo "Missing $notes" >&2
-            exit 1
-          fi
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "notes=$notes" >> "$GITHUB_OUTPUT"
-
-      - uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.meta.outputs.tag }}
-          name: ${{ steps.meta.outputs.tag }}
-          body_path: ${{ steps.meta.outputs.notes }}
-          draft: false
-          prerelease: false
-          make_latest: true
+          fetch-depth: 0
+
+      - name: Update notes for existing releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_TAG: ${{ inputs.tag }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            files=(".github/release-notes/${REQUESTED_TAG}.md")
+          else
+            mapfile -d '' files < <(git diff --name-only --diff-filter=AM -z "$BEFORE_SHA" "$GITHUB_SHA" -- '.github/release-notes/*.md')
+          fi
+          for notes in "${files[@]}"; do
+            tag="$(basename "$notes" .md)"
+            [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Invalid release tag: $tag" >&2; exit 1; }
+            [ -f "$notes" ] || { echo "Missing $notes" >&2; exit 1; }
+            # A new notes file must not publish a release before its builds finish.
+            if gh release view "$tag" >/dev/null 2>&1; then
+              gh release edit "$tag" --notes-file "$notes"
+            else
+              echo "No existing release for $tag; the tag build will publish it."
+            fi
+          done

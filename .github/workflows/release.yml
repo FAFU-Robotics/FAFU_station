@@ -9,7 +9,23 @@ permissions:
   contents: write
 
 jobs:
+  validate-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check package version matches tag
+        run: |
+          python3 - <<'PY'
+          import os, re
+          from pathlib import Path
+          source = Path('robot_station/robot_station/__init__.py').read_text(encoding='utf-8')
+          version = re.search(r'__version__\s*=\s*"([^"]+)"', source).group(1)
+          assert os.environ['GITHUB_REF_NAME'] == 'v' + version, 'Release tag and package version differ'
+          print('Validated version:', version)
+          PY
+
   build-windows:
+    needs: validate-version
     runs-on: windows-latest
     defaults:
       run:
@@ -41,6 +57,7 @@ jobs:
           if-no-files-found: error
 
   build-linux:
+    needs: validate-version
     runs-on: ubuntu-22.04
     timeout-minutes: 45
     steps:
@@ -130,10 +147,35 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           pattern: "*"
-          merge-multiple: true
           path: artifacts
-      - name: List release files
-        run: ls -lah artifacts
+      - name: Validate artifacts and write checksums
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, shutil
+          from pathlib import Path
+          version = os.environ['GITHUB_REF_NAME'].removeprefix('v')
+          output = Path('release-files')
+          output.mkdir()
+          checksums = []
+          for platform, folder, filename, prefix, magic in (
+              ('windows', 'windows-exe', 'FAFUArmStation.exe', 'exe', 'FAFUEXE1'),
+              ('linux', 'linux-appimage', 'FAFUArmStation-x86_64.AppImage', 'image', 'FAFUAPP1'),
+          ):
+              source = Path('artifacts') / folder
+              manifest = source / 'BUILD_MANIFEST.json'
+              data = json.loads(manifest.read_text(encoding='utf-8-sig'))
+              artifact = source / filename
+              digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+              assert data['version'] == version, f'{platform}: wrong version'
+              assert data['magic'] == magic, f'{platform}: wrong package format'
+              assert data[prefix + '_bytes'] == artifact.stat().st_size > 0, f'{platform}: wrong size'
+              assert data[prefix + '_sha256'].lower() == digest, f'{platform}: checksum mismatch'
+              shutil.copyfile(artifact, output / filename)
+              shutil.copyfile(manifest, output / (platform + '-BUILD_MANIFEST.json'))
+              checksums.append(digest + '  ' + filename)
+          (output / 'SHA256SUMS').write_text('\n'.join(checksums) + '\n', encoding='utf-8')
+          print('\n'.join(checksums))
+          PY
       - name: Resolve release notes
         id: notes
         run: |
@@ -150,6 +192,11 @@ jobs:
           name: ${{ github.ref_name }}
           body_path: ${{ steps.notes.outputs.use_file == 'true' && steps.notes.outputs.path || '' }}
           generate_release_notes: ${{ steps.notes.outputs.use_file != 'true' }}
+          fail_on_unmatched_files: true
+          make_latest: true
           files: |
-            artifacts/FAFUArmStation.exe
-            artifacts/FAFUArmStation-x86_64.AppImage
+            release-files/FAFUArmStation.exe
+            release-files/FAFUArmStation-x86_64.AppImage
+            release-files/windows-BUILD_MANIFEST.json
+            release-files/linux-BUILD_MANIFEST.json
+            release-files/SHA256SUMS

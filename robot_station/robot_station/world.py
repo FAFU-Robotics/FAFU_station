@@ -8,6 +8,7 @@ import time
 class ArmSnap:
     online: bool = True
     backend: str = "mock"
+    serial_port: str = ""
     enabled: bool = True
     n: int = 6
     q_deg: list[float] = field(default_factory=lambda: [0.0] * 6)
@@ -23,6 +24,10 @@ class ArmSnap:
     gripper_limits: list[float] | None = None
     gripper_deg: float = 75.0
     gripper_effort: int = 300
+    gripper_nm_per_raw: float | None = None
+    feedback_deg: list[float] | None = None
+    gripper_moving: bool | None = None
+    gripper_tau_raw: int | None = None
     tau_raw: list[int] = field(default_factory=lambda: [0] * 6)
     dyn_ready: bool = False
     grav_active: bool = False
@@ -62,6 +67,7 @@ class World:
     cmd_hz: float = 0.0
     last_rtt_ms: float | None = None
     echo_t0: float | None = None
+    connection: dict = field(default_factory=dict)
     arm: ArmSnap = field(default_factory=ArmSnap)
     camera: CamSnap = field(default_factory=CamSnap)
 
@@ -71,6 +77,8 @@ class World:
             "seq": self.seq,
             "t_mono": self.t_mono,
             "code_rev": self.code_rev,
+            "capabilities": {"motor_disable": True, "connection_profiles": 1, "cartesian_follow": True},
+            "connection": dict(self.connection),
             "now": time.time(),
             "safety": self.safety,
             "safety_reason": self.safety_reason,
@@ -81,6 +89,7 @@ class World:
             "arm": {
                 "online": a.online,
                 "backend": a.backend,
+                "serial_port": a.serial_port,
                 "enabled": a.enabled,
                 "n": a.n,
                 "q_deg": [round(x, 2) for x in a.q_deg],
@@ -98,6 +107,10 @@ class World:
                 "gripper_limits": a.gripper_limits,
                 "gripper_deg": None if a.gripper_deg is None else round(float(a.gripper_deg), 1),
                 "gripper_effort": int(a.gripper_effort),
+                "gripper_nm_per_raw": a.gripper_nm_per_raw,
+                "feedback_deg": a.feedback_deg,
+                "gripper_moving": a.gripper_moving,
+                "gripper_tau_raw": a.gripper_tau_raw,
                 "tau_raw": list(a.tau_raw),
                 "dyn_ready": bool(a.dyn_ready),
                 "grav_active": bool(a.grav_active),

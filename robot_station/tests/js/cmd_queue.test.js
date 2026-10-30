@@ -21,6 +21,8 @@ function test(name, fn) {
 test("shouldDrop: stream only", () => {
   assert.strictEqual(shouldDrop({ t: "arm", stream: true }), true);
   assert.strictEqual(shouldDrop({ t: "arm" }), false);
+  assert.strictEqual(shouldDrop({ t: "cart_go", stream: true }), true);
+  assert.strictEqual(shouldDrop({ t: "cart_go" }), false);
   assert.strictEqual(shouldDrop({ t: "cart" }), true);
   assert.strictEqual(shouldDrop({ t: "teach" }), true);
   assert.strictEqual(shouldDrop({ t: "home" }), false);
@@ -35,6 +37,41 @@ test("non-stream arm is queued and sent", () => {
   assert.strictEqual(q.flush((obj) => { sent.push(obj.t); return true; }, () => {}), true);
   assert.deepStrictEqual(sent, ["arm"]);
   assert.strictEqual(q.size(), 0);
+});
+
+test("new manual targets replace pending home and position targets", () => {
+  let t = 0;
+  const q = create({ ttlMs: 1000, now: () => t });
+  const dropped = [], sent = [];
+  const drop = (obj, reason) => dropped.push([obj.t, reason]);
+  q.enqueue({t:"home"}, drop);
+  q.enqueue({t:"arm",q:[20,40,40,0,0,0]}, drop);
+  q.enqueue({t:"cart_go",xyz:[0.2,0,0.3]}, drop);
+  t = 800;
+  q.enqueue({t:"arm",q:[-20,40,40,0,0,0]}, drop);
+  t = 1200;
+  q.flush(obj => {sent.push(obj);return true;}, drop);
+  assert.deepStrictEqual(sent, [{t:"arm",q:[-20,40,40,0,0,0]}]);
+  assert.deepStrictEqual(dropped.map(row => row[0]), ["home","arm","cart_go"]);
+  assert.ok(dropped.every(row => row[1].includes("替换")));
+});
+
+test("manual target replacement preserves explicit paths, programs and estop priority", () => {
+  const q = create({now:() => 0}), sent = [];
+  q.enqueue({t:"path",q:[[10],[20]]});
+  q.enqueue({t:"arm",q:[30]});
+  q.enqueue({t:"workbench",action:"run"});
+  q.enqueue({t:"path",q:[[40],[50]]});
+  q.enqueue({t:"arm",q:[60]});
+  q.flush(obj => {sent.push(obj.t);return true;});
+  assert.deepStrictEqual(sent, ["path","workbench","path","arm"]);
+  q.enqueue({t:"home"});
+  q.enqueue({t:"e"});
+  q.enqueue({t:"arm",q:[70]});
+  assert.strictEqual(q.hasEstop(), true);
+  sent.length = 0;
+  q.flush(obj => {sent.push(obj.t);return true;});
+  assert.deepStrictEqual(sent, ["e","arm"]);
 });
 
 test("estop clears the queue and is sent first", () => {

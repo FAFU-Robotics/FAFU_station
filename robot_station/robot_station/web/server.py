@@ -29,6 +29,7 @@ except ImportError:
     _WS_LEGACY = True
 
 from robot_station.config import StationConfig
+from robot_station.connection import needs_session
 from robot_station.service import Station
 from robot_station.telem import pack_telem
 
@@ -162,7 +163,7 @@ def serve_http(station: Station, cfg: StationConfig, stop_event: threading.Event
             arm = (snap.get("arm") or {}).get("backend") or cfg.arm
             from robot_station.serial_guard import live_serial_allowed
 
-            live = live_serial_allowed() or arm == "fafu"
+            live = live_serial_allowed()
             boot = str(snap.get("code_rev") or "").strip()
             arm_snap = snap.get("arm") or {}
             return _json(
@@ -178,13 +179,21 @@ def serve_http(station: Station, cfg: StationConfig, stop_event: threading.Event
                     "arm": arm,
                     "camera": cfg.camera,
                     "live_serial_allowed": live,
-                    "arm_allow_motion": bool(cfg.arm_allow_motion) or arm == "fafu",
+                    "arm_allow_motion": bool(cfg.arm_allow_motion),
+                    "capabilities": snap.get("capabilities", {}),
+                    "connection": snap.get("connection", {}),
                     "arm_port": cfg.arm_port or "cfg/auto",
                     "code_rev": boot,
                     "boot_rev": boot,
                     "dyn_ready": bool(arm_snap.get("dyn_ready")),
                 },
             )
+        if path == "/api/diagnostics" and method == "GET":
+            from robot_station.diagnostics import connection_diagnostics
+
+            return _json(200, connection_diagnostics(
+                cfg, station.snapshot(), in_process=isinstance(station, Station),
+                motion_connected=bool(getattr(getattr(station, "motion", None), "connected", False))))
         if path == "/api/scripts" and method == "GET":
             from robot_station.adapters.fafu_arm import list_sdk_scripts, map_script
 
@@ -198,6 +207,12 @@ def serve_http(station: Station, cfg: StationConfig, stop_event: threading.Event
                     ],
                 },
             )
+        if path == "/api/workspace" and method == "GET":
+            from robot_station.programs import WorkbenchStore
+            try:
+                return _json(200, {"ok": True, **WorkbenchStore().catalog()})
+            except (ValueError, OSError) as exc:
+                return _json(400, {"ok": False, "error": str(exc)})
         if path.split("?", 1)[0] == "/api/urdf" and method == "GET":
             from robot_station.grav_urdf import list_gravity_urdfs, selected_urdf_name, urdf_dir
 
@@ -215,6 +230,15 @@ def serve_http(station: Station, cfg: StationConfig, stop_event: threading.Event
             from robot_station.traj import list_recordings
 
             return _json(200, {"ok": True, "files": list_recordings()})
+        if path == "/api/traj/download" and method == "GET":
+            from urllib.parse import quote
+            from robot_station.traj import resolve_traj_path
+            try:
+                file = resolve_traj_path((query.get("name") or [""])[0])
+                return _http(200, file.read_bytes(), "application/x-ndjson; charset=utf-8",
+                             [("Content-Disposition", "attachment; filename*=UTF-8''" + quote(file.name))])
+            except (OSError, ValueError) as exc:
+                return _json(404, {"ok": False, "error": str(exc)})
         if path.split("?", 1)[0] == "/api/traj" and method == "DELETE":
             from robot_station.traj import delete_recording
 
@@ -248,12 +272,17 @@ def serve_http(station: Station, cfg: StationConfig, stop_event: threading.Event
             return _json(200, {"ok": True, "name": new.name})
         return _http(404, b"not found", "text/plain; charset=utf-8")
 
-    def process_request(connection: ServerConnection, request: Request) -> Response | None:
+    async def process_request(connection: ServerConnection, request: Request) -> Response | None:
         method = getattr(request, "method", "GET") or "GET"
+        if urlsplit(request.path).path == "/api/diagnostics":
+            return await asyncio.to_thread(dispatch, request.path, method, request.headers)
         return dispatch(request.path, method, request.headers)
 
     async def process_request_legacy(path: str, request_headers: Headers):
-        resp = dispatch(path, "GET", request_headers)
+        if urlsplit(path).path == "/api/diagnostics":
+            resp = await asyncio.to_thread(dispatch, path, "GET", request_headers)
+        else:
+            resp = dispatch(path, "GET", request_headers)
         if resp is None:
             return None
         return resp.status_code, list(resp.headers.raw_items()), resp.body or b""
@@ -363,7 +392,11 @@ async def _telem(ws: ServerConnection, st: Station, cfg: StationConfig) -> None:
     def _put(item: tuple[bytes, str | None]) -> None:
         if box.full():
             try:
-                box.get_nowait()
+                _, pending_hud = box.get_nowait()
+                # Pose-only updates may replace the binary frame, but must
+                # not starve feedback / connection / program status updates.
+                if item[1] is None and pending_hud is not None:
+                    item = (item[0], pending_hud)
             except asyncio.QueueEmpty:
                 pass
         box.put_nowait(item)
@@ -389,9 +422,10 @@ async def _telem(ws: ServerConnection, st: Station, cfg: StationConfig) -> None:
                 blob = pack_telem(data or {})
                 hud = None
                 now = time.monotonic()
-                arm = (data or {}).get("arm") or {}
-                err_hud = bool((data or {}).get("cmd_err") or arm.get("ik_err"))
-                if now - last_hud >= 0.1 and (not _teleop_hot(st) or err_hud):
+                if now - last_hud >= 0.1:
+                    # Keep camera suspension during teleoperation, while
+                    # orientation, measured feedback and status stay current.
+                    _teleop_hot(st)
                     payload = decorate(data) if callable(decorate) else data
                     hud = json.dumps({"t": "hud", "d": payload}, ensure_ascii=False, separators=(",", ":"))
                     last_hud = now
@@ -423,6 +457,18 @@ async def _on_text(st: Station, cid: str, raw: str, ws: ServerConnection) -> Non
     except json.JSONDecodeError:
         return
     kind = msg.get("t")
+    if needs_session(msg) and callable(getattr(st, "on_command", None)):
+        streaming = kind in ("touch", "park", "cart", "teach") or (kind == "arm" and msg.get("stream"))
+        result = st.on_command(cid, msg) if streaming else await asyncio.to_thread(st.on_command, cid, msg)
+        if result is not None:
+            if "request_id" in msg:
+                result = {**result, "request_id": msg["request_id"]}
+            await ws.send(json.dumps(result, ensure_ascii=False))
+        return
+    if kind == "workbench":
+        result = await asyncio.to_thread(st.on_workbench, cid, msg)
+        await ws.send(json.dumps({**result, "request_id": msg.get("request_id")}, ensure_ascii=False))
+        return
     if kind == "touch":
         st.on_touch(cid)
         return
@@ -501,7 +547,7 @@ async def _on_text(st: Station, cid: str, raw: str, ws: ServerConnection) -> Non
         dt_raw = msg.get("dt")
         durations = [float(x) for x in dt_raw] if dt_raw else None
         err = await _rpc(st.on_path, cid, wps, speed, durations)
-        await ws.send(json.dumps({"t": "ack", "ok": err is None, "error": err, "op": "path"}))
+        await ws.send(json.dumps({"t": "ack", "ok": err is None, "error": err, "op": "path", "request_id": msg.get("request_id")}))
     elif kind == "rec_start":
         err = await _rpc(st.on_rec_start, cid, msg.get("name"), msg.get("teach"))
         await ws.send(json.dumps({"t": "ack", "ok": err is None, "error": err, "op": "rec_start"}))

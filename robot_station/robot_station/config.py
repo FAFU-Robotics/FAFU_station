@@ -51,7 +51,8 @@ class StationConfig:
     arm_port: str = ""
     arm_allow_motion: bool = False
     arm_gripper_id: int = 7
-    # USB 热插拔监视：只在设备签名变化时才去认硬件。默认关闭，
+    arm_connect_on_start: bool = False  # Serial devices require an explicit Connect by default.
+    # USB 热插拔监视：仅记录机械臂设备变化，不自动连接或更换目标。默认关闭，
     # 便携启动器显式打开（见 usb_watch.py）。
     arm_watch: bool = False
     camera_watch: bool = False
@@ -62,7 +63,7 @@ class StationConfig:
         data = {k: v for k, v in raw.items() if k in allowed}
         if "arm_allow_motion" in data:
             data["arm_allow_motion"] = _as_bool(data["arm_allow_motion"], False)
-        for key in ("arm_watch", "camera_watch"):
+        for key in ("arm_watch", "camera_watch", "arm_connect_on_start"):
             if key in data:
                 data[key] = _as_bool(data[key], False)
         cfg = cls(**data)

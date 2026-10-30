@@ -56,8 +56,8 @@ class ArmAdapter:
     def set_grav_urdf(self, name: str) -> str | None:
         return None
 
-    def teach_pose(self, q_deg: list[float]) -> None:
-        self.apply_targets(q_deg, 999.0)
+    def teach_pose(self, q_deg: list[float]) -> str | None:
+        return "滑条拖动仅用于仿真臂"
 
     def apply_cartesian(
         self, dxyz: list[float], drpy_deg: list[float]
@@ -74,7 +74,7 @@ class ArmAdapter:
     ) -> str | None:
         return "此后端不支持路点路径（配置 arm: sim）"
 
-    def record_start(self, name: str | None = None, teach: str | None = None) -> str | None:
+    def record_start(self, name: str | None = None, teach: str | None = None, *, append_from: str | None = None) -> str | None:
         return "此后端不支持连续录制"
 
     def delete_traj(self, path: str) -> str | None:
@@ -99,6 +99,25 @@ class ArmAdapter:
 
     def set_powered(self, on: bool) -> str | None:
         return None
+
+
+class DisconnectedArm(ArmAdapter):
+    """An inert placeholder preserves the requested target if construction fails."""
+    def __init__(self, backend: str, n: int = 6) -> None:
+        self.backend, self.n = backend, n
+
+    def hold(self, *, abort_path: bool = False) -> None:
+        pass
+
+    def servo(self, dt: float) -> None:
+        pass
+
+    def poll(self) -> ArmSnap:
+        return ArmSnap(backend=self.backend, n=self.n, online=False, enabled=False,
+                       q_deg=[0.0]*self.n, target_deg=[0.0]*self.n, ok=[False]*self.n)
+
+    def refuse_motion(self) -> str:
+        return "设备未连接"
 
 
 class MockArm(ArmAdapter):
@@ -255,9 +274,9 @@ class MockArm(ArmAdapter):
         if not waypoints_deg:
             return "没有路点"
         first, rest = waypoints_deg[0], waypoints_deg[1:]
+        self.apply_targets(first, speed_deg_s)
         with self._lock:
             self._path = [[self._clip(i, float(p[i])) for i in range(self.n)] for p in rest]
-        self.apply_targets(first, speed_deg_s)
         return None
 
     def poll(self) -> ArmSnap:
@@ -305,7 +324,7 @@ def build_arm(
 
     ``mock`` — Demo 假臂（进程内插补，不走 SDK 方法名）。
     ``sim`` — FafuArm + 可运动 FakeFafuController，方法名与真机相同，不开串口。
-    ``fafu`` — 官方 SDK；``start()`` 失败时站控仍起来并切到仿真，避免没电/没应答时打不开页面。
+    ``fafu`` — 官方 SDK；连接失败保持真机目标且离线，不切换到仿真。
     ``auto`` — 尽量连真臂；失败保持 ``backend=fafu`` 且 offline，不换成假臂
     （避免界面显示假关节却像已连上）。
 

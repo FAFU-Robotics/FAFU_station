@@ -86,6 +86,14 @@ class Station:
     def on_touch(self, cid: str) -> None:
         self.core.on_touch(cid)
 
+    def on_workbench(self, cid: str, msg: dict) -> dict:
+        return self.core.on_workbench(cid, msg)
+
+    def on_command(self, cid: str, msg: dict) -> dict | None:
+        if msg.get("t") in ("cart", "arm", "teach", "cart_go"):
+            _mark_teleop(self)
+        return self.core.handle({**msg, "cid":cid})
+
     def on_park(self, cid: str) -> None:
         self.core.on_park(cid)
 
@@ -278,6 +286,19 @@ class WebFront:
 
     def on_touch(self, cid: str) -> None:
         self.motion.send({"t": "touch", "cid": cid})
+
+    def on_workbench(self, cid: str, msg: dict) -> dict:
+        return self.motion.call({**msg, "t": "workbench", "cid": cid}, timeout_s=10.0)
+
+    def on_command(self, cid: str, msg: dict) -> dict | None:
+        packet = {**msg, "cid":cid}
+        streaming = msg.get("t") in ("touch", "park", "cart", "teach") or (msg.get("t") == "arm" and msg.get("stream"))
+        if msg.get("t") in ("cart", "arm", "teach", "cart_go"):
+            _mark_teleop(self)
+        if streaming:
+            self.motion.send(packet)
+            return None
+        return self.motion.call(packet, timeout_s=25.0)
 
     def on_park(self, cid: str) -> None:
         self.motion.send({"t": "park", "cid": cid})
@@ -766,7 +787,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--arm-watch",
         action="store_true",
-        help="USB 热插拔：调试板插上时自动把臂源切到真机（不自动使能）",
+        help="USB 热插拔：记录机械臂设备变化，不自动连接或切换目标",
     )
     parser.add_argument(
         "--camera-watch",

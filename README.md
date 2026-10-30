@@ -1,5 +1,7 @@
 # FAFU 机械臂站控
 
+当前版本：**v1.7.0**。安装包与更新说明见 [GitHub Release](https://github.com/FAFU-Robotics/FAFU_station/releases/tag/v1.7.0)。
+
 本仓库是 FAFU 自研机械臂的软件集合，包含站控宿主和官方 SDK：
 
 ```
@@ -66,6 +68,10 @@ robot_station\scripts\rebuild_fafu_motor.bat
 
 构建需要 VS2022 C++ 工具和 CMake。`STATION_PYTHON` 可指定目标解释器。
 Python API、C++ 构建与例程见 [`fafu_arm_sdk/README.md`](fafu_arm_sdk/README.md)。
+
+## 程序工作台
+
+独立的连接、手动控制、路点和示教页面，以及 UR 风格程序树和 FAFU 简化脚本，见 [程序与作业工作台](robot_station/docs/PROGRAMMING.md)。
 
 ## 验收
 

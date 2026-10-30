@@ -21,13 +21,12 @@ def live_serial_allowed() -> bool:
 
 
 def apply_live_arm_policy(kind: str) -> str:
-    """Map live backends to sim when serial is forbidden. mock/sim unchanged."""
+    """Keep the selected target; the live adapter enforces permission on opening."""
     name = (kind or "mock").strip().lower()
     if name in ("fafu", "auto") and not live_serial_allowed():
         logger.warning(
-            "未允许真机串口：拒绝 arm=%s 打开 USB，改用 sim。"
+            "未允许真机串口：arm=%s 保持未连接，不自动切到仿真。"
             "真机请设置 STATION_ALLOW_LIVE_ARM=1",
             name,
         )
-        return "sim"
     return name

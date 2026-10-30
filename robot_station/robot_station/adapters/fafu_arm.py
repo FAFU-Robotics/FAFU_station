@@ -244,6 +244,21 @@ def _uses_controlled_motors(obj: Any) -> bool:
     return callable(getattr(obj, "_controlled_motor_ids", None))
 
 
+def gripper_torque_scale(robot: Any, motor_id: int) -> float | None:
+    """Use the configured model and the loaded SDK's authoritative table."""
+    cfg = getattr(robot, "_cfg", None)
+    models = getattr(cfg, "motor_types", {}) or {}
+    model = models.get(int(motor_id))
+    pm = sys.modules.get("fafu_motor")
+    coefficient = getattr(pm, "TORQUE_COEFF", {}).get(model)
+    return float(coefficient) * 0.01 if coefficient is not None else None
+
+
+def motor_fault_text(code: int) -> str:
+    describe = getattr(sys.modules.get("fafu_motor"), "describe_fault", None)
+    return str(describe(int(code))) if callable(describe) else f"故障 {code}"
+
+
 def _gripper_state_unusable(st: Any) -> bool:
     """True when a cached gripper sample must not block J1–J6 motion."""
     if st is None:
@@ -337,17 +352,12 @@ def _load_fafu_controller() -> Any:
     """
     overlay = _station_fafu_controller_path()
     if overlay.is_file():
-        import importlib.util
+        # Import the real SDK under its own name. Station overrides subclass it
+        # and never replace sys.modules['fafu_robot_controller'] with a copy.
+        from robot_station.vendor_fafu.fafu_robot_controller import FafuRobotController
 
-        sys.modules.pop("fafu_robot_controller", None)
-        spec = importlib.util.spec_from_file_location("fafu_robot_controller", overlay)
-        if spec is None or spec.loader is None:
-            raise RuntimeError(f"无法加载 {overlay}")
-        mod = importlib.util.module_from_spec(spec)
-        sys.modules["fafu_robot_controller"] = mod
-        spec.loader.exec_module(mod)
-        logger.info("已加载站控控制器：夹爪离线只警告，关节 1–6 在线即可使能和控制")
-        return _install_gripper_offline_gate(mod.FafuRobotController)
+        logger.info("已加载子模块 SDK 及站控离线电机适配层")
+        return _install_gripper_offline_gate(FafuRobotController)
     from fafu_robot_controller import FafuRobotController  # type: ignore
 
     _patch_controller_partial_axis(FafuRobotController)
@@ -410,9 +420,8 @@ def _board_port_name(board: Any) -> str:
 def resolve_live_serial_port(preferred: str | None, board_ports: Iterable[Any] | None) -> str:
     """Pick a debug-board tty from SDK enum plus an optional preferred path.
 
-    Empty / ``auto`` uses the first enumerated board. On POSIX,
-    ``/dev/fafu_debug_board`` matches the udev symlink via ``realpath``.
-    Does not open the port.
+    Empty / ``auto`` requires a unique enumerated board. Explicit endpoints
+    (including udev symlinks) are passed unchanged; no fallback or serial I/O.
     """
     ports: list[str] = []
     seen: set[str] = set()
@@ -428,34 +437,16 @@ def resolve_live_serial_port(preferred: str | None, board_ports: Iterable[Any] |
     def _first() -> str:
         if not ports:
             raise RuntimeError(NO_DEBUG_BOARD)
+        if len(ports) > 1:
+            raise RuntimeError("发现多个候选控制板，请明确选择串口")
         return ports[0]
 
     if is_auto:
         return _first()
-    if pref in ports:
-        return pref
-    if os.name != "nt":
-        try:
-            pref_real = os.path.realpath(pref)
-        except OSError:
-            pref_real = ""
-        if pref_real:
-            for port in ports:
-                try:
-                    if os.path.realpath(port) == pref_real:
-                        return pref
-                except OSError:
-                    continue
-        try:
-            if os.path.exists(pref):
-                return pref
-        except OSError:
-            pass
-    print(
-        f"[FafuRobot] preferred port {pref!r} not found; falling back to auto",
-        flush=True,
-    )
-    return _first()
+    # Explicit endpoints may use UART chips absent from the candidate list.
+    # Open that endpoint or fail; never substitute another arm.
+    from robot_station.connection import serial_endpoint
+    return serial_endpoint(pref)
 
 
 def _unique_motor_ids(ids: list[int]) -> list[int]:
@@ -1659,6 +1650,9 @@ class FafuArm(ArmAdapter):
         self._hold_latched = False
         self._brake_latched = False
         self._brake_applied = False
+        self._power_off_latched = False
+        self._connection_enable_pending = False
+        self._power_off_requested = False
         self._dyn_ready = False
         self._writer_err = ""
         self._grav_stop = threading.Event()
@@ -1790,18 +1784,26 @@ class FafuArm(ArmAdapter):
         except Exception:
             return False
 
-    def refuse_motion(self) -> str | None:
+    def refuse_motion(self, *, allow_disabled: bool = False) -> str | None:
         if self._robot is None:
             if self._link_error:
                 return f"机械臂未连接（{self._link_error}）"
             return "机械臂未连接"
         if not self.allow_motion:
             return "真臂当前只读（arm_allow_motion=false），不会下发运动或使能"
+        if self._connection_enable_pending and not allow_disabled:
+            return "新连接尚未确认使能，请先使能"
+        if self._power_off_latched and not allow_disabled:
+            return "机械臂已去使能，请先使能"
         return None
+
+    def refuse_power_change(self) -> str | None:
+        return self.refuse_motion(allow_disabled=True)
 
     def start(self) -> None:
         if self._robot is not None:
             return
+        robot = None
         try:
             if self._controller_cls is not None:
                 controller_cls = self._controller_cls
@@ -1884,6 +1886,9 @@ class FafuArm(ArmAdapter):
                 self._hold_latched = False
                 self._brake_latched = False
                 self._brake_applied = False
+                self._power_off_latched = False
+                self._connection_enable_pending = False
+                self._power_off_requested = False
                 self._offline_ids = list(missing)
             reprobe_ids = list(self._full_joint_ids)
             if self.has_gripper and int(self.gripper_id) not in reprobe_ids:
@@ -1904,9 +1909,22 @@ class FafuArm(ArmAdapter):
             with self._lock:
                 self._robot = None
                 self._link_error = str(exc)
+            if robot is not None:
+                try:
+                    robot.close_connection(joint_release="preserve", gripper_release="stop")
+                except Exception:
+                    logger.exception("释放未完成初始化的连接失败")
             logger.error("FAFU 臂连接失败（未使能、未下发运动）: %s", exc)
             if self.required:
                 raise RuntimeError(f"arm=fafu 连接失败: {exc}") from exc
+
+    def prepare_connection(self) -> None:
+        """Require an explicit Enable without releasing an already supported arm."""
+        with self._lock:
+            self._connection_enable_pending = True
+            self._power_off_requested = False
+            self._servo_intent = False
+            self._pending_grip = None
 
     def _apply_limits_from_robot(self, robot: Any) -> None:
         ids = list(getattr(robot, "joint_motor_ids", []))[: self.n]
@@ -2124,6 +2142,13 @@ class FafuArm(ArmAdapter):
         self._reprobe_th = threading.Thread(target=_loop, name="fafu-reprobe", daemon=True)
         self._reprobe_th.start()
 
+    def _close_release_policy(self, robot: Any) -> str:
+        if self._power_off_latched:
+            return "stop"
+        if self._connection_enable_pending or not self.allow_motion or not self._flag_enabled(robot):
+            return "preserve"
+        return "hold"
+
     def stop(self) -> None:
         self._stop_reprobe()
         self._servo_intent = False
@@ -2145,7 +2170,7 @@ class FafuArm(ArmAdapter):
             # gripper uses STOP/PWM-off: POSITION hold can drive a differently
             # calibrated arm into an end stop, while BRAKE can still exert
             # continuously on some gripper firmware.
-            robot.close_connection(joint_release="hold", gripper_release="stop")
+            robot.close_connection(joint_release=self._close_release_policy(robot), gripper_release="stop")
         except TypeError:
             try:
                 robot.close_connection()
@@ -2170,6 +2195,7 @@ class FafuArm(ArmAdapter):
         if not self._link_error:
             self._link_error = "USB/总线已断开"
         self._servo_intent = False
+        self._pending_grip = None
         self._servoing = False
         self._writer_busy = False
         try:
@@ -2187,7 +2213,7 @@ class FafuArm(ArmAdapter):
         try:
             # Leave the disconnected gripper in STOP/PWM-off.  Both POSITION
             # hold and vendor-specific BRAKE behavior can apply force.
-            robot.close_connection(joint_release="hold", gripper_release="stop")
+            robot.close_connection(joint_release=self._close_release_policy(robot), gripper_release="stop")
         except TypeError:
             try:
                 robot.close_connection()
@@ -2257,12 +2283,16 @@ class FafuArm(ArmAdapter):
         silent for watchdog_ms. Ending the session on key-up / 发送位置到位
         was dropping a raised arm. Same-pose servo_j writes feedforward vel 0.
         """
-        if self._brake_latched:
+        if self._brake_latched or self._power_off_latched or self._connection_enable_pending:
             self._servo_intent = False
             self._parked = True
             self._freeze_needed = False
             return
+        # A native move or external displacement can leave the cached servo
+        # command behind. Parking must never drive back to that obsolete pose.
         hold = self._servo_cmd_rad or self._stream_q_rad
+        if not self._servoing or not self._servo_cmd_is_current():
+            hold = self._adopt_measured_cmd()
         if hold is None:
             robot = self._robot
             if robot is not None:
@@ -2516,15 +2546,33 @@ class FafuArm(ArmAdapter):
         self._rec_teach = rec.teach
         return None
 
-    def record_start(self, name: str | None = None, teach: str | None = None) -> str | None:
+    def record_start(self, name: str | None = None, teach: str | None = None, *, append_from: str | None = None) -> str | None:
         if self._robot is None:
             return "机械臂未连接"
         if not self.allow_motion:
             return "真臂当前只读，不能录制"
+        if self._power_off_latched or self._connection_enable_pending:
+            return "机械臂已去使能，请先使能"
         if self._replay_frames:
             return "回放中请先停止再录制"
         if self._rec is not None:
             return "已在录制"
+        prefix = None
+        if append_from:
+            from robot_station.trajectory_workspace import validate_frames
+
+            try:
+                _, raw = load_traj(resolve_traj_path(append_from))
+                prefix = validate_frames(raw)
+            except (ValueError, OSError, TypeError, KeyError) as exc:
+                return str(exc)
+            end = [math.degrees(x) for x in prefix[-1]["pos"]]
+            if max(abs(a-b) for a, b in zip(self._measured_deg(), end)) > 3:
+                return "当前位置与轨迹末点相差超过 3°，请先前往末点再续录"
+            gpos = prefix[-1].get("gpos")
+            if gpos is not None and abs(float(self.poll().gripper_deg or 0) - math.degrees(gpos)) > 3:
+                return "夹爪与轨迹末点相差超过 3°，请先在手动控制中调整夹爪再续录"
+            name = name or Path(append_from).stem + "_续录"
         kind = (teach or "").strip().lower()
         self._rec_entered_float = False
         if kind == "drag":
@@ -2545,7 +2593,7 @@ class FafuArm(ArmAdapter):
         self._rec_prev_mono = time.monotonic()
         self._rec_teach = mode_teach
         self._traj_name = path.name
-        self._rec = TrajectoryWriter(path, teach=mode_teach, mode=self._ctrl_mode, n=self.n)
+        self._rec = TrajectoryWriter(path, teach=mode_teach, mode=self._ctrl_mode, n=self.n, prefix=prefix)
         return None
 
     def record_stop(self) -> str | None:
@@ -2555,7 +2603,9 @@ class FafuArm(ArmAdapter):
             return None
         err = self._stop_recording()
         if entered and self._ctrl_mode in FLOAT_MODES:
-            self._reenter_position()
+            position_error = self._reenter_position()
+            if position_error:
+                return "录制已保存，但退出拖臂模式失败：" + position_error
             self._ctrl_mode = "Position"
         return err
 
@@ -2981,6 +3031,10 @@ class FafuArm(ArmAdapter):
                 pass
 
     def _ensure_enabled(self) -> str | None:
+        if self._connection_enable_pending:
+            return "新连接尚未确认使能，请先使能"
+        if self._power_off_latched:
+            return "机械臂已去使能，请先使能"
         robot = self._robot
         if robot is None:
             return "机械臂未连接"
@@ -3131,7 +3185,7 @@ class FafuArm(ArmAdapter):
         target equals the current pose, so motors keep humming/hunting. SDK
         ``emergency_stop`` / ``disable`` are MODE_STOP (PWM off) and drop the arm.
         """
-        if self._brake_latched:
+        if self._brake_latched or self._power_off_latched or self._connection_enable_pending:
             return
         robot = self._robot
         if robot is None or not self.allow_motion:
@@ -3310,6 +3364,8 @@ class FafuArm(ArmAdapter):
                 if sleep_s > 0:
                     time.sleep(sleep_s)
         finally:
+            if self._power_off_latched or self._connection_enable_pending:
+                return
             if self._brake_latched:
                 try:
                     self._apply_brake()
@@ -3451,6 +3507,8 @@ class FafuArm(ArmAdapter):
                 if sleep_s > 0:
                     time.sleep(sleep_s)
         finally:
+            if self._power_off_latched or self._connection_enable_pending:
+                return
             if self._brake_latched:
                 try:
                     self._apply_brake()
@@ -3576,6 +3634,8 @@ class FafuArm(ArmAdapter):
             self._ctrl_mode = "Position"
         self._servo_intent = False
         self._hold_latched = True
+        if self._power_off_latched or self._connection_enable_pending:
+            return
         if self._brake_latched:
             try:
                 self._apply_brake()
@@ -3592,9 +3652,22 @@ class FafuArm(ArmAdapter):
     def hold(self, *, abort_path: bool = False) -> None:
         if not self.allow_motion or self._robot is None:
             return
+        if self._power_off_latched or self._connection_enable_pending:
+            self._servo_intent = False
+            self._pending_grip = None
+            self._freeze_needed = False
+            self._hold_latched = True
+            self._parked = True
+            return
         if abort_path:
             self._abort_replay(hold=False)
             self._home_path = []
+            if not self._brake_latched:
+                # A path may have moved the plant without updating the old
+                # stream target (notably the simulator's native path runner).
+                # Stop/pause must hold feedback, never return to that old target.
+                self._adopt_measured_cmd()
+                self._hold_latched = False
         elif self._home_path or self._replay_frames:
             return
         if self._brake_latched:
@@ -3625,12 +3698,14 @@ class FafuArm(ArmAdapter):
             return
         self._servo_dt = max(0.0, min(0.05, float(dt)))
         if self.allow_motion:
-            if self._brake_latched:
+            if self._power_off_latched or self._connection_enable_pending:
+                self._flush_writer()
+            elif self._brake_latched:
                 self._apply_brake()
             else:
                 self._record_tick()
                 self._flush_writer()
-            if self._brake_latched:
+            if self._brake_latched and not self._power_off_latched:
                 self._apply_brake()
         step = getattr(robot, "step", None)
         if callable(step):
@@ -3714,6 +3789,10 @@ class FafuArm(ArmAdapter):
     def _flush_writer_locked(self) -> None:
         robot = self._robot
         if robot is None or not self.allow_motion:
+            return
+        if self._power_off_latched or self._connection_enable_pending:
+            if self._power_off_requested:
+                self._finish_power_off()
             return
         if self._brake_latched:
             self._apply_brake()
@@ -3947,6 +4026,10 @@ class FafuArm(ArmAdapter):
 
     def park_stream(self) -> None:
         """Freeze leftover follow/keyboard servo at the last commanded pose."""
+        if self._ctrl_mode in ("Gravity", "Gra+Fri"):
+            # A page change / slider release must never start a position
+            # writer while the arm is being led by hand.
+            return
         if self._home_path or self._replay_frames:
             return
         self._hold_stream_pose()
@@ -4066,7 +4149,6 @@ class FafuArm(ArmAdapter):
         if err:
             return err
         spd = min(float(speed_deg_s), HOME_MAX_DEG_S)
-        self.set_teleop_speed(spd)
         try:
             q_meas = self._read_joint_q_rad(robot)
         except Exception as exc:
@@ -4078,24 +4160,10 @@ class FafuArm(ArmAdapter):
             self._stream_q_rad = list(q_meas)
             q_now = [math.degrees(x) for x in q_meas]
         wps = [self._q_rad(p) for p in self._home_waypoints_deg(q_now)]
-        if self._is_fake():
-            err = self._end_stream()
-            if err:
-                return err
-            robot.go_home(speed=self._speed_pct(spd), block=False)
-            self._home_path = []
-            self._target_deg = [0.0] * self.n
-            self._parked = True
-            self._hold_latched = True
-            return None
-        self._home_path = wps
-        if self._servo_cmd_rad is not None:
-            self._stream_q_rad = list(self._servo_cmd_rad)
-        else:
-            self._stream_q_rad = self._q_rad(q_now)
-        self._servo_intent = True
-        self._target_deg = [math.degrees(x) for x in wps[-1]]
-        self._note_stream()
+        # Use the same timed writer in simulation and on hardware. A native
+        # simulator go_home left _servo_cmd_rad at the pre-home pose; the next
+        # park (sent before 发送位置) instantly restored that obsolete pose.
+        self._start_joint_path(wps, spd)
         return None
 
     def set_ctrl_mode(self, mode: str) -> str | None:
@@ -4105,6 +4173,8 @@ class FafuArm(ArmAdapter):
         name = (mode or "Position").strip()
         if name not in ("Position", "Gravity", "Gra+Fri", "Impedance"):
             return f"未知控制模式 {mode!r}"
+        if self._rec is not None and name != self._ctrl_mode:
+            return "录制期间不能切换控制模式，请先停止录制"
         robot = self._robot
         if robot is None:
             return "机械臂未连接"
@@ -4120,6 +4190,7 @@ class FafuArm(ArmAdapter):
             if not self._float_modes_available():
                 return "真机力矩环未加载"
         self._servo_intent = False
+        self._home_path = []
         if prev in FLOAT_MODES or name == "Position":
             err = self._reenter_position()
             if err:
@@ -4165,19 +4236,29 @@ class FafuArm(ArmAdapter):
             robot.set_speed_scale(1.0)
         return None
 
-    def teach_pose(self, q_deg: list[float]) -> None:
+    def teach_pose(self, q_deg: list[float]) -> str | None:
         blocked = self.refuse_motion()
         if blocked:
             logger.warning("忽略示教: %s", blocked)
-            return
+            return blocked
         robot = self._robot
         if robot is None:
-            return
-        if self._use_sdk_float():
-            return
+            return "机械臂未连接"
+        if not self._is_fake():
+            return "滑条拖动仅用于仿真；真实机械臂请用手引导"
+        if self._ctrl_mode not in ("Gravity", "Gra+Fri"):
+            return "仿真拖动仅在 Gravity / Gra+Fri 模式可用"
+        self._servo_intent = False
+        self._home_path = []
+        if self._servoing:
+            self._end_servo()
         if hasattr(robot, "teleport"):
             robot.teleport(self._q_rad(self._clip_deg(q_deg)), is_radians=True)
         self._target_deg = self._clip_deg(q_deg)
+        self._servo_cmd_rad = self._q_rad(self._target_deg)
+        self._stream_q_rad = list(self._servo_cmd_rad)
+        self._parked = True
+        return None
 
     def _fk_xyz_rot(self, q_rad: list[float], robot: Any) -> tuple[list[float], Any]:
         """End-effector pose. SDK FK needs pinocchio; station URDF IK does not."""
@@ -4429,6 +4510,7 @@ class FafuArm(ArmAdapter):
                 prev = cur
             if max_delta > 0:
                 speed = max(5.0, min(80.0, max_delta))
+            speed = min(float(speed_deg_s), speed)
         if self._is_fake():
             err = self._end_stream()
             if err:
@@ -4485,6 +4567,10 @@ class FafuArm(ArmAdapter):
             return
         self._brake_latched = False
         self._brake_applied = False
+        if self._power_off_latched or self._connection_enable_pending:
+            self._servo_intent = False
+            self._freeze_needed = False
+            return
         self._stop_gravity(join=True)
         self._abort_replay(hold=False)
         self._servo_intent = False
@@ -4511,13 +4597,19 @@ class FafuArm(ArmAdapter):
         self._freeze_needed = True
 
     def set_powered(self, on: bool) -> str | None:
-        blocked = self.refuse_motion()
+        blocked = self.refuse_motion(allow_disabled=True)
         if blocked:
             return blocked
         robot = self._robot
         if robot is None:
             return "机械臂未连接"
         if on:
+            if self._power_off_requested:
+                return "正在去使能，请等待设备状态确认"
+            was_off = self._power_off_latched
+            was_pending = self._connection_enable_pending
+            self._connection_enable_pending = False
+            self._power_off_latched = False
             self._hold_latched = False
             err = self._ensure_enabled()
             if err and self._present_joints_enabled(robot):
@@ -4536,8 +4628,11 @@ class FafuArm(ArmAdapter):
                     logger.warning("SDK 全员使能失败已忽略，在线轴已切入位置环")
                     err = None
             if err:
+                self._power_off_latched = was_off
+                self._connection_enable_pending = was_pending
                 return err
             self._writer_err = ""
+            self._adopt_measured_cmd()
             # Cold enable used to leave no servo session. 发送位置 / follow
             # then hit SDK servo_start → vendor enable() which still required
             # the gripper. Start a parked hold so remaining joints are already
@@ -4545,23 +4640,52 @@ class FafuArm(ArmAdapter):
             if not self._is_fake():
                 self._hold_stream_pose()
             return None
+        # The motion tick owns servo_start/j/end. Stage the shutdown here;
+        # waiting for the tick while holding MotionCore's arm lock deadlocks it.
+        self._connection_enable_pending = False
+        self._power_off_latched = True
+        self._power_off_requested = True
+        self._writer_err = ""
         self._servo_intent = False
+        self._pending_grip = None
+        self._freeze_needed = False
         self._home_path = []
         self._abort_replay(hold=False)
-        self._stop_gravity(join=True)
-        if not self._wait_servo_idle(0.8):
-            return "servo 未结束，无法去使能"
-        self._send_zero_vel_hold()
+        self._stop_recording()
+        self._grav_stop.set()
         self._parked = True
         self._hold_latched = True
-        if self._is_fake():
-            try:
-                robot.disable()
-            except Exception as exc:
-                return f"去使能失败: {exc}"
-            return None
-        # Live disable() is MODE_STOP (PWM off). Keep position hold instead.
         return None
+
+    def _finish_power_off(self) -> None:
+        """Run on the servo writer: stop every producer, then issue MODE_STOP."""
+        self._power_off_requested = False
+        robot = self._robot
+        try:
+            if robot is None:
+                raise RuntimeError("设备已断开")
+            if not self._stop_gravity(join=True):
+                raise RuntimeError("重力/阻抗环未退出")
+            self._servoing = bool(self._servoing or self._sdk_servoing(robot))
+            if self._servoing and not self._end_servo():
+                raise RuntimeError("伺服会话未结束")
+            robot.disable()
+            states = robot.get_motor_states(prefer_cache=False)
+            missing = set(self._offline_ids)
+            ids = [mid for mid in self._sdk_joint_ids(robot) if mid not in missing]
+            absent = [mid for mid in ids if mid not in states]
+            failed = [mid for mid in ids if mid in states and int(states[mid].mode) != 0]
+            if self.has_gripper and self.gripper_id in states and int(states[self.gripper_id].mode) != 0:
+                failed.append(self.gripper_id)
+            if not ids or absent or failed:
+                raise RuntimeError(f"无法确认 STOP 模式（无反馈：{absent}，未停止：{failed}）")
+            self._ctrl_mode = "Position"
+            self._servo_cmd_rad = None
+            self._stream_q_rad = None
+            self._writer_err = ""
+        except Exception as exc:
+            self._writer_err = f"电机去使能未完成：{exc}"
+            logger.error("%s", self._writer_err)
 
     def run_mapped_script(self, name: str) -> str | None:
         op = map_script(name)
@@ -4627,6 +4751,7 @@ class FafuArm(ArmAdapter):
                     "online": online,
                     "ok": bool(ok[i]) if i < len(ok) else False,
                     "fault": fault,
+                    "fault_text": motor_fault_text(fault) if fault else "正常",
                     "mode": _motor_mode_name(mode),
                 }
             )
@@ -4639,6 +4764,7 @@ class FafuArm(ArmAdapter):
                     "online": bool(link_up) and gst is not None and bool(getattr(gst, "online", True)),
                     "ok": gst is not None and not bool(getattr(gst, "fault", 0)),
                     "fault": int(getattr(gst, "fault", 0) or 0) if gst is not None else 1,
+                    "fault_text": motor_fault_text(int(getattr(gst, "fault", 0) or 0)) if gst is not None else "离线",
                     "mode": _motor_mode_name(int(getattr(gst, "mode", 0) or 0) if gst is not None else 0),
                 }
             )
@@ -4655,6 +4781,8 @@ class FafuArm(ArmAdapter):
                 "float_ok": self._float_modes_available(),
                 "float_reason": self._float_modes_reason(),
                 "gripper_effort": int(clip_gripper_effort(self._gripper_effort)),
+                "gripper_nm_per_raw": gripper_torque_scale(robot, self.gripper_id),
+                "serial_port": str(getattr(robot, "port", "") or "") if self.backend == "fafu" else "",
                 "link_err": self._link_error if robot is None else "",
             }
             extra.update(self._traj_snap())
@@ -4713,6 +4841,7 @@ class FafuArm(ArmAdapter):
                         self._q_fb_err = msg
                         logger.warning("部分关节无反馈，整臂仍视为已连接: %s", exc)
                     q_rad = self._q_rad_from_states(states, self._full_joint_ids or ids)
+            feedback_deg = [math.degrees(float(x)) for x in q_rad[:self.n]]
             # Live USB reads can lag the motor command by a cache tick. The
             # twin should track the last servo_j we sent while a session is
             # open; otherwise the 3D arm trails the metal arm.
@@ -4740,6 +4869,10 @@ class FafuArm(ArmAdapter):
                     moving = any(abs(float(v)) > 0.02 for v in vels[: self.n])
             except Exception:
                 moving = False
+            # The station's timed path is still executing even when the
+            # simulator (or a low-speed hardware cache sample) reports zero
+            # instantaneous velocity between servo setpoints.
+            moving = moving or bool(self._home_path or self._replay_frames)
             try:
                 if not ids:
                     ids = list(getattr(robot, "joint_motor_ids", []))[: self.n]
@@ -4795,7 +4928,9 @@ class FafuArm(ArmAdapter):
                     enabled = self._flag_enabled(robot)
             tgt = list(self._target_deg) if self.allow_motion else list(q_deg)
             extra_tgt = getattr(robot, "_tgt_rad", None)
-            if extra_tgt is not None:
+            # Fake servo_j exposes the next interpolated setpoint, not the
+            # requested endpoint. Report the same final target as live control.
+            if extra_tgt is not None and not self._servo_intent:
                 tgt = [math.degrees(float(x)) for x in extra_tgt[: self.n]]
             lo_g = float(self.gripper_limits[0])
             hi_g = float(self.gripper_limits[1])
@@ -4833,6 +4968,11 @@ class FafuArm(ArmAdapter):
                 enabled=enabled,
                 n=self.n,
                 q_deg=q_deg,
+                feedback_deg=feedback_deg,
+                gripper_moving=(abs(float(getattr(states.get(self.gripper_id), "velocity", 0) or 0)) > 0.02
+                                if self.gripper_id in states else None),
+                gripper_tau_raw=(int(getattr(states.get(self.gripper_id), "torque", 0) or 0)
+                                 if self.gripper_id in states else None),
                 target_deg=tgt,
                 ok=ok,
                 gripper_open=grip,

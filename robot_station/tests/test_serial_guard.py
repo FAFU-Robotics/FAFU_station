@@ -13,8 +13,8 @@ class SerialGuardTests(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("STATION_ALLOW_LIVE_ARM", None)
             self.assertFalse(live_serial_allowed())
-            self.assertEqual(apply_live_arm_policy("fafu"), "sim")
-            self.assertEqual(apply_live_arm_policy("auto"), "sim")
+            self.assertEqual(apply_live_arm_policy("fafu"), "fafu")
+            self.assertEqual(apply_live_arm_policy("auto"), "auto")
             self.assertEqual(apply_live_arm_policy("mock"), "mock")
             self.assertEqual(apply_live_arm_policy("sim"), "sim")
 

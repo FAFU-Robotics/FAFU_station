@@ -31,6 +31,7 @@ class SimMotionTests(unittest.TestCase):
             StationConfig(arm="sim", open_browser=False, control_hz=80, watchdog_s=2.0)
         )
         core.start()
+        self.assertIsNone(core.on_power("a", True))
         try:
             err = core.on_arm_targets("a", [12.0, 40.0, 40.0, 0.0, 0.0, 0.0], 80.0)
             self.assertIsNone(err)
@@ -57,6 +58,7 @@ class SimMotionTests(unittest.TestCase):
             StationConfig(arm="sim", open_browser=False, control_hz=80, watchdog_s=2.0)
         )
         core.start()
+        self.assertIsNone(core.on_power("a", True))
         try:
             self.assertIsNone(core.on_home("a", 80.0))
             deadline = time.monotonic() + 1.5
@@ -437,6 +439,7 @@ class SimMotionTests(unittest.TestCase):
             StationConfig(arm="sim", open_browser=False, control_hz=80, watchdog_s=2.0)
         )
         core.start()
+        self.assertIsNone(core.on_power("a", True))
         try:
             core.on_arm_targets("a", [0.0, 40.0, 40.0, 0.0, 0.0, 0.0], 80.0)
             time.sleep(0.25)
@@ -462,6 +465,7 @@ class SimMotionTests(unittest.TestCase):
             StationConfig(arm="sim", open_browser=False, control_hz=80, watchdog_s=2.0)
         )
         core.start()
+        self.assertIsNone(core.on_power("a", True))
         try:
             self.assertIsNone(core.on_arm_targets("a", [0.0, 40.0, 40.0, 0.0, 0.0, 0.0], 80.0))
             deadline = time.monotonic() + 1.5
@@ -482,7 +486,8 @@ class SimMotionTests(unittest.TestCase):
             self.assertIsNone(err, err)
             self.assertEqual(fake.calls.count("move_j"), n_move)
             ack = core.handle(
-                {"t": "cart_go", "cid": "a", "xyz": xyz, "rpy": rpy, "speed": 40.0}
+                {"t": "cart_go", "cid": "a", "xyz": xyz, "rpy": rpy, "speed": 40.0,
+                 "session":core.snapshot()["connection"]["session"]}
             )
             self.assertTrue(ack.get("ok"), ack)
             deadline = time.monotonic() + 3.5
@@ -607,6 +612,7 @@ class SimMotionTests(unittest.TestCase):
             StationConfig(arm="sim", open_browser=False, control_hz=80, watchdog_s=2.0)
         )
         core.start()
+        self.assertIsNone(core.on_power("a", True))
         try:
             start = [0.0, 40.0, 40.0, 0.0, 0.0, 0.0]
             goal = [18.0, 40.0, 40.0, 0.0, 0.0, 0.0]
@@ -643,6 +649,7 @@ class SimMotionTests(unittest.TestCase):
             StationConfig(arm="sim", open_browser=False, control_hz=50, watchdog_s=2.0)
         )
         core.start()
+        self.assertIsNone(core.on_power("a", True))
         try:
             self.assertIsNone(core.on_mode("a", "Gravity"))
             self.assertIsNone(core.on_teach("a", [25.0, 40.0, 40.0, 0.0, 0.0, 0.0]))
@@ -658,6 +665,7 @@ class SimMotionTests(unittest.TestCase):
             StationConfig(arm="sim", open_browser=False, control_hz=50, watchdog_s=2.0)
         )
         core.start()
+        self.assertIsNone(core.on_power("a", True))
         try:
             err = core.on_arm_targets("a", [5.0, 40.0, 40.0, 0.0, 0.0, 0.0], 40.0, stream=True)
             self.assertIsNone(err, err)
@@ -678,6 +686,7 @@ class SimMotionTests(unittest.TestCase):
             StationConfig(arm="sim", open_browser=False, control_hz=80, watchdog_s=2.0)
         )
         core.start()
+        self.assertIsNone(core.on_power("a", True))
         try:
             self.assertIsNone(core.on_arm_targets("a", [5.0, 40.0, 40.0, 0.0, 0.0, 0.0], 40.0, stream=True))
             time.sleep(0.12)
@@ -1042,27 +1051,28 @@ class SimMotionTests(unittest.TestCase):
         try:
             self.assertEqual(core.arm_kind(), "sim")
             self.assertIsNone(core.on_arm_src("a", "sim"))
-            err = core.on_arm_src("a", "fafu")
+            self.assertIsNone(core.on_link("a", "disconnect"))
+            err = core.on_link("a", "connect", "serial", "COM9")
             self.assertIsNotNone(err)
             self.assertIn("真机", err or "")
             self.assertEqual(core.arm_kind(), "sim")
         finally:
             core.stop()
 
-    def test_live_boot_auto_enables_after_connect(self) -> None:
+    def test_live_boot_keeps_enable_separate_from_connect(self) -> None:
         os.environ["STATION_ALLOW_LIVE_ARM"] = "1"
         arm = FafuArm(allow_motion=True, controller_cls=FakeFafuController, required=True)
         arm.backend = "fafu"
         core = MotionCore(
-            StationConfig(arm="fafu", arm_allow_motion=True, open_browser=False, control_hz=40)
+            StationConfig(arm="fafu", arm_allow_motion=True, arm_connect_on_start=True, open_browser=False, control_hz=40)
         )
         core.arm = arm
         try:
             core.start()
             fake = FakeFafuController.last
             assert fake is not None
-            self.assertTrue(fake.is_enabled)
-            self.assertIn("enable", fake.calls)
+            self.assertFalse(fake.is_enabled)
+            self.assertNotIn("enable", fake.calls)
         finally:
             core.stop()
             os.environ.pop("STATION_ALLOW_LIVE_ARM", None)
@@ -1072,7 +1082,7 @@ class SimMotionTests(unittest.TestCase):
         arm = FafuArm(allow_motion=False, controller_cls=FakeFafuController, required=True)
         self.assertEqual(arm.backend, "fafu")
         core = MotionCore(
-            StationConfig(arm="fafu", arm_allow_motion=False, open_browser=False, control_hz=40)
+            StationConfig(arm="fafu", arm_allow_motion=False, arm_connect_on_start=True, open_browser=False, control_hz=40)
         )
         core.arm = arm
         try:
@@ -1101,8 +1111,9 @@ class SimMotionTests(unittest.TestCase):
 
         core.start()
         try:
+            self.assertIsNone(core.on_link("a", "disconnect"))
             with patch("robot_station.motion.build_arm", side_effect=fake_build):
-                err = core.on_arm_src("a", "fafu")
+                err = core.on_link("a", "connect", "serial", "COM9")
             self.assertIsNone(err)
             self.assertEqual(core.arm_kind(), "fafu")
             fake = FakeFafuController.last
@@ -1113,11 +1124,11 @@ class SimMotionTests(unittest.TestCase):
             core.stop()
             os.environ.pop("STATION_ALLOW_LIVE_ARM", None)
 
-    def test_fafu_start_failure_falls_back_to_sim(self) -> None:
+    def test_fafu_start_failure_keeps_serial_target(self) -> None:
         os.environ["STATION_ALLOW_LIVE_ARM"] = "1"
         try:
             core = MotionCore(
-                StationConfig(arm="fafu", open_browser=False, control_hz=40, watchdog_s=2.0)
+                StationConfig(arm="fafu", arm_connect_on_start=True, open_browser=False, control_hz=40, watchdog_s=2.0)
             )
             self.assertEqual(core.arm.backend, "fafu")
 
@@ -1128,9 +1139,9 @@ class SimMotionTests(unittest.TestCase):
             core.arm.start = boom  # type: ignore[method-assign]
             core.start()
             try:
-                self.assertEqual(core.arm_kind(), "sim")
-                self.assertIn("仿真", core._cmd_err)
-                self.assertIn("motors", core._cmd_err)
+                self.assertEqual(core.arm_kind(), "fafu")
+                self.assertFalse(core.snapshot()["arm"]["online"])
+                self.assertIn("motors", core.snapshot()["connection"]["error"])
             finally:
                 core.stop()
         finally:
@@ -1281,6 +1292,7 @@ class SimMotionTests(unittest.TestCase):
             StationConfig(arm="sim", open_browser=False, control_hz=50, watchdog_s=2.0)
         )
         core.start()
+        self.assertIsNone(core.on_power("a", True))
         try:
             fake = FakeFafuController.last
             assert fake is not None
@@ -1349,6 +1361,7 @@ class TrajMotionTests(unittest.TestCase):
                 StationConfig(arm="sim", open_browser=False, control_hz=80, watchdog_s=2.0)
             )
             core.start()
+            self.assertIsNone(core.on_power("a", True))
             try:
                 self.assertIsNone(core.on_rec_start("a"))
                 deadline = time.monotonic() + 0.8
@@ -1404,6 +1417,7 @@ class TrajMotionTests(unittest.TestCase):
                 StationConfig(arm="sim", open_browser=False, control_hz=80, watchdog_s=2.0)
             )
             core.start()
+            self.assertIsNone(core.on_power("a", True))
             try:
                 self.assertIsNone(core.on_mode("a", "Gravity"))
                 self.assertIsNone(core.on_rec_start("a"))
@@ -1458,6 +1472,7 @@ class TrajMotionTests(unittest.TestCase):
                 StationConfig(arm="sim", open_browser=False, control_hz=80, watchdog_s=2.0)
             )
             core.start()
+            self.assertIsNone(core.on_power("a", True))
             try:
                 self.assertIsNone(core.on_rec_start("a", "keepme"))
                 core.on_arm_targets("a", [8.0, 40.0, 40.0, 0.0, 0.0, 0.0], 80.0, stream=True)
@@ -1566,6 +1581,7 @@ class TrajMotionTests(unittest.TestCase):
                 StationConfig(arm="sim", open_browser=False, control_hz=80, watchdog_s=2.0)
             )
             core.start()
+            self.assertIsNone(core.on_power("a", True))
             try:
                 self.assertEqual(core.arm_mode(), "Position")
                 self.assertIsNone(core.on_rec_start("a", teach="drag"))
@@ -1663,6 +1679,7 @@ class TrajMotionTests(unittest.TestCase):
             StationConfig(arm="sim", open_browser=False, control_hz=80, watchdog_s=2.0)
         )
         core.start()
+        self.assertIsNone(core.on_power("a", True))
         try:
             start = [0.0, 40.0, 40.0, 0.0, 0.0, 0.0]
             goal = [16.0, 40.0, 40.0, 0.0, 0.0, 0.0]

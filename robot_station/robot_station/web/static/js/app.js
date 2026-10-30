@@ -1,10 +1,13 @@
-/* FAFU 机械臂站控 · 浏览器端：控制 JSON WebSocket + 独立视频 WebSocket
+/* FAFU 机械臂站控 · 浏览器端：控制 JSON WebSocket + 实时关节状态
  * 客户 PC 本机直连机械臂。
  */
 (() => {
-  const PAGES = ["home", "arm"];
-  const DEFAULT_PAGE = "arm";
-  const PAGE_TITLE = { home: "总览", arm: "机械臂" };
+  const PAGES = ["home", "arm/control", "work/waypoints", "work/trajectories", "work/program"];
+  const PAGE_ID = {"home":"home", "arm/control":"arm", "work/waypoints":"waypoints", "work/trajectories":"trajectories", "work/program":"program"};
+  let shownPage = "";
+  let lastWorkPage = "work/program";
+  const DEFAULT_PAGE = "arm/control";
+  const PAGE_TITLE = {"home":"总览与连接", "arm/control":"手动控制", "work/waypoints":"路点", "work/trajectories":"示教轨迹", "work/program":"程序"};
   const DEFAULT_LIMITS = [
     [-140.688, 148.140],
     [0.0, 180.0],
@@ -17,13 +20,10 @@
   let gripLimits = [8, 75];
   const GRIP_EFFORT_MIN = 50;
   const GRIP_EFFORT_MAX = 800;
-  const GRIP_EFFORT_NM = 0.0053;
-  let waypoints = [];
-  let trajTeach = "drag";
-  const VID_HDR = 12;
   let ws = null;
-  let vws = null;
   let last = null;
+  let lastPowerSeq = null;
+  let lastPowerFeedbackAt = 0;
   let info = null;
   let hz = 0;
   let nCmd = 0;
@@ -45,6 +45,7 @@
   let live = false;
   let myCid = "";
   let ctrlMode = "Position";
+  let teachContext = "";
   let spaceMode = "joint";
   let followDirty = false;
   let jointDirty = false;
@@ -101,12 +102,14 @@
     { label: "X", unit: "m", min: -0.30, max: 0.75, step: 0.001, digits: 3, def: 0.247 },
     { label: "Y", unit: "m", min: -0.55, max: 0.55, step: 0.001, digits: 3, def: 0.0 },
     { label: "Z", unit: "m", min: -0.20, max: 0.70, step: 0.001, digits: 3, def: 0.169 },
-    { label: "滚转", unit: "°", min: -180, max: 180, step: 0.1, digits: 1, def: 0 },
-    { label: "俯仰", unit: "°", min: -180, max: 180, step: 0.1, digits: 1, def: 0 },
-    { label: "偏航", unit: "°", min: -180, max: 180, step: 0.1, digits: 1, def: 0 },
+    { label: "R", unit: "°", min: -180, max: 180, step: 0.1, digits: 1, def: 0 },
+    { label: "P", unit: "°", min: -180, max: 180, step: 0.1, digits: 1, def: 0 },
+    { label: "Y", unit: "°", min: -180, max: 180, step: 0.1, digits: 1, def: 0 },
   ];
   let cartDirty = false;
-  const urls = { 0: "", 1: "" };
+  let cartPrimed = false;
+  const cartFollow = {timer:0, pending:null, dirty:false, lastSent:0, serial:0};
+  const CART_HINT = "目标值独立保留，实时位姿显示在 3D 下方。键盘仍用于增量控制。";
 
   const $ = (id) => document.getElementById(id);
 
@@ -120,7 +123,8 @@
   }
   function paintGripEffortNm() {
     const raw = currentGripEffort();
-    if ($("gripEffortUnit")) $("gripEffortUnit").textContent = "raw ≈ " + (raw * GRIP_EFFORT_NM).toFixed(2) + " Nm";
+    const factor = last && last.arm && last.arm.gripper_nm_per_raw;
+    if ($("gripEffortUnit")) $("gripEffortUnit").textContent = factor ? "raw ≈ " + (raw * factor).toFixed(2) + " Nm" : "raw";
   }
   function sendGripEffort() {
     paintGripEffortNm();
@@ -144,6 +148,7 @@
   }
 
   function sendGripOpen(open) {
+    if ($(open ? "btnGripOpen" : "btnGripClose")?.disabled) return;
     const next = !!open;
     gripOpenCmd = next;
     gripToggleAt = performance.now();
@@ -160,45 +165,74 @@
     sendGripOpen(!gripperIsOpen());
   }
 
+  function setWorkMenu(open, restoreFocus = false) {
+    $("workNavMenu").hidden = !open;
+    $("workNavSelect").setAttribute("aria-expanded", String(open));
+    if (restoreFocus) $("workNavSelect").focus();
+  }
   function currentPage() {
     const raw = (location.hash || "#/" + DEFAULT_PAGE).replace(/^#\/?/, "").split("?")[0];
-    return PAGES.indexOf(raw) >= 0 ? raw : DEFAULT_PAGE;
+    if (raw === "arm/connection") return "home";
+    return raw === "arm" ? "arm/control" : (PAGES.indexOf(raw) >= 0 ? raw : DEFAULT_PAGE);
   }
   function ensureDefaultHash() {
     const raw = (location.hash || "").replace(/^#\/?/, "").split("?")[0];
-    if (!raw || PAGES.indexOf(raw) < 0) {
+    if (raw === "arm/connection") { location.hash = "#/home"; return true; }
+    if (!raw || raw === "arm" || PAGES.indexOf(raw) < 0) {
       location.hash = "#/" + DEFAULT_PAGE;
       return true;
     }
     return false;
   }
+  function releaseManual(park = true) {
+    const had = cartHeld.size || followDirty || ($("armFollow") && $("armFollow").checked);
+    cancelCartFollow();
+    cartHeld.clear();
+    followDirty = false;
+    if ($("armFollow")) $("armFollow").checked = false;
+    $("armFollow")?.closest(".follow-row")?.classList.remove("is-on");
+    if (park && had && ws && ws.readyState === 1) send({t:"park"});
+  }
   function showPage() {
     if (ensureDefaultHash()) return;
     const page = currentPage();
-    document.querySelectorAll(".page").forEach((el) => el.classList.toggle("on", el.id === "page-" + page));
-    document.querySelectorAll("#navTabs a, #pageJump a").forEach((a) => {
-      a.classList.toggle("on", a.getAttribute("data-page") === page);
+    if (page !== shownPage && $("simTeachEnabled")) $("simTeachEnabled").checked = false;
+    if (shownPage === "arm/control" && page !== shownPage) releaseManual();
+    shownPage = page;
+    setWorkMenu(false);
+    const group = page.split("/")[0];
+    document.querySelectorAll(".page").forEach(el => el.classList.toggle("on", el.id === "page-" + PAGE_ID[page]));
+    document.querySelectorAll("#navTabs > a").forEach(a => a.classList.toggle("on", a.dataset.group === group));
+    $("workNav").classList.toggle("on", group === "work");
+    if (group === "work") lastWorkPage = page;
+    $("workNavSelect").value = lastWorkPage;
+    $("workNavLabel").textContent = PAGE_TITLE[lastWorkPage];
+    $("workNavEntry").href = "#/" + lastWorkPage;
+    $("workNavEntry").title = "打开" + PAGE_TITLE[lastWorkPage];
+    document.querySelectorAll("#workNavMenu a").forEach(a => {
+      if (a.dataset.workPage === page) a.setAttribute("aria-current", "page");
+      else a.removeAttribute("aria-current");
     });
-    document.title = "FAFU 机械臂站控 · " + (PAGE_TITLE[page] || page);
+    document.title = "FAFU 机械臂站控 · " + PAGE_TITLE[page];
     syncStage();
+    window.dispatchEvent(new CustomEvent("station:page", {detail:page}));
   }
 
   function syncStage() {
     const twin = $("panel-twin");
-    const cams = $("panel-cams");
     const stage = $("panel-stage");
     const twinOn = !!(twin && !twin.classList.contains("off"));
-    const camsOn = !!(cams && !cams.classList.contains("off"));
-    if (stage) stage.classList.toggle("off", !twinOn && !camsOn);
+    if (stage) stage.classList.toggle("off", !twinOn);
     if (window.Arm3D) {
-      Arm3D.setActive(twinOn && currentPage() === "arm");
-      requestAnimationFrame(() => Arm3D.resize());
+      Arm3D.setActive(twinOn && currentPage() === "arm/control");
     }
   }
 
   function typing() {
+    if (!$("workNavMenu").hidden) return true;
     const el = document.activeElement;
     if (!el) return false;
+    if (el.closest("#workNav, #commandNotice, #hotkeyBar, #btnTheme")) return true;
     if (el.isContentEditable) return true;
     const tag = (el.tagName || "").toLowerCase();
     if (tag === "textarea" || tag === "select") return true;
@@ -220,7 +254,7 @@
   }
   function teleopHot() {
     if (cartHeld.size) return true;
-    return !!( $("armFollow") && $("armFollow").checked );
+    return spaceMode === "joint" && !!$("armFollow")?.checked;
   }
   const CMD_QUEUE_LIB = window.CmdQueue;
   if (!CMD_QUEUE_LIB) console.error("cmdqueue.js 未加载：断线指令将不排队");
@@ -247,7 +281,11 @@
     if (QUEUED_UI_OPS.has(op)) setAck(reason, false);
   }
 
+  function withSession(obj) {
+    return {...obj, session:last?.connection?.session};
+  }
   function send(obj) {
+    obj = withSession(obj);
     if (obj && (obj.t === "arm" || obj.t === "cart" || obj.t === "teach" || obj.t === "cart_go")) {
       obj.t0 = performance.now();
     }
@@ -256,6 +294,10 @@
         ws.send(JSON.stringify(obj));
         return true;
       } catch (e) {}
+    }
+    if (obj.t !== "e") {
+      dropQueued(obj, "控制连接已断开，旧指令不会补发，请重新操作");
+      return false;
     }
     if (!CMD_QUEUE_LIB || CMD_QUEUE_LIB.shouldDrop(obj)) return false;
     cmdQueue.enqueue(obj, dropQueued);
@@ -319,13 +361,42 @@
   function telemFresh() {
     return lastTelemAt && (performance.now() - lastTelemAt) < 220;
   }
-  function setLink(ok, extra) {
-    $("dotLink").className = "dot " + (ok ? "on" : "off");
-    $("linkTxt").textContent = (ok ? "已连接" : "未连接") + (extra ? " · " + extra : "");
+  function deviceState() {
+    const a=last?.arm || {},c=last?.connection || {};
+    const connected=!!(ws && ws.readyState===1);
+    const fresh=!!(connected && telemWs?.readyState===1 && lastPowerFeedbackAt && performance.now()-lastPowerFeedbackAt<2000);
+    const phase=c.status || (a.online?"connected":"disconnected");
+    return {connected,fresh,phase,online:!!(fresh && phase==="connected" && a.online),
+      kind:c.kind || (a.backend==="sim" || a.backend==="mock"?"simulation":"serial"),
+      port:c.port || a.serial_port || ""};
   }
-  function setAck(text, ok) {
+  function setLink(ok, extra) {
+    const cls="dot "+(ok?"on":"off"),text=(ok?"已连接":"未连接")+(extra?" · "+extra:"");
+    if ($("dotLink").className!==cls) $("dotLink").className=cls;
+    if ($("linkTxt").textContent!==text) $("linkTxt").textContent=text;
+  }
+  function paintGlobalStatus() {
+    const s=deviceState(),a=last?.arm || {};
+    // These indicators must update even when teleoperation skips the heavy DOM render.
+    if (!s.online || !a.enabled || last?.connection?.enable_required) releaseManual(false);
+    setLink(s.online);
+    const switching=["connecting","disconnecting"].includes(s.phase);
+    const label=!s.fresh?"设备状态未知":switching?(s.phase==="connecting"?"正在连接设备":"正在断开设备"):
+      !s.online?"无活动设备":s.kind==="simulation"?"本机仿真":s.port?"串口 · "+s.port:"串口机械臂";
+    if ($("mockTxt").textContent!==label) $("mockTxt").textContent=label;
+    $("mockDot").className="dot "+(!s.fresh || switching?"warn":!s.online?"":s.kind==="simulation"?"warn":"on");
+    const readonly=s.online && s.kind==="serial" && info && !info.arm_allow_motion;
+    const banner=!s.fresh?(s.connected?"设备状态未更新 · 暂停控制，等待最新反馈。":"站控通信已断开 · 正在重新连接。"):
+      switching?"设备正在切换连接，请等待完成。":!s.online?"设备未连接 · 在「总览与连接」选择串口机械臂或本机仿真。":
+      s.kind==="simulation"?"本机仿真 · 当前操作仅作用于模拟机械臂。":readonly?"串口已连接 · 当前为只读连接，不接受使能与运动。":"";
+    $("collectBanner").classList.toggle("on",!!banner);
+    if ($("collectBanner").textContent!==banner) $("collectBanner").textContent=banner;
+    paintSafety(last);
+  }
+  function setAck(text, ok, options = {}) {
+    if (text) window.StationToast?.show(text, {tone:ok ? "success" : "error", ...options});
     const cls = "hint " + (ok ? "tone-ok" : "tone-bad");
-    ["armAck", "connAck"].forEach((id) => {
+    ["armAck"].forEach((id) => {
       const el = $(id);
       if (!el) return;
       el.textContent = text || "";
@@ -335,18 +406,14 @@
   function vendorEnableNoise(text, arm) {
     const t = String(text || "");
     if (!/motor_reset|enable failed|使能失败/.test(t)) return false;
-    if (arm && arm.enabled) return true;
-    const motors = (arm && arm.motors) || [];
-    let n = 0;
-    for (let i = 0; i < motors.length; i += 1) {
-      const m = motors[i];
-      if (!m || m.name === "夹爪") continue;
-      if (m.online) n += 1;
-    }
-    return n >= 6;
+    return !!arm?.enabled;
   }
   function paintCmdErr(d, a) {
     const err = (d && d.cmd_err) || "";
+    if (pendingCmd.power && String(err).startsWith("电机去使能未完成")) {
+      endCmd("power", false, err);
+      paintPowerButton();
+    }
     const cur = ($("armAck") && $("armAck").textContent) || "";
     if (vendorEnableNoise(err, a) || (a && a.enabled && vendorEnableNoise(cur, a))) {
       if (vendorEnableNoise(cur, a)) setAck("", true);
@@ -407,7 +474,7 @@
     setBusy($(id), true, spec.busy);
     pendingCmd[op] = { id: id, pair: pair, want: spec.want, pick: spec.pick, t0: performance.now() };
     if (spec.hot) flashHot(spec.hot, spec.ack);
-    if (spec.ack) setAck(spec.ack, spec.okTone !== false);
+    if (spec.ack) setAck(spec.ack, spec.okTone !== false, {tone:"info", pending:true, force:true});
     return true;
   }
   function endCmd(op, ok, text) {
@@ -436,7 +503,7 @@
   function ackText(op, ok, error, want) {
     if (!ok) return "失败：" + (error || "");
     if (op === "link") return want === "disconnect" ? "断开指令已执行" : "连接指令已执行";
-    if (op === "power") return want ? "使能指令已执行，见右侧电机状态" : "去使能指令已执行";
+    if (op === "power") return want ? "机械臂已使能" : "机械臂已去使能，电机不再提供保持力矩";
     if (op === "home") return "复位已下发";
     if (op === "arm" || op === "cart_go") return "位置已下发";
     if (op === "path") return "轨迹已下发";
@@ -453,27 +520,48 @@
     if (op === "script") return "已执行映射";
     return "已下发 " + (op || "");
   }
+  function paintPowerButton() {
+    const button = $("btnPowerToggle"), a = last && last.arm;
+    const motorEnabled = !!a?.enabled, needsConfirmation = !!last?.connection?.enable_required;
+    const {connected,fresh,online}=deviceState();
+    const enabled = online && motorEnabled && !needsConfirmation, pending = pendingCmd.power;
+    const estop = last && last.safety === "ESTOP_LATCHED";
+    const programBusy = ["running", "paused"].includes(last && last.program && last.program.status);
+    const oldHost = enabled && a.backend === "fafu" && !(last.capabilities && last.capabilities.motor_disable);
+    const known = online;
+    const powerStatus = $("powerStatus"), powerStatusText = $("powerStatusText");
+    const statusState = !known ? "unknown" : motorEnabled ? "on" : "off";
+    const statusText = !known ? "使能未知" : motorEnabled ? "已使能" : "未使能";
+    if (powerStatus && powerStatusText) {
+      powerStatus.dataset.state = statusState;
+      if (powerStatusText.textContent !== statusText) powerStatusText.textContent = statusText;
+      powerStatus.title = known ? "机械臂" + statusText : "等待机械臂最新使能反馈";
+    }
+    button.dataset.powerState = pending ? "pending" : !known ? "unknown" : enabled ? "on" : "off";
+    button.dataset.idle = known && enabled ? "去使能" : known && motorEnabled && needsConfirmation ? "确认使能" : "使能";
+    button.disabled = !!(pending || !known || estop || programBusy || oldHost);
+    button.textContent = pending ? (pending.want ? "正在使能…" : "正在去使能…") : button.dataset.idle;
+    button.setAttribute("data-hot", enabled ? "disable" : "enable");
+    setBtnOn("btnPowerToggle", enabled);
+    button.title = pending ? "等待设备状态确认，请勿重复点击" : !connected || !fresh ? "等待最新设备状态" :
+      !online ? "请先连接机械臂" : estop ? "请先解除急停" : programBusy ? "请先停止程序" :
+      oldHost ? "请重启站控以加载真正的电机去使能功能" :
+      enabled ? "点击去使能，电机将不再提供保持力矩" : motorEnabled && needsConfirmation ? "电机已处于使能状态，确认后以当前实测姿态接管控制" : "当前未使能，点击使能";
+  }
   function paintCmdButtons(a, estop) {
     sweepPending();
-    const online = !!(a && a.online);
-    const enabled = !!(a && a.enabled);
-    const open = !!(a && a.gripper_open);
-    if (!pendingCmd.link) {
-      setBtnOn("btnArmConnect", online);
-      setBtnOn("btnArmDisconnect", !online);
-    }
+    const online = deviceState().online;
+    const open = online && !!a?.gripper_open;
     if (pendingCmd.power) {
       const p = pendingCmd.power;
-      if (p && online && !!p.want === enabled) {
+      const confirmed = p.want ? a?.enabled && !last?.connection?.enable_required : !a?.enabled;
+      if (p && online && confirmed) {
         endCmd("power", true, ackText("power", true, "", p.want));
       }
     }
-    if (!pendingCmd.power) {
-      setBtnOn("btnArmEnable", enabled);
-      setBtnOn("btnArmDisable", online && !enabled);
-    }
+    paintPowerButton();
     setBtnOn("btnGripOpen", open);
-    setBtnOn("btnGripClose", !open);
+    setBtnOn("btnGripClose", online && !open);
     if ($("btnEstop")) $("btnEstop").classList.toggle("is-on", !!estop);
     const follow = $("armFollow");
     const row = follow && follow.closest(".follow-row");
@@ -494,8 +582,20 @@
     clearTimeout(hotFlashTimer);
     hotFlashTimer = setTimeout(() => {
       document.querySelectorAll("[data-hot].hot").forEach((el) => el.classList.remove("hot"));
-      if (flash) flash.classList.remove("on");
+      if (flash) { flash.classList.remove("on"); flash.hidden = true; flash.textContent = ""; }
     }, 1400);
+  }
+
+  function layoutHotkeyPop() {
+    const pop = $("hotkeyPop"), bar = $("hotkeyBar");
+    if (!pop || pop.hidden || !bar) return;
+    const anchor = bar.getBoundingClientRect();
+    const width = pop.getBoundingClientRect().width;
+    const left = Math.max(12, Math.min(anchor.right - width, document.documentElement.clientWidth - width - 12));
+    const top = document.querySelector(".top").getBoundingClientRect().bottom + 8;
+    pop.style.left = (left - anchor.left) + "px";
+    pop.style.top = (top - anchor.top) + "px";
+    pop.style.maxHeight = Math.max(0, innerHeight - top - 12) + "px";
   }
 
   function setHotkeyPop(open) {
@@ -505,6 +605,7 @@
     pop.hidden = !open;
     btn.classList.toggle("open", open);
     btn.setAttribute("aria-expanded", open ? "true" : "false");
+    if (open) layoutHotkeyPop();
   }
 
   function buildJoints() {
@@ -535,7 +636,9 @@
     };
   }
   function readJoints() {
-    return limits.map((_, i) => Number($("jointList").querySelector("[data-jn='" + i + "']").value || 0));
+    try {
+      return limits.map(([min,max],i) => window.StationNumbers.read($("jointList").querySelector("[data-jn='"+i+"']"),{label:"J"+(i+1)+" 目标角度",min,max}));
+    } catch (_) {return null;}
   }
   function applyLimits(arm) {
     if (!arm) return;
@@ -576,6 +679,7 @@
     if (jointDirty) {
       if (arm.moving) return;
       const q = readJoints();
+      if (!q) return;
       const near = q.length === 6 && arm.q_deg.length >= 6 &&
         q.every((v, i) => Math.abs(Number(v) - Number(arm.q_deg[i])) < 0.8);
       if (!near) return;
@@ -587,17 +691,21 @@
     return !!(last && last.arm && Array.isArray(last.arm.q_deg) && last.arm.q_deg.length >= 6);
   }
   function wantJointStream() {
+    if (currentPage() !== "arm/control") return false;
+    if (spaceMode !== "joint") return false;
     if (ctrlMode !== "Position" && ctrlMode !== "Impedance") return false;
     if (!jointsPrimed()) return false;
     return !!( $("armFollow") && $("armFollow").checked );
   }
-  function stopFollowStream() {
+  function stopFollowStream(park = true) {
+    cancelCartFollow();
     if ($("armFollow")) $("armFollow").checked = false;
+    $("armFollow")?.closest(".follow-row")?.classList.remove("is-on");
     followDirty = false;
     const box = $("jointList");
     const el = document.activeElement;
     if (box && el && box.contains(el) && typeof el.blur === "function") el.blur();
-    send({ t: "park" });
+    if (park) send({ t: "park" });
   }
   function paintGrip(open, deg) {
     const q = (last && last.arm && last.arm.q_deg) || [];
@@ -608,6 +716,7 @@
     if (window.Arm3D) Arm3D.setPose(q || [], a && a.gripper_deg, a && a.gripper_open);
   }
   function maybeFollow() {
+    if ((ctrlMode === "Gravity" || ctrlMode === "Gra+Fri") && !simulatedTeachEnabled()) return;
     followDirty = true;
     if (!($("armFollow") && $("armFollow").checked)) jointDirty = true;
     sendFollowNow();
@@ -616,7 +725,12 @@
     if (cartHeld.size) return;
     if (last && last.safety === "ESTOP_LATCHED") return;
     const q = readJoints();
+    if (!q) {
+      if ($("armFollow")?.checked) stopFollowStream();
+      return;
+    }
     if (ctrlMode === "Gravity" || ctrlMode === "Gra+Fri") {
+      if (!simulatedTeachEnabled()) return;
       paintCommandedJoints(q);
       send({ t: "teach", q: q });
       noteHz();
@@ -629,18 +743,20 @@
     noteHz();
   }
   function followHot() {
+    if (currentPage() !== "arm/control") return false;
     if (spaceMode === "cart") return false;
     if (cartHeld.size) return false;
     if (last && last.safety === "ESTOP_LATCHED") return false;
     const box = $("jointList");
     const el = document.activeElement;
     const sliding = !!(box && el && box.contains(el));
-    if (ctrlMode === "Gravity" || ctrlMode === "Gra+Fri") return sliding || followDirty;
+    if (ctrlMode === "Gravity" || ctrlMode === "Gra+Fri") return simulatedTeachEnabled() && (sliding || followDirty);
     if (!wantJointStream()) return false;
     if (ctrlMode !== "Position" && ctrlMode !== "Impedance") return false;
     return sliding || followDirty || ($("armFollow") && $("armFollow").checked);
   }
   function controlTick(dtSec) {
+    if (currentPage() !== "arm/control" || (last && last.program && ["running","paused"].includes(last.program.status))) return;
     if (!live || !ws || ws.readyState !== 1) return;
     const now = performance.now();
     const minDt = (1000 / controlHz) * 0.55;
@@ -669,21 +785,20 @@
     controlRaf = requestAnimationFrame(raf);
   }
   function fmtCart(v, digits, unit) {
-    if (v == null || v === "" || Number.isNaN(Number(v))) return "—";
+    if (v == null || v === "" || !Number.isFinite(Number(v))) return "—";
     return Number(v).toFixed(digits) + unit;
   }
   function paintCartPose(a) {
     const xyz = (a && a.ee_m) || [];
     const rpy = (a && a.ee_rpy_deg) || [];
-    if ($("cartPose")) {
-      $("cartPose").textContent =
-        "实测  X " + fmtCart(xyz[0], 3, "") +
-        "  Y " + fmtCart(xyz[1], 3, "") +
-        "  Z " + fmtCart(xyz[2], 3, "") + " m" +
-        "　R " + fmtCart(rpy[0], 1, "") +
-        "  P " + fmtCart(rpy[1], 1, "") +
-        "  Yaw " + fmtCart(rpy[2], 1, "") + "°";
-    }
+    const online=deviceState().online;
+    const values=[xyz[0],xyz[1],xyz[2],rpy[0],rpy[1],rpy[2]];
+    ["tcpX","tcpY","tcpZ","tcpR","tcpP","tcpYaw"].forEach((id,i)=>{
+      const element=$(id);if(!element)return;
+      const text=online?fmtCart(values[i],i<3?3:1,""):"—";
+      if(element.textContent!==text)element.textContent=text;
+    });
+    if($("tcpReadoutState"))$("tcpReadoutState").textContent=online?"实时位姿":"等待反馈";
     syncCartFromSnap(a);
   }
   function clipCartAxis(i, raw) {
@@ -711,35 +826,31 @@
       if (!r || !n) return;
       r.value = clipped;
       n.value = Number(clipped).toFixed(ax.digits);
+      window.StationNumbers.clear(n);
     });
   }
   function syncCartFromSnap(arm) {
-    if (!arm) return;
-    const box = $("cartList");
-    if (!box) return;
-    if (document.activeElement && box.contains(document.activeElement)) return;
-    if (cartDirty) {
-      const pose = readCart();
-      if (arm.moving || !cartNearMeasured(arm, pose.xyz, pose.rpy)) return;
-      cartDirty = false;
-    }
+    if (cartPrimed || cartDirty || !arm?.online || arm.ee_m?.length!==3 || arm.ee_rpy_deg?.length!==3) return;
     writeCartInputs(arm.ee_m, arm.ee_rpy_deg);
+    cartPrimed=true;
   }
   function readCart() {
     const box = $("cartList");
     const xyz = [];
     const rpy = [];
-    for (let i = 0; i < 6; i++) {
+    try {for (let i = 0; i < 6; i++) {
       const n = box && box.querySelector("[data-cn='" + i + "']");
-      const v = clipCartAxis(i, n ? n.value : CART_AXES[i].def);
+      const ax=CART_AXES[i];
+      const v = window.StationNumbers.read(n,{label:ax.label+" 目标"+(i<3?"位置":"姿态"),min:ax.min,max:ax.max});
       if (i < 3) xyz.push(v);
       else rpy.push(v);
-    }
+    }}catch(_){return null;}
     return { xyz: xyz, rpy: rpy };
   }
   function cartNearMeasured(arm, xyz, rpy) {
     const m = (arm && arm.ee_m) || [];
     const r = (arm && arm.ee_rpy_deg) || [];
+    if(m.length!==3 || r.length!==3)return false;
     for (let i = 0; i < 3; i++) {
       if (Math.abs(Number(xyz[i]) - Number(m[i] || 0)) > 0.0015) return false;
     }
@@ -757,16 +868,17 @@
       return;
     }
     const pose = readCart();
+    if(!pose){setAck("请填写完整且在范围内的 XYZ、RPY 目标",false);return;}
     const arm = last && last.arm;
-    if (arm && cartNearMeasured(arm, pose.xyz, pose.rpy) && !arm.moving) {
-      setAck("目标就是当前末端位姿。先拖滑条再发送，或用 WASD。", false);
+    if (live && arm && cartNearMeasured(arm, pose.xyz, pose.rpy) && !arm.moving) {
+      setAck("已在目标位姿，无需移动。", true);
       return;
     }
-    cartDirty = false;
+    stopFollowStream(false);
     const sent = send({ t: "cart_go", xyz: pose.xyz, rpy: pose.rpy, speed: Number($("armSpeed").value || 40) });
-    if (sent) cartDirty = true;
+    cartDirty = sent || !!CMD_QUEUE_LIB;
     flashHot("send", "发送位置");
-    setAck(sent ? "笛卡尔目标已按 Speed 下发" : "未连接：目标已排队，连接恢复后下发", sent);
+    setAck(sent ? (arm?.moving ? "已更新目标，从当前位姿按设定速度移动" : "笛卡尔目标已按设定速度下发") : "未连接：仅保留最新目标，连接恢复后下发", sent);
   }
   function bindCartSliders() {
     const box = $("cartList");
@@ -775,12 +887,14 @@
     CART_AXES.forEach((ax, i) => {
       const row = document.createElement("div");
       row.className = "joint";
+      row.dataset.axis=["x","y","z","r","p","yaw"][i];
+      const description=ax.label+" 目标"+(i<3?"位置":"姿态");
       row.innerHTML =
-        "<label>" + ax.label + "</label>" +
+        "<label for='cartTarget"+i+"'>" + ax.label + "</label>" +
         "<input type='range' min='" + ax.min + "' max='" + ax.max + "' step='" + ax.step +
-        "' value='" + ax.def + "' data-c='" + i + "'/>" +
+        "' value='" + ax.def + "' data-c='" + i + "' aria-label='"+description+"滑条'/>" +
         "<input type='number' min='" + ax.min + "' max='" + ax.max + "' step='" + ax.step +
-        "' value='" + Number(ax.def).toFixed(ax.digits) + "' data-cn='" + i + "'/>" +
+        "' value='" + Number(ax.def).toFixed(ax.digits) + "' data-cn='" + i + "' id='cartTarget"+i+"' aria-label='"+description+"（"+ax.unit+"）'/>" +
         "<span class='cart-unit'>" + ax.unit + "</span>";
       box.appendChild(row);
     });
@@ -794,22 +908,77 @@
     };
     box.addEventListener("input", (ev) => {
       const el = ev.target;
+      if (el.dataset.c == null && el.dataset.cn == null) return;
+      cartDirty=true;
       if (el.dataset.c != null) syncPair(Number(el.dataset.c), el.value);
-      if (el.dataset.cn != null) syncPair(Number(el.dataset.cn), el.value);
+      if (el.dataset.cn != null && el.value!=="" && Number.isFinite(Number(el.value))) box.querySelector("[data-c='"+el.dataset.cn+"']").value=el.value;
+      queueCartFollow();
     });
     box.addEventListener("change", (ev) => {
       const el = ev.target;
       if (el.dataset.c == null && el.dataset.cn == null) return;
-      sendCartPose();
+      cartDirty=true;
+      const i=Number(el.dataset.c ?? el.dataset.cn), ax=CART_AXES[i];
+      try{syncPair(i,window.StationNumbers.read(el,{label:ax.label+" 目标",min:ax.min,max:ax.max}));}
+      catch(_){return;}
+      queueCartFollow();
     });
+  }
+  function wantCartFollow(){
+    return spaceMode==="cart" && currentPage()==="arm/control" && !!$("armFollow")?.checked && live &&
+      !!last?.capabilities?.cartesian_follow && !cartHeld.size &&
+      ["Position","Impedance"].includes(ctrlMode) && last?.arm?.online && last.arm.enabled &&
+      last.safety!=="ESTOP_LATCHED" && !["running","paused"].includes(last.program?.status);
+  }
+  function cancelCartFollow(){
+    clearTimeout(cartFollow.timer);cartFollow.timer=0;cartFollow.dirty=false;
+    if(cartFollow.pending)clearTimeout(cartFollow.pending.timeout);
+    cartFollow.pending=null;
+  }
+  function queueCartFollow(){
+    if(!wantCartFollow())return;
+    cartFollow.dirty=true;
+    if(cartFollow.timer || cartFollow.pending)return;
+    cartFollow.timer=setTimeout(flushCartFollow,Math.max(0,100-(performance.now()-cartFollow.lastSent)));
+  }
+  function flushCartFollow(){
+    cartFollow.timer=0;
+    if(!wantCartFollow() || !cartFollow.dirty || cartFollow.pending)return;
+    const pose=readCart();if(!pose)return;
+    cartFollow.dirty=false;
+    if(!last.arm.moving && cartNearMeasured(last.arm,pose.xyz,pose.rpy))return;
+    const request_id="cart-follow-"+(++cartFollow.serial);
+    const timeout=setTimeout(()=>{if(cartFollow.pending?.id===request_id){stopFollowStream();setAck("笛卡尔跟随应答超时，已关闭实时跟随",false);}},3000);
+    cartFollow.pending={id:request_id,timeout};cartFollow.lastSent=performance.now();
+    try{ws.send(JSON.stringify(withSession({t:"cart_go",...pose,speed:Number($("armSpeed").value||40),stream:true,request_id,t0:performance.now()})));}
+    catch(_){stopFollowStream();setAck("连接已断开，已关闭实时跟随",false);}
+  }
+  function handleCartFollowAck(msg){
+    if(!cartFollow.pending || msg.request_id!==cartFollow.pending.id)return false;
+    clearTimeout(cartFollow.pending.timeout);cartFollow.pending=null;
+    if(!msg.ok){stopFollowStream();setAck("笛卡尔跟随失败："+(msg.error||"目标无法执行"),false);}
+    else if(cartFollow.dirty)queueCartFollow();
+    return true;
+  }
+  function useCurrentCartPose(){
+    const arm=last?.arm;if(!arm?.online || arm.ee_m?.length!==3 || arm.ee_rpy_deg?.length!==3)return;
+    if($("armFollow")?.checked)stopFollowStream();
+    writeCartInputs(arm.ee_m,arm.ee_rpy_deg);cartDirty=false;cartPrimed=true;
   }
   function setSpace(name, fromUi) {
     if (name === "cart" && (ctrlMode === "Gravity" || ctrlMode === "Gra+Fri")) {
       setAck("Gravity 示教请用关节空间。笛卡尔请先切回 Position。", false);
       name = "joint";
     }
-    spaceMode = name === "cart" ? "cart" : "joint";
-    if (spaceMode === "cart" && $("armFollow")) $("armFollow").checked = false;
+    const nextSpace=name === "cart" ? "cart" : "joint";
+    if(spaceMode!==nextSpace)releaseManual();
+    spaceMode=nextSpace;
+    $("manualControlTitle").textContent=spaceMode==="cart"?"笛卡尔控制":"关节控制";
+    if($("armFollow")){
+      const unsupported=spaceMode==="cart" && !last?.capabilities?.cartesian_follow;
+      $("armFollow").disabled=unsupported || ["Gravity","Gra+Fri"].includes(ctrlMode) || ["running","paused"].includes(last?.program?.status);
+      $("armFollow").title=unsupported?"重启更新后的站控服务以启用笛卡尔实时跟随":"";
+    }
     if ($("jointSpace")) $("jointSpace").classList.toggle("off", spaceMode !== "joint");
     if ($("cartSpace")) $("cartSpace").classList.toggle("off", spaceMode !== "cart");
     if ($("spaceBtns")) {
@@ -822,12 +991,13 @@
     }
     if ($("spaceHint")) {
       $("spaceHint").textContent = spaceMode === "cart"
-        ? "笛卡尔：拖 X/Y/Z 与姿态滑条。松手或「发送位置」后按 Speed 走到目标（直线 IK）。键盘 WASD 仍可用。"
-        : "关节空间：拖 J1–J6 改目标，点「发送位置」下发；勾选「实时跟随」后拖滑条才发 servo。";
+        ? "拖动只编辑 XYZ、RPY 目标，点击「发送位置」后运动。开启实时跟随时，拖动即运动。"
+        : "拖动滑条设置目标，点击「发送位置」后运动。开启实时跟随时，拖动即运动。";
     }
-    if (spaceMode === "cart" && last && last.arm) {
+    if (spaceMode === "cart" && !cartDirty && last?.arm?.online) {
       cartDirty = false;
       writeCartInputs(last.arm.ee_m, last.arm.ee_rpy_deg);
+      cartPrimed=true;
     }
     if (fromUi) setAck(spaceMode === "cart" ? "已切到笛卡尔滑条控制" : "已切到关节空间", true);
   }
@@ -841,19 +1011,24 @@
       setAck("请先切回 Position 再发送位置", false);
       return;
     }
-    stopFollowStream();
     const q = readJoints();
-    const cur = (last && last.arm && last.arm.q_deg) || [];
+    if (!q) {setAck("请填写完整且在关节限位内的六轴目标角度",false);return;}
+    const arm = last && last.arm;
+    const cur = (arm && (arm.feedback_deg?.length >= 6 ? arm.feedback_deg : arm.q_deg)) || [];
     const same = q.length === 6 && cur.length >= 6 && q.every((v, i) => Math.abs(Number(v) - Number(cur[i])) < 0.2);
-    if (same) {
-      setAck("目标就是当前角，臂不会动。先拖滑条再发送，或勾选实时跟随。", false);
+    const sameLive = arm?.q_deg?.length >= 6 && q.every((v,i)=>Math.abs(Number(v)-Number(arm.q_deg[i]))<0.2);
+    // A validated target replaces the old motion directly. A separate park
+    // could restore an obsolete servo target before this command is accepted.
+    stopFollowStream(false);
+    if (live && same && sameLive && !arm.moving) {
+      jointDirty = false;
+      setAck("已在目标位置，无需移动。", true);
       return;
     }
-    jointDirty = false;
     const sent = send({ t: "arm", q: q, speed: Number($("armSpeed").value || 40) });
-    if (sent) jointDirty = true;
+    jointDirty = sent || !!CMD_QUEUE_LIB;
     flashHot("send", "发送位置");
-    setAck(sent ? "关节目标已下发" : "未连接：目标已排队，连接恢复后下发", sent);
+    setAck(sent ? (arm?.moving ? "已更新目标，从当前位置按设定速度移动" : "关节目标已下发，按设定速度移动") : "未连接：仅保留最新目标，连接恢复后下发", sent);
   }
 
   function kv(title, rows) {
@@ -863,63 +1038,29 @@
     }).join("");
     return "<div class='kv'><h3>" + title + "</h3><table>" + lines + "</table></div>";
   }
-  function metric(k, v, s) {
-    return "<div class='metric'><div class='k'>" + k + "</div><div class='v'>" + v + "</div><div class='s'>" + (s || "") + "</div></div>";
-  }
-  function paintWaypoints() {
-    const box = $("wpList");
-    if (!box) return;
-    if (!waypoints.length) {
-      box.innerHTML = "<li>还没有路点</li>";
-      return;
+  function acceptSnapshot(d) {
+    if (last?.connection?.session && d.connection?.session!==last.connection.session) {
+      releaseManual(false);
+      jointDirty=false;
+      pendingTelem=null;
     }
-    box.innerHTML = waypoints.map((w, i) =>
-      "<li>#" + (i + 1) + "　" + w.q.map((x) => Number(x).toFixed(0)).join("，") +
-      "°　<input type='number' min='0.2' step='0.1' value='" + Number(w.t || 2).toFixed(1) +
-      "' data-wpt='" + i + "' style='width:70px'/> s</li>"
-    ).join("");
-    box.querySelectorAll("[data-wpt]").forEach((el) => {
-      el.addEventListener("change", () => {
-        const i = Number(el.dataset.wpt);
-        if (waypoints[i]) waypoints[i].t = Number(el.value || 2);
-      });
-    });
-  }
-
-  function paintTrajTeach() {
-    document.querySelectorAll("#trajTeachBtns [data-traj-teach]").forEach((btn) => {
-      btn.classList.toggle("active", btn.getAttribute("data-traj-teach") === trajTeach);
-    });
-    const hint = $("trajTeachHint");
-    if (!hint) return;
-    hint.textContent = trajTeach === "soft"
-      ? "软件录制：留在 Position，用跟随 / 键盘 / 发送位置记录连续曲线。"
-      : "拖臂录制（默认）：开始后切入 Gravity（纯 G(q)），扶稳再徒手拖。仿真用滑条示教。";
-  }
-
-  function paintTraj(a) {
-    const st = $("trajStatus");
-    if (!st || !a) return;
-    const teachLabel = a.rec_teach === "drag" ? "拖臂" : (a.rec_teach === "soft" ? "软件" : (a.rec_teach || ""));
-    if (a.recording) {
-      st.textContent = "录制中 · " + (a.rec_frames || 0) + " 帧 · " + Number(a.rec_s || 0).toFixed(1) + " s"
-        + (teachLabel ? (" · " + teachLabel) : "");
-    } else if (a.replay_active) {
-      st.textContent = "回放中 · 先走到起点再按时间戳 · " + (a.traj_file || "");
-    } else {
-      st.textContent = a.traj_file
-        ? ("上次：" + a.traj_file)
-        : (trajTeach === "drag" ? "未录制。点开始后扶稳再拖臂。" : "未录制。Position 下软件操控。");
+    if (d.seq !== lastPowerSeq) {
+      lastPowerSeq = d.seq;
+      lastPowerFeedbackAt = performance.now();
     }
-  }
-
-  function render(d) {
     last = d;
+    paintGlobalStatus();
+    paintMotorStatus(d.arm || {});
+    paintCmdButtons(d.arm || {},d.safety==="ESTOP_LATCHED");
+    window.dispatchEvent(new CustomEvent("station:snapshot", {detail:d}));
+  }
+  function render(d) {
+    acceptSnapshot(d);
     const a = d.arm || {};
     applyLimits(a);
     if (a.ctrl_mode) ctrlMode = a.ctrl_mode;
     paintCtrlMode(a);
-    if (currentPage() === "arm") {
+    if (currentPage() === "arm/control") {
       syncJointsFromSnap(a);
       if ($("gripDeg") && a.gripper_deg != null && document.activeElement !== $("gripDeg") && document.activeElement !== $("gripRange")) {
         $("gripDeg").value = Number(a.gripper_deg).toFixed(1);
@@ -946,10 +1087,10 @@
           $("kbPadHint").className = "hint tone-bad";
         }
       } else if ($("kbAck").classList.contains("tone-bad")) {
-        $("kbAck").textContent = "按键映射与 SDK test_fafu_keyboard_cartesian 相同。";
+        $("kbAck").textContent = "松开按键停止，快捷键仅在手动控制页生效。";
         $("kbAck").className = "hint";
         if ($("kbPadHint")) {
-          $("kbPadHint").textContent = "拖动只改目标。松手或「发送位置」后 IK + move_j，速度用上方 Speed。键盘 WASD 仍是增量遥操作。";
+          $("kbPadHint").textContent = CART_HINT;
           $("kbPadHint").className = "hint";
         }
       }
@@ -958,7 +1099,6 @@
     if (now - lastDom < 50) return;
     lastDom = now;
     paintHud(d, a, estop);
-    paintTraj(a);
   }
 
   function floatModeNeedsDynamics(mode) {
@@ -978,17 +1118,16 @@
     if (box) {
       box.querySelectorAll("[data-mode]").forEach((btn) => {
         const mode = btn.dataset.mode;
-        const blocked = floatModeNeedsDynamics(mode) && !ok;
+        const blocked = (floatModeNeedsDynamics(mode) && !ok) || !!a.recording;
         btn.disabled = blocked;
         btn.setAttribute("aria-disabled", blocked ? "true" : "false");
-        btn.title = blocked ? (mode + "：" + reason + "（真机力矩环未加载）") : "";
+        btn.title = a.recording ? "录制期间控制模式已锁定，请先停止录制" : blocked ? (mode + "：" + reason + "（真机力矩环未加载）") : "";
         btn.classList.toggle("active", mode === ctrlMode);
       });
     }
-    if ($("armCtrlMode")) $("armCtrlMode").textContent = ctrlMode;
     const hints = {
       Position: "Position：关节/笛卡尔滑条 + 发送位置。实时跟随与键盘走 servo。",
-      Gravity: "Gravity：真机与 SDK [t] 示教相同（纯 G(q) 力矩前馈，无 K/B/I）。切入约 0.5 s 用软件 damping_kd 刹速度，稳定后回到纯 G(q)。无 pinocchio 时用站控 G(q)。仿真用滑条改当前角。夹爪打开。",
+      Gravity: "Gravity：真机以重力补偿接受手动引导，关节控件显示实测位置。仿真需明确开启「仿真拖动」后才能用滑条模拟手动拖臂。",
       "Gra+Fri": "Gra+Fri：与 Gravity 相同，另加示教摩擦补偿。切入同样有短时软件阻尼，稳定后保持 G(q)+摩擦。仿真与 Gravity 相同示教语义。",
       Impedance: "Impedance：真机柔顺保持进入时的姿态（不跟随拖动）。仿真为较慢跟随。",
     };
@@ -1001,6 +1140,43 @@
         : "Gravity / Gra+Fri / Impedance 已禁用：" + reason + "（真机力矩环未加载）。仿真臂仍可切这些模式做滑条示教。";
     }
     paintGravUrdf(a);
+    paintTeachControls(a);
+  }
+  function simulatedTeachEnabled() {
+    return last?.arm?.backend === "sim" && !!$("simTeachEnabled")?.checked;
+  }
+  function paintTeachControls(a) {
+    const online=deviceState().online;
+    const floating = ctrlMode === "Gravity" || ctrlMode === "Gra+Fri";
+    const simulation = a.backend === "sim";
+    const context = [ctrlMode,a.backend,!!a.recording,a.rec_teach].join(":");
+    if (context !== teachContext) {
+      teachContext = context;
+      $("simTeachEnabled").checked = false;
+      if (floating || a.recording) {
+        releaseManual(); jointDirty = false;
+        writeJointInputs(a.q_deg || []);
+      }
+    }
+    const busy = ["running","paused"].includes(last?.program?.status);
+    const readOnly = floating && !(simulation && simulatedTeachEnabled());
+    $("manualTeachStatus").hidden = !online || !(floating || a.recording);
+    $("simTeachOption").hidden = !online || !(floating && simulation);
+    $("simTeachEnabled").disabled = !online || busy;
+    $("manualTeachMessage").textContent = floating
+      ? (a.recording ? "拖臂录制中 · 控制模式已锁定。" : "当前为手动拖臂模式。") + (simulation ? "关节角默认只读；开启下方仿真拖动后，滑条才会改变仿真姿态并被录制。" : "请用手引导机械臂，滑条仅显示实测位置，不下发关节目标。")
+      : "界面操控录制中 · 可以发送位置或使用实时跟随；停止录制前不能切换控制模式。";
+    $("jointList").querySelectorAll("input").forEach(input => {input.disabled = readOnly || busy;});
+    $("cartList").querySelectorAll("input").forEach(input => {input.disabled = floating || busy;});
+    $("btnCartUseCurrent").disabled=!online || floating || busy;
+    for (const id of ["btnSendArm","btnHome","armFollow"]) $(id).disabled = !online || floating || busy || !!pendingCmd[id === "btnHome" ? "home" : "arm"];
+    const cartUnsupported=spaceMode==="cart" && !last?.capabilities?.cartesian_follow;
+    if(cartUnsupported)$("armFollow").disabled=true;
+    $("armFollow").title=cartUnsupported?"重启更新后的站控服务以启用笛卡尔实时跟随":"";
+    $("spaceBtns").querySelector('[data-space="cart"]').disabled = floating || busy;
+    if (floating && spaceMode !== "joint") setSpace("joint");
+    for (const id of ["gripRange","gripDeg","btnGripOpen","btnGripClose"]) $(id).disabled = !online || floating || busy;
+    $("gravUrdf").disabled = !!a.recording || busy;
   }
   const urdfList = { files: [], dir: "", selected: "" };
   function paintGravUrdf(arm) {
@@ -1018,6 +1194,7 @@
       ? files.map((n) => "<option value='" + n + "'>" + n + "</option>").join("")
       : "<option value=''>urdf 目录为空</option>";
     if (cur && Array.from(sel.options).some((o) => o.value === cur)) sel.value = cur;
+    sel.title = sel.value;
     const hint = $("gravUrdfHint");
     if (hint) {
       const where = dir || "robot_station\\urdf";
@@ -1037,30 +1214,17 @@
       paintGravUrdf((last && last.arm) || {});
     } catch (e) {}
   }
-  function paintArmSrc(backend) {
-    if (pendingCmd.arm_src) return;
-    const src = backend === "sim" ? "sim" : (backend === "fafu" ? "fafu" : "");
-    document.querySelectorAll("#armSrcBtns [data-arm-src]").forEach((b) => {
-      b.classList.toggle("active", b.getAttribute("data-arm-src") === src);
-      b.classList.toggle("is-on", b.getAttribute("data-arm-src") === src);
-    });
-  }
-  function setArmSrc(mode) {
-    const id = mode === "sim" ? "btnArmSim" : "btnArmLive";
-    stopFollowStream();
-    if (!beginCmd("arm_src", {
-      id: id,
-      pair: ["btnArmLive", "btnArmSim"],
-      busy: mode === "sim" ? "切换仿真…" : "切换真机…",
-      ack: mode === "sim" ? "正在切到仿真臂…" : "正在切到真机 USB…",
-      want: mode,
-    })) return;
-    send({ t: "arm_src", mode: mode });
-  }
   function paintMotorStatus(a) {
     const table = $("motorTable");
     const hint = $("motorHint");
     if (!table) return;
+    const state=deviceState();
+    if (!state.online) {
+      const text=state.fresh?"设备未连接，连接后读取电机反馈。":"设备状态未更新，暂不显示旧电机反馈。";
+      table.replaceChildren();
+      if (hint) hint.textContent=text;
+      return;
+    }
     const motors = (a && a.motors) || [];
     if (!motors.length) {
       const why = (a && a.link_err) ? String(a.link_err) : "";
@@ -1077,7 +1241,7 @@
         "<tr>" +
         "<td>" + (m.name || ("M" + m.id)) + "</td>" +
         "<td class='" + (online ? "st-on" : "st-off") + "'>" + (online ? "在线" : "离线") + "</td>" +
-        "<td class='" + (ok ? "st-on" : "st-off") + "'>" + (ok ? "正常" : ("故障 " + (m.fault || ""))) + "</td>" +
+        "<td class='" + (ok ? "st-on" : "st-off") + "'>" + (ok ? "正常" : (m.fault_text || ("故障 " + (m.fault || "")))) + "</td>" +
         "<td>" + mode + "</td>" +
         "</tr>"
       );
@@ -1090,70 +1254,24 @@
         : ("未使能 · " + nOk + "/" + motors.length + " 轴有通信。点「使能」切入位置环。");
     }
   }
-  function motorOnlineCounts(a) {
-    const motors = (a && a.motors) || [];
-    return { n: motors.length, nOn: motors.filter((m) => m.online).length };
-  }
   function paintHud(d, a, estop) {
-    const cam = d.camera || {};
     $("cliTxt").textContent = String(d.clients || 0);
     if (rtt == null && d.rtt_ms != null) $("rttTxt").textContent = Number(d.rtt_ms).toFixed(1) + " ms";
-    const demo = (a.backend || "mock") === "mock" || a.backend === "sim";
-    const camLive = (cam.backend || "mock") !== "mock";
-    setLink(!!a.online);
-    const armLabel = demo
-      ? (a.backend === "sim" ? "仿真臂" : "假臂")
-      : (a.online ? "真机" : "真机未连接");
-    const bits = [armLabel, camLive ? "真相机" : "假相机"];
-    if ($("mockTxt")) $("mockTxt").textContent = bits.join(" · ");
-    if ($("mockDot")) $("mockDot").className = "dot " + ((demo || !camLive || !a.online) ? "warn" : "on");
-    if (info && $("homeHint")) {
-      const ip = info.host_ip + ":" + info.http_port;
-      const guard = info.live_serial_allowed ? "" : "　未允许真机串口。";
-      $("homeHint").textContent =
-        "本站在本机运行。http://" + ip +
-        "　USB 直连机械臂与作业相机。" + guard;
-    }
-    if ($("armModeBadge")) {
-      const demo = (a.backend || "mock") === "mock" || a.backend === "sim";
-      const { n, nOn } = motorOnlineCounts(a);
-      const linkUp = !!a.online;
-      const partial = linkUp && n > 0 && nOn < n;
-      $("armModeBadge").textContent = !linkUp
-        ? "已断开"
-        : (partial ? ("部分轴离线 " + nOn + "/" + n) : (demo ? (a.backend === "sim" ? "Sim Mode" : "Demo Mode") : "Live Robot"));
-      $("armDot").className = "status-dot" + (!linkUp ? " off" : (partial ? " warn" : (demo ? " connected" : " live")));
-    }
-    if ($("armBackend")) $("armBackend").textContent = a.backend || "—";
-    if ($("armLinkTxt")) {
-      const { n, nOn } = motorOnlineCounts(a);
-      if (!a.online) $("armLinkTxt").textContent = "已断开";
-      else if (n && nOn < n) $("armLinkTxt").textContent = "已连接 · " + nOn + "/" + n + " 轴在线";
-      else $("armLinkTxt").textContent = "已连接";
-    }
-    if (a.link_err && a.online && String(a.link_err).indexOf("离线：") !== 0) setAck(a.link_err, false);
-    if ($("armEnabled")) $("armEnabled").textContent = a.enabled ? "是" : "否";
-    if ($("armGripTxt")) $("armGripTxt").textContent = a.gripper_open ? "Open" : "Close";
-    if ($("armRobotName")) $("armRobotName").textContent = "FAFU";
-    if (info && $("armServerUrl")) $("armServerUrl").textContent = info.arm_port || "cfg / auto";
-    if ($("armCtrlMode")) $("armCtrlMode").textContent = ctrlMode;
-    paintArmSrc(a.backend);
+    // The connection card has one renderer in connections.js, including offline feedback.
+    if (a.link_err && deviceState().online && String(a.link_err).indexOf("离线：") !== 0) setAck(a.link_err, false);
     paintMotorStatus(a);
     paintCmdButtons(a, estop);
-    if ($("collectBanner")) {
-      if (a.backend === "sim") {
-        $("collectBanner").classList.add("on");
-        $("collectBanner").textContent = "当前是仿真臂：不开 USB，页面操作只驱动仿真。可在右侧切回「真机 USB」。";
-      } else if (a.backend === "fafu" && info && info.live_serial_allowed && info.arm_allow_motion) {
-        $("collectBanner").classList.remove("on");
-        $("collectBanner").textContent = "";
-      }
+    paintArmFeedback(a);
+  }
+  function paintArmFeedback(a) {
+    if (!deviceState().online) {
+      const text=deviceState().fresh?"设备未连接，等待反馈":"设备状态未更新";
+      $("armKv").innerHTML=kv("实测角度",[["状态",text]]);
+      if ($("eeKv")) $("eeKv").innerHTML=kv("力矩与控制状态",[["状态",text]]);
+      return;
     }
-    $("homeMetrics").innerHTML =
-      metric("臂", (a.q_deg || []).map((x) => Number(x).toFixed(0) + "°").join("  ") || "—", a.moving ? "运动中" : (a.gripper_open ? "夹爪开" : "夹爪合")) +
-      metric("安全", d.safety || "—", estop ? "需解除" : "可运动") +
-      metric("相机", camLive ? shortCamName(cam.device || "USB") : "—", camLive ? "已自动识别" : (cam.reason || "未连接"));
-    const rows = (a.q_deg || []).map((q, i) => [
+    const measured = a.feedback_deg?.length >= 6 ? a.feedback_deg : (a.q_deg || []);
+    const rows = measured.map((q, i) => [
       "J" + (i + 1),
       Number(q).toFixed(2) + "°  →  " + Number((a.target_deg || [])[i] || 0).toFixed(2) + "°",
       (a.ok && a.ok[i] === false) ? "tone-bad" : "tone-ok",
@@ -1164,15 +1282,7 @@
     $("armKv").innerHTML = kv("实测角度", rows);
     if ($("eeKv")) {
       const tau = (a.tau_raw || []).map((x) => Number(x)).join("  ") || "—";
-      const xyz = (a.ee_m && a.ee_m.length === 3)
-        ? a.ee_m.map((x) => Number(x).toFixed(3)).join("  ") + " m"
-        : "等待快照";
-      const rpy = (a.ee_rpy_deg && a.ee_rpy_deg.length === 3)
-        ? a.ee_rpy_deg.map((x) => Number(x).toFixed(1)).join("  ") + " °"
-        : "—";
-      $("eeKv").innerHTML = kv("位姿 / 力矩", [
-        ["X Y Z", xyz],
-        ["R P Y", rpy],
+      $("eeKv").innerHTML = kv("力矩与控制状态", [
         ["外力", "无腕部 F/T"],
         ["关节力矩 raw", tau],
         ["动力学", a.dyn_ready ? "pinocchio URDF" : "站控 URDF（笛卡尔 IK；重力 G(q)）"],
@@ -1182,53 +1292,13 @@
         ["录制", a.recording ? ((a.rec_frames || 0) + " 帧") : (a.replay_active ? "回放中" : "关")],
       ]);
     }
-    const roles = cam.roles || ["作业相机"];
-    const fps = cam.fps || [];
-    roles.forEach((name, i) => {
-      const fpsTxt = (fps[i] != null ? Number(fps[i]).toFixed(1) : "—") + " Hz";
-      let label = name;
-      if (i === 0 && cam.device) label = "作业相机 · " + shortCamName(cam.device);
-      [["camRole", "camFps"], ["homeRole", "homeFps"]].forEach(([rk, fk]) => {
-        const r = $(rk + i);
-        const f = $(fk + i);
-        if (r) r.textContent = label;
-        if (f) f.textContent = fpsTxt;
-      });
-    });
-    const camOk = camLive && (cam.online || [])[0];
-    document.querySelectorAll(".js-cam-overlay").forEach((ov) => {
-      if (camOk) ov.style.display = "none";
-      else {
-        ov.style.display = "";
-        ov.textContent = cam.reason || (camLive ? "等待画面" : "未连接 · 假画面");
-      }
-    });
-  }
-
-  function shortCamName(s) {
-    return String(s || "")
-      .replace(/Intel\(R\)\s*/ig, "")
-      .replace(/RealSense\(TM\)\s*/ig, "")
-      .replace(/\s+Depth\s*$/i, "")
-      .trim() || "USB";
-  }
-
-  function applyPng(sid, blob) {
-    const url = URL.createObjectURL(blob);
-    const prev = urls[sid];
-    ["cam" + sid, "homeCam" + sid].forEach((id) => {
-      const img = $(id);
-      if (img) img.src = url;
-    });
-    urls[sid] = url;
-    if (prev) setTimeout(() => URL.revokeObjectURL(prev), 200);
   }
 
   function paintSafety(d) {
     const estop = !!(d && d.safety === "ESTOP_LATCHED");
     const banner = $("estopBanner");
     if (banner) banner.classList.toggle("on", estop);
-    if ($("safeTxt")) $("safeTxt").textContent = (d && d.safety) || "—";
+    if ($("safeTxt")) $("safeTxt").textContent = deviceState().fresh?((d && d.safety) || "—"):"状态未知";
     if ($("btnEstop")) $("btnEstop").classList.toggle("is-on", estop);
   }
   function parseTelem(buf) {
@@ -1277,18 +1347,19 @@
     if (!raw) return;
     const t = parseTelem(raw);
     if (!t) return;
+    if (last && ((t.seq-(last.seq>>>0))|0)<0) return;
     last = mergeSnap(t);
     lastTelemAt = performance.now();
+    paintGlobalStatus();
     const a = last.arm || {};
     if (window.Arm3D) Arm3D.setPose(a.q_deg || [], a.gripper_deg, a.gripper_open);
     if (last.echo_t0 != null) applyEchoRtt(last.echo_t0);
     paintSafety(last);
-    if (teleopHot()) return;
-    if (currentPage() === "arm") syncJointsFromSnap(a);
     paintCartPose(a);
+    if (teleopHot()) return;
+    if (currentPage() === "arm/control") syncJointsFromSnap(a);
     const estop = last.safety === "ESTOP_LATCHED";
     $("estopBanner").classList.toggle("on", estop);
-    $("safeTxt").textContent = last.safety || "—";
   }
   function connectBus() {
     const prev = ws;
@@ -1301,7 +1372,8 @@
     sock.onopen = () => { if (ws === sock) flushCmdQueue(); };
     sock.onclose = () => {
       if (ws !== sock) return;
-      setLink(false, "");
+      releaseManual(false);
+      paintGlobalStatus();
       if (live) setTimeout(() => { if (ws === sock) connectBus(); }, 800);
     };
     sock.onmessage = (ev) => {
@@ -1314,10 +1386,12 @@
       if (msg.t === "hello" && msg.cid) myCid = msg.cid;
       if (msg.t === "snap") return;
       if (msg.t === "ack") {
+        window.dispatchEvent(new CustomEvent("station:ack", {detail:msg}));
+        if(handleCartFollowAck(msg))return;
+        if (msg.op === "workbench") return;
         const want = pendingCmd[msg.op] && pendingCmd[msg.op].want;
         if (msg.op === "clear") {
           endCmd("clear", !!msg.ok, msg.ok ? "已解除急停" : (msg.error || "失败"));
-          if (!msg.ok) alert(msg.error || "失败");
         } else if (msg.op === "script") {
           endCmd("script", !!msg.ok, msg.ok ? "已执行映射" : ("失败：" + (msg.error || "")));
           if ($("scriptAck")) {
@@ -1338,7 +1412,11 @@
         } else if (msg.op === "power") {
           const arm = last && last.arm;
           const ok = !!msg.ok || vendorEnableNoise(msg.error, arm);
-          endCmd("power", ok, ackText("power", ok, ok ? "" : msg.error, want));
+          const confirmed = want ? arm?.enabled && !last?.connection?.enable_required : !arm?.enabled;
+          if (!ok || (pendingCmd.power && arm && confirmed)) {
+            endCmd("power", ok, ackText("power", ok, ok ? "" : msg.error, want));
+          }
+          paintPowerButton();
           if (ok && arm) paintMotorStatus(arm);
         } else if (msg.op === "arm_src") {
           endCmd("arm_src", !!msg.ok, ackText("arm_src", !!msg.ok, msg.error, want));
@@ -1364,8 +1442,15 @@
     const sock = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws");
     telemWs = sock;
     sock.binaryType = "arraybuffer";
-    sock.onclose = () => { if (telemWs === sock && live) setTimeout(() => { if (telemWs === sock) connectTelem(); }, 800); };
+    sock.onclose = () => {
+      if (telemWs!==sock) return;
+      pendingTelem=null;
+      lastPowerFeedbackAt=0;
+      paintGlobalStatus();
+      if (live) setTimeout(() => { if (telemWs===sock) connectTelem(); },800);
+    };
     sock.onmessage = (ev) => {
+      if (telemWs!==sock) return;
       if (ev.data instanceof ArrayBuffer) {
         pendingTelem = ev.data;
         if (!snapRaf) snapRaf = requestAnimationFrame(flushSnap);
@@ -1375,10 +1460,11 @@
       try { msg = JSON.parse(ev.data); } catch (e) { return; }
       if (msg.t === "hud" && msg.d) {
         if (teleopHot()) {
-          last = mergeSnap(msg.d);
+          acceptSnapshot(mergeSnap(msg.d));
           paintSafety(last);
           paintCmdErr(msg.d, last.arm || {});
           const a = last.arm || {};
+          paintCartPose(a);
           if (a.ik_err && $("kbAck")) {
             $("kbAck").textContent = a.ik_err;
             $("kbAck").className = "hint tone-bad";
@@ -1432,37 +1518,10 @@
       connectRttSocket();
     }
   }
-  function connectVideo() {
-    const prev = vws;
-    if (prev) {
-      prev.onclose = null;
-      try { prev.close(); } catch (e) {}
-    }
-    const sock = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws/video");
-    vws = sock;
-    sock.binaryType = "arraybuffer";
-    sock.onmessage = (ev) => {
-      if (cartHeld.size) return;
-      if ($("armFollow") && $("armFollow").checked) return;
-      const cams = $("panel-cams");
-      if (currentPage() === "arm" && cams && cams.classList.contains("off")) return;
-      const buf = ev.data;
-      if (!(buf instanceof ArrayBuffer) || buf.byteLength < VID_HDR) return;
-      const v = new DataView(buf);
-      if (v.getUint8(0) !== 0xA1) return;
-      const sid = v.getUint8(1);
-      const len = v.getUint32(8);
-      const payload = buf.slice(VID_HDR, VID_HDR + len);
-      applyPng(sid, new Blob([payload], { type: "image/png" }));
-    };
-    sock.onclose = () => { if (vws === sock && live) setTimeout(() => { if (vws === sock) connectVideo(); }, 1000); };
-  }
-
   function nudgeSockets() {
     if (!live) return;
     if (!ws || ws.readyState > 1) connectBus();
     if (!telemWs || telemWs.readyState > 1) connectTelem();
-    if (!vws || vws.readyState > 1) connectVideo();
     if (!rttWorker && (!rttWs || rttWs.readyState > 1)) connectRttSocket();
   }
 
@@ -1478,24 +1537,16 @@
       clearTimeout(timer);
       if (r.ok) info = await r.json();
     } catch (e) {}
-    if (info) $("brandSub").textContent = "控制 " + info.control_hz + "Hz · 视频 " + info.video_hz + "Hz · " + info.host_ip;
     if ($("collectBanner")) {
-      const liveArm = !!(info && info.live_serial_allowed);
-      const motion = !!(info && info.arm_allow_motion);
-      $("collectBanner").classList.toggle("on", !(liveArm && motion));
-      $("collectBanner").textContent = liveArm
-        ? (motion ? "" : "已允许开串口，但 arm_allow_motion=false：真臂只读，不会使能或下发。")
-        : "未允许真机串口：本站不开真臂 USB。当前运动只作用于仿真/假臂。";
-      if (liveArm && motion) $("collectBanner").classList.remove("on");
+      $("collectBanner").classList.add("on");
+      $("collectBanner").textContent = "等待设备状态 · 在「总览与连接」管理连接。";
     }
-    await loadScripts();
     await loadTrajList();
     await loadUrdfList();
     startControlLoop(info && info.control_hz);
     connectBus();
     connectTelem();
     connectRtt();
-    connectVideo();
     document.addEventListener("visibilitychange", () => {
       if (!document.hidden) nudgeSockets();
     });
@@ -1509,9 +1560,12 @@
     const num = $("armSpeed");
     if (fromRange) num.value = range.value;
     else range.value = num.value;
+    const fill = 100 * (Number(range.value) - Number(range.min)) / (Number(range.max) - Number(range.min));
+    range.style.setProperty("--speed-fill", fill + "%");
   }
   $("armSpeedRange").addEventListener("input", () => syncSpeed(true));
   $("armSpeed").addEventListener("input", () => syncSpeed(false));
+  syncSpeed(true);
   $("btnSendArm").onclick = sendPosition;
   function fireEstop() {
     cartHeld.clear();
@@ -1540,35 +1594,28 @@
       hot: "home",
       ack: "复位：按当前姿态连续回零",
     })) return;
-    stopFollowStream();
+    stopFollowStream(false);
     jointDirty = false;
     send({ t: "home", speed: Number($("armSpeed").value || 40) });
   }
   function firePower(on) {
-    const id = on ? "btnArmEnable" : "btnArmDisable";
+    paintPowerButton();
+    if ($("btnPowerToggle").disabled) { setAck($("btnPowerToggle").title, false); return; }
+    if (!last?.connection?.enable_required && !!last.arm.enabled === !!on) { setAck(on ? "机械臂已使能" : "机械臂已去使能", true); return; }
+    if (!on) releaseManual();
+    const id = "btnPowerToggle";
     if (!beginCmd("power", {
       id: id,
-      pair: ["btnArmEnable", "btnArmDisable"],
       busy: on ? "正在使能…" : "正在去使能…",
       hot: on ? "enable" : "disable",
       ack: on ? "正在使能，随后显示各轴在线状态…" : "正在去使能…",
       want: on,
     })) return;
-    send({ t: "power", on: on });
+    paintPowerButton();
+    try { ws.send(JSON.stringify(withSession({ t: "power", on: !!on }))); }
+    catch (error) { endCmd("power", false, "设备连接已断开，请重连后重试"); paintPowerButton(); }
   }
-  function fireLink(action) {
-    const connect = action === "connect";
-    const id = connect ? "btnArmConnect" : "btnArmDisconnect";
-    if (!beginCmd("link", {
-      id: id,
-      pair: ["btnArmConnect", "btnArmDisconnect"],
-      busy: connect ? "正在连接…" : "正在断开…",
-      hot: connect ? "connect" : "disconnect",
-      ack: connect ? "正在连接…" : "正在断开…",
-      want: action,
-    })) return;
-    send({ t: "link", action: action });
-  }
+  function fireLink(action) { window.StationConnection?.perform(action); }
   function fireHotCmd(name) {
     if (name === "home") {
       goHome();
@@ -1604,17 +1651,13 @@
     }
     if (name === "follow") {
       const box = $("armFollow");
-      if (!box) return;
+      if (!box || box.disabled) return;
       box.checked = !box.checked;
-      const row = box.closest(".follow-row");
-      if (row) row.classList.toggle("is-on", box.checked);
+      box.dispatchEvent(new Event("change"));
       if (!box.checked) {
-        stopFollowStream();
         flashHot("follow", "跟随关");
         setAck("已关闭实时跟随", true);
       } else {
-        jointDirty = false;
-        sendFollowNow();
         flashHot("follow", "跟随开");
         setAck("已打开实时跟随", true);
       }
@@ -1631,27 +1674,31 @@
     }
   }
   $("btnHome").onclick = goHome;
+  $("simTeachEnabled").onchange = () => {
+    jointDirty = false; followDirty = false;
+    writeJointInputs(last?.arm?.q_deg || []);
+    paintTeachControls(last?.arm || {});
+  };
   if ($("btnHomeCart")) $("btnHomeCart").onclick = goHome;
   if ($("armFollow")) {
     $("armFollow").addEventListener("change", () => {
       const row = $("armFollow").closest(".follow-row");
       if (row) row.classList.toggle("is-on", $("armFollow").checked);
-      if (!$("armFollow").checked) send({ t: "park" });
-      else jointDirty = false;
+      if (!$("armFollow").checked) stopFollowStream();
+      else if(spaceMode==="cart"){
+        cancelCartFollow();
+        writeCartInputs(last?.arm?.ee_m,last?.arm?.ee_rpy_deg);cartPrimed=true;cartDirty=false;
+      }else jointDirty = false;
     });
   }
+  $("btnCartUseCurrent").onclick=useCurrentCartPose;
   $("btnGripOpen").onclick = () => {
     fireHotCmd("grip-open");
   };
   $("btnGripClose").onclick = () => {
     fireHotCmd("grip-close");
   };
-  if ($("btnArmEnable")) {
-    $("btnArmEnable").onclick = () => firePower(true);
-  }
-  if ($("btnArmDisable")) {
-    $("btnArmDisable").onclick = () => firePower(false);
-  }
+  $("btnPowerToggle").onclick = () => firePower(!last?.arm?.enabled || !!last?.connection?.enable_required);
   if ($("btnArmConnect")) {
     $("btnArmConnect").onclick = () => fireLink("connect");
   }
@@ -1713,13 +1760,6 @@
       setSpace(btn.dataset.space, true);
     });
   }
-  if ($("armSrcBtns")) {
-    $("armSrcBtns").addEventListener("click", (ev) => {
-      const btn = ev.target.closest("button[data-arm-src]");
-      if (!btn) return;
-      setArmSrc(btn.dataset.armSrc);
-    });
-  }
   $("modeBtns").addEventListener("click", (ev) => {
     const btn = ev.target.closest("button[data-mode]");
     if (!btn || btn.disabled) return;
@@ -1732,7 +1772,7 @@
     ctrlMode = next;
     paintCtrlMode(arm);
     pulseBtn(btn);
-    if (ctrlMode !== "Position" && $("armFollow")) $("armFollow").checked = false;
+    stopFollowStream(false);
     if (ctrlMode === "Gravity" || ctrlMode === "Gra+Fri") setSpace("joint");
     send({ t: "mode", mode: ctrlMode });
     setAck("已切到 " + ctrlMode, true);
@@ -1745,146 +1785,9 @@
       send({ t: "grav_urdf", name: name });
     });
   }
-  $("btnWpAdd").onclick = () => {
-    pulseBtn($("btnWpAdd"));
-    waypoints.push({ q: readJoints(), t: 2 });
-    paintWaypoints();
-    setAck("已记录路点 #" + waypoints.length, true);
-  };
-  $("btnWpClear").onclick = () => {
-    pulseBtn($("btnWpClear"));
-    waypoints = [];
-    paintWaypoints();
-    setAck("已清空路点", true);
-  };
-  $("btnWpRun").onclick = async () => {
-    pulseBtn($("btnWpRun"));
-    if (ctrlMode !== "Position") { setAck("请先切回 Position", false); return; }
-    if (!waypoints.length) { setAck("还没有路点", false); return; }
-    if (!beginCmd("path", {
-      id: "btnWpRun",
-      busy: "运行中…",
-      ack: "轨迹已交给后端…",
-    })) return;
-    send({
-      t: "path",
-      q: waypoints.map((w) => w.q),
-      dt: waypoints.map((w) => Number(w.t || 2)),
-      speed: Number($("armSpeed").value || 40),
-    });
-  };
   async function loadTrajList(prefer) {
-    const sel = $("trajFile");
-    if (!sel) return;
-    const cur = prefer || sel.value;
-    try {
-      const r = await fetch("/api/traj");
-      if (!r.ok) return;
-      const body = await r.json();
-      const items = body.files || [];
-      sel.innerHTML = items.length
-        ? items.map((it) => {
-            const name = it.name || "";
-            const frames = it.frames != null ? it.frames : "";
-            const teach = it.teach ? (" · " + it.teach) : "";
-            return "<option value='" + name + "'>" + name + " · " + frames + " 帧" + teach + "</option>";
-          }).join("")
-        : "<option value=''>还没有轨迹文件</option>";
-      if (cur && Array.from(sel.options).some((o) => o.value === cur)) sel.value = cur;
-    } catch (e) {}
+    window.dispatchEvent(new CustomEvent("station:trajectories", {detail:{prefer}}));
   }
-  document.querySelectorAll("#trajTeachBtns [data-traj-teach]").forEach((btn) => {
-    btn.onclick = () => {
-      trajTeach = btn.getAttribute("data-traj-teach") || "drag";
-      paintTrajTeach();
-      if (last) paintTraj(last.arm || {});
-    };
-  });
-  paintTrajTeach();
-  if ($("btnRecStart")) $("btnRecStart").onclick = () => {
-    pulseBtn($("btnRecStart"));
-    if (!beginCmd("rec_start", { id: "btnRecStart", busy: "录制中…", ack: "开始录制…" })) return;
-    send({ t: "rec_start", teach: trajTeach });
-  };
-  if ($("btnRecStop")) $("btnRecStop").onclick = () => {
-    pulseBtn($("btnRecStop"));
-    if (!beginCmd("rec_stop", { id: "btnRecStop", busy: "停止中…", ack: "停止录制…" })) return;
-    send({ t: "rec_stop" });
-  };
-  if ($("btnRecRename")) $("btnRecRename").onclick = () => {
-    pulseBtn($("btnRecRename"));
-    const file = $("trajFile") && $("trajFile").value;
-    if (!file) { setAck("还没有轨迹文件", false); return; }
-    const stem = file.toLowerCase().endsWith(".jsonl") ? file.slice(0, -6) : file;
-    const typed = window.prompt("新文件名（可省略 .jsonl）", stem);
-    if (typed == null) return;
-    const dest = String(typed).trim();
-    if (!dest) { setAck("文件名不能为空", false); return; }
-    if (!beginCmd("rec_rename", { id: "btnRecRename", busy: "重命名…", ack: "正在重命名…", pick: dest.toLowerCase().endsWith(".jsonl") ? dest : (dest + ".jsonl") })) return;
-    send({ t: "rec_rename", file: file, name: dest });
-  };
-  if ($("btnRecDelete")) $("btnRecDelete").onclick = () => {
-    pulseBtn($("btnRecDelete"));
-    const file = $("trajFile") && $("trajFile").value;
-    if (!file) { setAck("还没有轨迹文件", false); return; }
-    if (!window.confirm("删除本机轨迹 " + file + " ？此操作不能恢复。")) return;
-    if (!beginCmd("rec_delete", { id: "btnRecDelete", busy: "删除中…", ack: "正在删除…" })) return;
-    send({ t: "rec_delete", file: file });
-  };
-  if ($("btnReplay")) $("btnReplay").onclick = async () => {
-    pulseBtn($("btnReplay"));
-    const file = $("trajFile") && $("trajFile").value;
-    if (!file) { setAck("还没有轨迹文件", false); return; }
-    if (!beginCmd("replay", { id: "btnReplay", busy: "回放中…", ack: "回放已交给后端…" })) return;
-    send({
-      t: "replay",
-      file: file,
-      rate: Number(($("trajRate") && $("trajRate").value) || 1),
-      speed: Number($("armSpeed").value || 40),
-    });
-  };
-  function syncTrajRate(fromRange) {
-    const r = $("trajRateRange");
-    const n = $("trajRate");
-    if (!r || !n) return;
-    if (fromRange) n.value = r.value;
-    else r.value = n.value;
-  }
-  if ($("trajRateRange")) $("trajRateRange").addEventListener("input", () => syncTrajRate(true));
-  if ($("trajRate")) $("trajRate").addEventListener("change", () => syncTrajRate(false));
-  async function loadScripts() {
-    const sel = $("scriptSel");
-    if (!sel) return;
-    try {
-      const r = await fetch("/api/scripts");
-      if (!r.ok) return;
-      const body = await r.json();
-      const items = body.scripts || [];
-      sel.innerHTML = items.map((it) => {
-        const name = it.name || it;
-        const mapped = it.mapped ? " · 可映射" : " · 仅列表";
-        return "<option value='" + name + "'>" + name + mapped + "</option>";
-      }).join("");
-    } catch (e) {}
-  }
-  $("btnScriptRun").onclick = () => {
-    const name = $("scriptSel").value;
-    if (!beginCmd("script", {
-      id: "btnScriptRun",
-      busy: "请求中…",
-      ack: "已请求 " + name,
-    })) return;
-    send({ t: "script", name: name });
-    if ($("scriptAck")) {
-      $("scriptAck").textContent = "已请求 " + name;
-      $("scriptAck").className = "hint tone-ok";
-    }
-  };
-  if ($("btnScriptRefresh")) $("btnScriptRefresh").onclick = () => {
-    pulseBtn($("btnScriptRefresh"));
-    loadScripts();
-  };
-
   function cartPulse(dtSec) {
     if (!cartHeld.size) return;
     if (last && last.safety === "ESTOP_LATCHED") return;
@@ -1909,15 +1812,42 @@
     writeCartInputs(last.arm.ee_m, last.arm.ee_rpy_deg);
   }
 
+  $("workNavSelect").onclick = ev => {
+    const open = $("workNavMenu").hidden;
+    setWorkMenu(open);
+    if (open && ev.detail === 0) $("workNavMenu").querySelector("a").focus();
+  };
+  $("workNavEntry").onclick = () => setWorkMenu(false);
+  document.querySelectorAll("#workNavMenu a").forEach(a => a.onclick = () => setWorkMenu(false, true));
+  $("workNav").addEventListener("keydown", ev => {
+    const open = !$("workNavMenu").hidden;
+    if ((ev.key === "Escape" || ev.key === "Tab") && open) {
+      setWorkMenu(false, true);
+      return; // Escape still reaches the existing global emergency-stop handler.
+    }
+    if (!["ArrowDown", "ArrowUp"].includes(ev.key) && !(open && ["Home", "End"].includes(ev.key))) return;
+    ev.preventDefault(); ev.stopPropagation();
+    setWorkMenu(true);
+    const items = Array.from($("workNavMenu").querySelectorAll("a"));
+    const current = items.indexOf(document.activeElement);
+    const next = ev.key === "Home" ? 0 : ev.key === "End" ? items.length - 1 :
+      current < 0 ? (ev.key === "ArrowUp" ? items.length - 1 : 0) :
+      (current + (ev.key === "ArrowUp" ? -1 : 1) + items.length) % items.length;
+    items[next].focus();
+  });
+  document.addEventListener("click", ev => { if (!$("workNav").contains(ev.target)) setWorkMenu(false); });
+  document.addEventListener("focusin", ev => { if (!$("workNav").contains(ev.target)) setWorkMenu(false); });
+  window.addEventListener("resize", () => setWorkMenu(false));
   window.addEventListener("hashchange", showPage);
   window.addEventListener("keydown", (ev) => {
     if (!live) return;
     if (ev.code === "Escape") {
       ev.preventDefault();
+      if ($("confirmDialog").open) $("confirmDialog").close("cancel");
       fireEstop();
       return;
     }
-    if (typing()) return;
+    if (currentPage() !== "arm/control" || typing()) return;
     const cmd = CMD_KEYS[ev.code];
     if (cmd) {
       if (ev.repeat) return;
@@ -1938,7 +1868,7 @@
     }
   });
   window.addEventListener("keyup", (ev) => {
-    if (!CART_KEYS[ev.code]) return;
+    if (!CART_KEYS[ev.code] || !cartHeld.has(ev.code)) return;
     cartHeld.delete(ev.code);
     syncSlidersAfterCart();
     if (!cartHeld.size) send({ t: "park" });
@@ -1960,13 +1890,36 @@
     if (!bar || bar.contains(ev.target)) return;
     setHotkeyPop(false);
   });
+  window.addEventListener("resize", layoutHotkeyPop);
+  if (window.ResizeObserver) new ResizeObserver(layoutHotkeyPop).observe(document.querySelector(".top"));
 
-  setInterval(() => { if (live) sendTouch(); flushHz(); cmdQueue.sweep(dropQueued); }, 100);
+  setInterval(() => {
+    if (live) sendTouch();
+    flushHz();cmdQueue.sweep(dropQueued);paintGlobalStatus();paintPowerButton();
+    if (!deviceState().online) {
+      const arm=last?.arm || {};
+      paintMotorStatus(arm);paintArmFeedback(arm);paintCartPose(arm);paintTeachControls(arm);
+      setBtnOn("btnGripOpen",false);setBtnOn("btnGripClose",false);
+    }
+  }, 100);
   setInterval(() => { if (live && !rttWorker) sendPing(); }, 250);
 
+  window.StationUI = {
+    snapshot: () => last,
+    connected: () => !!(ws && ws.readyState === 1),
+    deviceState,
+    readTargets: () => limits.map(([min,max],i) => window.StationNumbers.read($("jointList").querySelector("[data-jn='"+i+"']"),{label:"J"+(i+1)+" 目标角度",min,max})),
+    releaseManual: releaseManual,
+    page: currentPage,
+    refreshStage: syncStage,
+    notice: setAck,
+    sendImmediate: msg => {
+      if (!ws || ws.readyState !== 1) throw new Error("站控连接尚未就绪，请稍后重试");
+      ws.send(JSON.stringify(withSession(msg)));
+    }
+  };
   buildJoints();
   bindCartSliders();
-  paintWaypoints();
   showPage();
   boot();
 })();

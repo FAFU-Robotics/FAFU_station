@@ -61,7 +61,7 @@ jobs:
           python -c "from pathlib import Path; from tests.test_single_exe import split_bundle, MAGIC; blob=Path(r'$out').read_bytes(); stub, payload, digest = split_bundle(blob); assert blob[-8:]==MAGIC; assert payload[:2]==b'PK'; print('ci pack ok', len(blob))"
           $man = Join-Path $env:RUNNER_TEMP "BUILD_MANIFEST.json"
           if (-not (Test-Path $man)) { throw "BUILD_MANIFEST.json was not written next to the exe" }
-          python -c "import json; from pathlib import Path; m=json.loads(Path(r'$man').read_text(encoding='utf-8')); assert m['magic']=='FAFUEXE1'; assert m['exe_bytes']>0; assert m['exe_sha256']!=m['payload_sha256']; print('ci manifest ok', m['exe_bytes'])"
+          python -c "import json; from pathlib import Path; m=json.loads(Path(r'$man').read_text(encoding='utf-8-sig')); assert m['magic']=='FAFUEXE1'; assert m['exe_bytes']>0; assert m['exe_sha256']!=m['payload_sha256']; print('ci manifest ok', m['exe_bytes'])"
 
   linux-smoke:
     runs-on: ubuntu-22.04

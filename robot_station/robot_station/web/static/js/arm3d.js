@@ -16,62 +16,39 @@
   /* First CAD palette: segmented light greys (not URDF 0.75 wash, not black joints). */
   var MESH_COLORS = [0x8a9199, 0x9aa3ad, 0xb8c0c8, 0x9aa3ad, 0xb8c0c8, 0x9aa3ad, 0xc5cdd4];
   var TOOL = [0.165, 0, 0];
-  var GRIP_LO = 0;
-  var GRIP_HI = 105;
-  var JAW_TRAVEL = 0.042;
-  var GRIP_T_PER_S = 2.5;
+  // One context and one set of immutable CAD buffers for every workspace.
+  // Views own only their transforms, camera, gripper state and path line.
+  var sharedRenderer = null;
+  var activeView = null;
+  var meshPromise = null;
+  var cadMaterials = Object.create(null);
+  var renderWidth = 0, renderHeight = 0, renderDpr = 0;
+  var FRAME_MS = 1000 / 30;
 
-  var host = null;
-  var overlay = null;
-  var renderer = null;
-  var scene = null;
-  var camera = null;
-  var robot = null;
-  var nodes = [];
-  var jawL = null;
-  var jawR = null;
-  var jawLCad = null;
-  var jawRCad = null;
-  var lastGrip = NaN;
-  var lastGripOpen = null;
-  var shownT = 1;
-  var gripInited = false;
-  var gripClock = 0;
-  var baseAxes = null;
-  var eeAxes = null;
-  var raf = 0;
-  var active = false;
-  var ready = false;
-  var az = 0.95;
-  var el = 0.38;
-  var dist = 1.15;
-  var lookX = 0.04;
-  var lookY = 0.16;
-  var lookZ = 0;
-  var dragging = false;
-  var lastX = 0;
-  var lastY = 0;
-  var lastQ = [0, 0, 0, 0, 0, 0];
-  var needsFit = true;
-  var cadOk = false;
-
-  function $(id) {
-    return document.getElementById(id);
+  function themeColor(name, fallback) {
+    return getComputedStyle(document.documentElement).getPropertyValue(name).trim() || fallback;
   }
 
-  function setOverlay(text) {
-    overlay = overlay || $("arm3dOverlay");
-    if (overlay) overlay.textContent = text;
+  function getRenderer() {
+    if (!sharedRenderer) {
+      sharedRenderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+      sharedRenderer.setClearColor(themeColor("--view-bg", 0x070b10), 1);
+      sharedRenderer.domElement.style.display = "block";
+      sharedRenderer.domElement.style.width = "100%";
+      sharedRenderer.domElement.style.height = "100%";
+    }
+    return sharedRenderer;
   }
 
   function cadMaterial(color) {
-    return new THREE.MeshPhongMaterial({
+    if (!cadMaterials[color]) cadMaterials[color] = new THREE.MeshPhongMaterial({
       color: color,
       specular: 0x2a3038,
       shininess: 48,
       side: THREE.DoubleSide,
       flatShading: true,
     });
+    return cadMaterials[color];
   }
 
   function geoFromTris(tris) {
@@ -106,7 +83,7 @@
       }
     }
     if (left.length < 90 || right.length < 90) return null;
-    var travel = JAW_TRAVEL;
+    var travel = 0.042;
     if (tipInner < 1e8) travel = Math.max(0.028, Math.min(0.07, tipInner - 0.003));
     return {
       body: geoFromTris(body) || geo,
@@ -132,31 +109,49 @@
     return geo;
   }
 
-  function loadMeshes(done) {
-    var left = MESH_NAMES.length;
-    var geos = new Array(MESH_NAMES.length);
-    var i;
-    function finish() {
-      left -= 1;
-      if (left > 0) return;
-      var ok = 0;
-      for (i = 0; i < geos.length; i += 1) if (geos[i]) ok += 1;
-      done(ok >= 4 ? geos : null);
-    }
-    for (i = 0; i < MESH_NAMES.length; i += 1) {
-      (function (idx, name) {
-        fetch("/static/meshes/" + name + ".bin", { cache: "force-cache" })
-          .then(function (r) { return r.ok ? r.arrayBuffer() : null; })
-          .then(function (buf) {
-            geos[idx] = buf ? parseFarm(buf) : null;
-            finish();
-          })
-          .catch(function () {
-            geos[idx] = null;
-            finish();
-          });
-      })(i, MESH_NAMES[i]);
-    }
+  function loadMeshes() {
+    if (!meshPromise) meshPromise = Promise.all(MESH_NAMES.map(function (name) {
+      return fetch("/static/meshes/" + name + ".bin", { cache: "force-cache" })
+        .then(function (r) { return r.ok ? r.arrayBuffer() : null; })
+        .then(function (buf) { return buf ? parseFarm(buf) : null; })
+        .catch(function () { return null; });
+    })).then(function (geos) {
+      if (geos.filter(Boolean).length < 4) return null;
+      var parts = splitLink6(geos[6]);
+      if (parts) {
+        if (parts.body !== geos[6]) geos[6].dispose();
+        geos[6] = parts.body;
+        geos.gripper = parts;
+      }
+      return geos;
+    });
+    return meshPromise;
+  }
+
+  function createArm3D(hostId, overlayId) {
+  var GRIP_LO = 0;
+  var GRIP_HI = 105;
+  var JAW_TRAVEL = 0.042;
+  var GRIP_T_PER_S = 2.5;
+  var host = null, overlay = null, renderer = null, scene = null, camera = null;
+  var robot = null, nodes = [], jointAxes = [];
+  var jawL = null, jawR = null, jawLCad = null, jawRCad = null;
+  var lastGrip = NaN, lastGripOpen = null, shownT = 1;
+  var gripInited = false, gripClock = 0;
+  var baseAxes = null, eeAxes = null;
+  var raf = 0, timer = 0, lastRender = -Infinity;
+  var active = false, ready = false, dirty = true, poseDirty = true, pathDirty = false, inTick = false;
+  var az = 0.95, el = 0.38, dist = 1.15;
+  var lookX = 0.04, lookY = 0.16, lookZ = 0;
+  var dragging = false, lastX = 0, lastY = 0;
+  var lastQ = [0, 0, 0, 0, 0, 0];
+  var needsFit = true, cadOk = false, pathLine = null, pathFrames = [];
+  var grid = null;
+
+  function $(id) { return document.getElementById(id); }
+  function setOverlay(text) {
+    overlay = overlay || $(overlayId);
+    if (overlay) overlay.textContent = text;
   }
 
   function bone(parent, to, radius, color) {
@@ -181,6 +176,7 @@
 
   function triad(size) {
     var axes = new THREE.AxesHelper(size);
+    colorTriad(axes);
     var mats = axes.material;
     if (Array.isArray(mats)) {
       mats.forEach(function (m) {
@@ -191,6 +187,12 @@
     }
     axes.renderOrder = 2;
     return axes;
+  }
+  function colorTriad(axes) {
+    if (axes.setColors) axes.setColors(
+      new THREE.Color(themeColor("--axis-x", 0xff8a96)),
+      new THREE.Color(themeColor("--axis-y", 0x5dd59c)),
+      new THREE.Color(themeColor("--axis-z", 0x70bcff)));
   }
 
   function lookAtTarget() {
@@ -207,12 +209,14 @@
       target.z + dist * Math.cos(e) * Math.cos(az)
     );
     camera.lookAt(target);
+    invalidate();
   }
 
-  function fitCamera() {
+  function updateCameraFit() {
     if (!robot || !camera || !host) return;
     robot.updateMatrixWorld(true);
     var box = new THREE.Box3().setFromObject(robot);
+    if (pathLine) box.union(new THREE.Box3().setFromObject(pathLine));
     if (!box.isEmpty()) {
       var sphere = box.getBoundingSphere(new THREE.Sphere());
       lookX = sphere.center.x;
@@ -226,6 +230,11 @@
     }
     placeCamera();
     needsFit = false;
+  }
+
+  function fitCamera() {
+    needsFit = true;
+    invalidate();
   }
 
   function gripT() {
@@ -269,11 +278,7 @@
     var i;
     for (i = 0; i < nodes.length; i += 1) {
       var q = ((qDeg[i] || 0) * Math.PI) / 180;
-      var ax = JOINTS[i].axis;
-      nodes[i].quaternion.setFromAxisAngle(
-        new THREE.Vector3(ax[0], ax[1], ax[2]).normalize(),
-        q
-      );
+      nodes[i].quaternion.setFromAxisAngle(jointAxes[i], q);
     }
   }
 
@@ -312,7 +317,7 @@
       node.position.set(spec.xyz[0], spec.xyz[1], spec.xyz[2]);
       parent.add(node);
       if (useCad && i === 5 && geos[6]) {
-        var parts = splitLink6(geos[6]);
+        var parts = geos.gripper;
         if (parts && parts.left && parts.right) {
           node.add(new THREE.Mesh(parts.body, cadMaterial(MESH_COLORS[6])));
           jawLCad = new THREE.Group();
@@ -370,8 +375,7 @@
   }
 
   function hintText() {
-    return (cadOk ? "CAD 网格 · fafu_baseV1" : "URDF 同链 · 未加载 STL，用几何体") +
-      " · 拖拽旋转 · 滚轮缩放 · 双击框选";
+    return cadOk ? "CAD 网格 · fafu_baseV1" : "简化模型 · 未加载 CAD 网格";
   }
 
   function onPointerDown(ev) {
@@ -407,56 +411,121 @@
   }
 
   function resize() {
-    if (!host || !renderer || !camera) return;
+    if (!active || activeView !== api || document.hidden || !host || !renderer || !camera) return;
     var w = host.clientWidth;
     var h = host.clientHeight;
     if (w < 8 || h < 8) return;
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.5));
-    renderer.setSize(w, h, false);
-    camera.aspect = w / h;
-    camera.updateProjectionMatrix();
+    var dpr = Math.min(window.devicePixelRatio || 1, 1.5);
+    if (renderWidth !== w || renderHeight !== h || renderDpr !== dpr) {
+      renderer.setPixelRatio(dpr);
+      renderer.setSize(w, h, false);
+      renderWidth = w; renderHeight = h; renderDpr = dpr;
+      invalidate();
+    }
+    if (camera.aspect !== w / h) {
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+      invalidate();
+    }
   }
 
-  function tick() {
+  function drawable() {
+    return active && activeView === api && ready && !document.hidden &&
+      host && host.clientWidth > 8 && host.clientHeight > 8;
+  }
+
+  function cancelPending() {
+    if (raf) cancelAnimationFrame(raf);
+    if (timer) clearTimeout(timer);
+    raf = 0; timer = 0; gripClock = 0;
+  }
+
+  function schedule() {
+    if (inTick || raf || timer || !drawable()) return;
+    var wait = FRAME_MS - (performance.now() - lastRender);
+    if (wait > 0) {
+      timer = setTimeout(function () { timer = 0; schedule(); }, wait);
+    } else raf = requestAnimationFrame(tick);
+  }
+
+  function invalidate() {
+    dirty = true;
+    schedule();
+  }
+
+  function applyTheme() {
+    if (!scene) return;
+    scene.traverse(function (object) { if (object.type === "AxesHelper") colorTriad(object); });
+    scene.background.set(themeColor("--view-bg", 0x070b10));
+    if (grid) {
+      scene.remove(grid);
+      grid.geometry.dispose();
+      (Array.isArray(grid.material) ? grid.material : [grid.material]).forEach(function (material) { material.dispose(); });
+    }
+    grid = new THREE.GridHelper(1.4, 14,
+      themeColor("--view-grid-major", 0x334556), themeColor("--view-grid-minor", 0x1b2733));
+    scene.add(grid);
+    if (pathLine) pathLine.material.color.set(themeColor("--cyan", 0x5ec8ff));
+    invalidate();
+  }
+
+  function tick(now) {
     raf = 0;
-    if (!ready) return;
-    var now = typeof performance !== "undefined" ? performance.now() : Date.now();
+    if (!drawable()) return;
+    inTick = true;
     var dt = gripClock ? Math.min(0.05, (now - gripClock) / 1000) : 0.016;
     gripClock = now;
+    if (pathDirty) updatePath();
+    if (poseDirty) { applyJoints(lastQ); poseDirty = false; }
     stepGrip(dt);
-    if (active && renderer && scene && camera && host && host.clientWidth > 8) {
+    if (needsFit) updateCameraFit();
+    if (dirty) {
       renderer.render(scene, camera);
+      lastRender = now;
     }
-    if (active) raf = requestAnimationFrame(tick);
+    dirty = false;
+    inTick = false;
+    if (Math.abs(gripT() - shownT) > 0.00001) invalidate();
   }
 
   function setActive(on) {
-    active = !!on;
-    if (active && !raf) raf = requestAnimationFrame(tick);
+    if (!on) {
+      active = false;
+      if (activeView === api) activeView = null;
+      cancelPending();
+      return;
+    }
+    if (activeView && activeView !== api) activeView.setActive(false);
+    activeView = api;
+    active = true;
+    if (!init()) return;
+    if (renderer.domElement.parentNode !== host) host.appendChild(renderer.domElement);
+    resize();
+    invalidate();
   }
 
   function init() {
-    host = $("arm3dHost");
-    overlay = $("arm3dOverlay");
-    if (!host) return false;
+    if (scene) return true;
+    host = $(hostId);
+    overlay = $(overlayId);
+    if (!host || !active) return false;
+    host.title = "拖拽旋转 · 滚轮缩放 · 双击框选";
     if (typeof THREE === "undefined") {
       setOverlay("未加载 Three.js");
       return false;
     }
-    scene = new THREE.Scene();
-    scene.background = new THREE.Color(0x070b10);
-    camera = new THREE.PerspectiveCamera(46, 1, 0.02, 20);
     try {
-      renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+      renderer = getRenderer();
     } catch (err) {
       setOverlay("本机无法创建 WebGL");
       return false;
     }
-    renderer.setClearColor(0x070b10, 1);
-    renderer.domElement.style.display = "block";
-    renderer.domElement.style.width = "100%";
-    renderer.domElement.style.height = "100%";
-    host.appendChild(renderer.domElement);
+    scene = new THREE.Scene();
+    scene.background = new THREE.Color(themeColor("--view-bg", 0x070b10));
+    camera = new THREE.PerspectiveCamera(46, 1, 0.02, 20);
+    jointAxes = JOINTS.map(function (spec) {
+      return new THREE.Vector3(spec.axis[0], spec.axis[1], spec.axis[2]).normalize();
+    });
 
     scene.add(new THREE.AmbientLight(0xffffff, 0.42));
     var key = new THREE.DirectionalLight(0xffffff, 0.95);
@@ -469,22 +538,20 @@
     rim.position.set(0.1, 0.2, -1.0);
     scene.add(rim);
 
-    var grid = new THREE.GridHelper(1.4, 14, 0x334556, 0x1b2733);
-    grid.position.y = 0;
-    scene.add(grid);
+    applyTheme();
 
     setOverlay("加载 CAD 网格…");
-    loadMeshes(function (geos) {
+    loadMeshes().then(function (geos) {
       buildRobot(geos);
-      applyJoints(lastQ);
       shownT = gripT();
       gripInited = true;
       applyGripVisual(shownT);
-      resize();
-      fitCamera();
       ready = true;
       setOverlay(hintText());
-      setActive(true);
+      // A view may have been hidden while loading. Do not steal the canvas
+      // back or compute its latest pose/path until it is visible again.
+      resize();
+      invalidate();
     });
 
     host.addEventListener("pointerdown", onPointerDown);
@@ -497,6 +564,10 @@
     if (typeof ResizeObserver !== "undefined") {
       new ResizeObserver(resize).observe(host);
     }
+    document.addEventListener("visibilitychange", function () {
+      if (document.hidden) cancelPending();
+      else if (active) { resize(); invalidate(); }
+    });
     return true;
   }
 
@@ -504,32 +575,71 @@
     var a = Number(lo);
     var b = Number(hi);
     if (!isFinite(a) || !isFinite(b) || b <= a) return;
+    if (a === GRIP_LO && b === GRIP_HI) return;
     GRIP_LO = a;
     GRIP_HI = b;
-    if (ready) applyJoints(lastQ);
+    invalidate();
   }
 
   function setPose(qDeg, gripDeg, gripOpen) {
-    lastQ = qDeg || lastQ;
-    if (gripDeg != null && gripDeg !== "" && !isNaN(Number(gripDeg))) lastGrip = Number(gripDeg);
-    if (gripOpen === true || gripOpen === false) lastGripOpen = gripOpen;
-    if (!ready) return;
-    applyJoints(lastQ);
-    if (needsFit) fitCamera();
+    var changed = false;
+    if (qDeg) for (var i = 0; i < JOINTS.length; i += 1) {
+      var q = Number(qDeg[i]);
+      if (!isFinite(q)) q = 0;
+      if (lastQ[i] !== q) { lastQ[i] = q; poseDirty = true; changed = true; }
+    }
+    if (gripDeg != null && gripDeg !== "" && isFinite(Number(gripDeg)) && lastGrip !== Number(gripDeg)) {
+      lastGrip = Number(gripDeg); changed = true;
+    }
+    if ((gripOpen === true || gripOpen === false) && lastGripOpen !== gripOpen) {
+      lastGripOpen = gripOpen; changed = true;
+    }
+    if (changed) invalidate();
   }
 
-  global.Arm3D = {
+  function setPath(frames) {
+    if (frames === pathFrames) return;
+    pathFrames = frames || [];
+    pathDirty = true;
+    invalidate();
+  }
+
+  function updatePath() {
+    pathDirty = false;
+    if (pathLine) {
+      scene.remove(pathLine);
+      pathLine.geometry.dispose();
+      pathLine.material.dispose();
+      pathLine = null;
+    }
+    needsFit = true;
+    if (pathFrames.length < 2) return;
+    var points = [];
+    pathFrames.forEach(function (frame) {
+      applyJoints(frame.pos.map(function (q) { return q * 180 / Math.PI; }));
+      robot.updateMatrixWorld(true);
+      points.push(eeAxes.getWorldPosition(new THREE.Vector3()));
+    });
+    pathLine = new THREE.Line(new THREE.BufferGeometry().setFromPoints(points),
+      new THREE.LineBasicMaterial({color: themeColor("--cyan", 0x5ec8ff), transparent: true, opacity: 0.7}));
+    scene.add(pathLine);
+    applyJoints(lastQ);
+  }
+
+  window.addEventListener("station:theme", applyTheme);
+  var api = {
     init: init,
     setPose: setPose,
     setGripRange: setGripRange,
     resize: resize,
     setActive: setActive,
     fitCamera: fitCamera,
+    setPath: setPath,
   };
-
-  if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", init);
-  } else {
-    init();
+  return api;
   }
+
+  global.Arm3D = createArm3D("arm3dHost", "arm3dOverlay");
+  global.Arm3D.create = createArm3D;
+  // Navigation activates a view on demand; hidden workspaces allocate no GL resources.
 })(window);

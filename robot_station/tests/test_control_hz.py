@@ -66,7 +66,8 @@ class WaitSnapTests(unittest.TestCase):
         core.start()
         try:
             core.on_estop("test")
-            ack = core.handle({"t": "cart", "cid": "a", "dxyz": [0.01, 0, 0], "drpy": [0, 0, 0]})
+            ack = core.handle({"t": "cart", "cid": "a", "dxyz": [0.01, 0, 0], "drpy": [0, 0, 0],
+                               "session":core.snapshot()["connection"]["session"]})
             self.assertFalse(ack.get("ok"))
             self.assertIn("急停", core.snapshot().get("cmd_err") or "")
         finally:
@@ -147,6 +148,7 @@ class TickRateTests(unittest.TestCase):
             StationConfig(arm="sim", open_browser=False, control_hz=100, telemetry_hz=100)
         )
         core.start()
+        self.assertIsNone(core.on_power("a", True))
         try:
             err = core.on_arm_targets("a", [20.0, 40.0, 40.0, 0.0, 0.0, 0.0], 40.0, stream=True)
             self.assertIsNone(err, err)

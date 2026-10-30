@@ -26,11 +26,12 @@ arm_cfg: ""
 arm_port: ""
 arm_allow_motion: false
 arm_gripper_id: 7
+arm_connect_on_start: false # 真机默认等待网页中选择串口并点击连接；此项也不会自动使能。
 
 # USB 热插拔监视：只在设备签名变化时才去认硬件；默认关闭。
 # Windows 便携启动器（FAFUArmStation.exe / 启动真机.bat）和 Linux
 # AppRun / 启动真机.sh 会自动打开这两个开关。
-# 效果是"先插臂先认臂"：没插调试板时用仿真臂，插上后自动切真机（不自动使能）。
-# Linux 端口：留空=auto；也可写 /dev/fafu_debug_board（udev 软链接）。
+# 机械臂监视仅记录 USB 设备变化，不自动连接，也不切换真机/仿真。
+# Linux 端口可选 /dev/ttyUSB0 或 /dev/fafu_debug_board（udev 软链接）。
 arm_watch: false
 camera_watch: false

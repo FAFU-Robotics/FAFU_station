@@ -8,6 +8,8 @@
  *  - 100 Hz teleop traffic (arm stream / cart / teach / touch / rtt / ping) is
  *    never queued; it is stale by definition.
  *  - Discrete commands are queued for at most ttlMs, then cancelled.
+ *  - Manual position/home targets replace older pending manual targets.
+ *    Explicit waypoint paths and program steps retain their ordering.
  *  - Estop is special: enqueueing it cancels every other pending command and
  *    it is always flushed first, so a queued "home" can never run before it.
  */
@@ -26,7 +28,11 @@
     if (!obj || !obj.t) return false;
     var t = obj.t;
     if (t === "cart" || t === "teach" || t === "touch" || t === "rtt" || t === "ping") return true;
-    return t === "arm" && !!obj.stream;
+    return (t === "arm" || t === "cart_go") && !!obj.stream;
+  }
+
+  function isManualTarget(obj) {
+    return obj.t === "home" || obj.t === "cart_go" || (obj.t === "arm" && !obj.stream);
   }
 
   function create(opts) {
@@ -73,6 +79,14 @@
         });
         items.push({ obj: obj, at: at });
         return true;
+      }
+      if (isManualTarget(obj)) {
+        for (var i = items.length - 1; i >= 0; i -= 1) {
+          if (isManualTarget(items[i].obj)) {
+            var replaced = items.splice(i, 1)[0];
+            safeDrop(onDrop, replaced.obj, "已由新的手动目标替换");
+          }
+        }
       }
       items.push({ obj: obj, at: at });
       if (items.length > maxItems) {
