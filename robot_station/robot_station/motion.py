@@ -885,6 +885,16 @@ class MotionCore:
             return err
         self._enable_required = not bool(on)
         self._publish_connection("connected")
+        if on:
+            from robot_station.adapters.fafu_arm import ENABLE_UNCONFIRMED
+
+            if (self._cmd_err or "") == ENABLE_UNCONFIRMED:
+                self._set_cmd_err("")
+            if str(getattr(self.arm, "_writer_err", "") or "") == ENABLE_UNCONFIRMED:
+                try:
+                    self.arm._writer_err = ""
+                except Exception:
+                    pass
         self._note()
         return None
 

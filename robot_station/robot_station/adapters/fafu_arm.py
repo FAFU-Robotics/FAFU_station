@@ -137,6 +137,14 @@ STREAM_IDLE_S = 0.35
 # watchdog_ms. 150 ms was shorter than keyboard/IK hitches, so a stutter
 # at a raised J2 dropped the arm. Keep this well above one slow tick.
 SERVO_WATCHDOG_MS = 400
+# Position-mode reads can disagree for one sample. Confirm with a few
+# rereads, and do not motor_reset until those rereads still miss.
+MODE_CONFIRM_READS = 3
+MODE_CONFIRM_GAP_S = 0.05
+ENABLE_LOSS_HOLD_S = 0.5
+ENABLE_RETRY_GAP_S = 1.5
+ENABLE_UNCONFIRMED = "新连接尚未确认使能，请先使能"
+MOTION_NEEDS_ENABLE = "请先使能"
 CART_POSE_TOL_M = 0.004
 
 
@@ -326,6 +334,10 @@ def _install_gripper_offline_gate(controller_cls: type) -> type:
 
     def enable(self, *args: Any, **kwargs: Any) -> Any:
         _force_silent_gripper_offline(self)
+        # A latched station enable already owns the motors. servo_start calls
+        # enable() with the SDK default, which motor_resets on a flaky read.
+        if getattr(self, "_station_user_enabled", False):
+            kwargs["allow_motor_reset"] = False
         if callable(orig_enable):
             return orig_enable(self, *args, **kwargs)
         return None
@@ -990,54 +1002,81 @@ def switch_motors_to_position(
     *,
     allow_motor_reset: bool = True,
 ) -> None:
-    """Put only ``motor_ids`` into position mode. Never touches omitted axes."""
+    """Put only ``motor_ids`` into position mode. Never touches omitted axes.
+
+    Success and failure come from one read of every joint. A single sample
+    that is not position mode is reread before ``motor_reset``.
+    """
     ids = [int(m) for m in motor_ids]
     ht = getattr(robot, "_ht", None)
     if ht is None or not ids:
         return
     mode_pos = int(getattr(robot, "MODE_POSITION", 0x0A) or 0x0A)
 
-    def current_mode(mid: int) -> int | None:
+    def read_mode(mid: int) -> int | None:
         try:
-            s = ht.read_motor_state(int(mid), 0.2)
+            state = ht.read_motor_state(int(mid), 0.2)
         except Exception:
             return None
-        if s is None:
+        if state is None:
             return None
-        return int(getattr(s, "mode", 0) or 0)
+        return int(getattr(state, "mode", 0) or 0)
 
-    pending = [mid for mid in ids if current_mode(mid) != mode_pos]
+    def snapshot() -> dict[int, int | None]:
+        return {int(mid): read_mode(int(mid)) for mid in ids}
+
+    def confirm(focus: list[int]) -> tuple[list[int], dict[int, int | None]]:
+        """Reread until ``focus`` is in position mode, or the sample budget ends.
+
+        The returned miss list is exactly the joints that missed on the last
+        snapshot, so it cannot disagree with that snapshot.
+        """
+        last = snapshot()
+        missing = [int(mid) for mid in focus if last.get(int(mid)) != mode_pos]
+        for attempt in range(1, MODE_CONFIRM_READS):
+            if not missing:
+                break
+            time.sleep(MODE_CONFIRM_GAP_S)
+            last = snapshot()
+            missing = [int(mid) for mid in focus if last.get(int(mid)) != mode_pos]
+            if attempt + 1 == MODE_CONFIRM_READS:
+                break
+        return missing, last
+
+    def classify(last: dict[int, int | None]) -> tuple[list[int], list[int]]:
+        ok = [int(mid) for mid in ids if last.get(int(mid)) == mode_pos]
+        missed = [int(mid) for mid in ids if int(mid) not in ok]
+        return ok, missed
+
+    pending = [int(mid) for mid in ids if read_mode(int(mid)) != mode_pos]
     if not pending:
         return
-    failed: list[int] = []
     for mid in pending:
-        s = None
         try:
             if hasattr(ht, "set_motor_mode"):
-                s = ht.set_motor_mode(int(mid), mode_pos)
+                ht.set_motor_mode(int(mid), mode_pos)
         except Exception:
-            s = None
-        got = int(getattr(s, "mode", 0) or 0) if s is not None else current_mode(mid)
-        if got != mode_pos:
-            failed.append(mid)
-    if failed and allow_motor_reset and hasattr(ht, "motor_reset"):
+            pass
+    failed, last = confirm(pending)
+    if not failed:
+        return
+    if allow_motor_reset and hasattr(ht, "motor_reset"):
         for mid in failed:
             try:
                 ht.motor_reset(int(mid))
             except Exception:
                 logger.warning("motor_reset(%s) 失败", mid)
         time.sleep(1.0)
-        still: list[int] = []
         for mid in failed:
             try:
                 if hasattr(ht, "set_motor_mode"):
                     ht.set_motor_mode(int(mid), mode_pos)
             except Exception:
                 pass
-            if current_mode(mid) != mode_pos:
-                still.append(mid)
-        failed = still
-    ok = [mid for mid in ids if current_mode(mid) == mode_pos]
+        failed, last = confirm(failed)
+        if not failed:
+            return
+    ok, failed = classify(last)
     if not ok:
         raise RuntimeError(f"在线轴 {failed or ids} 未能切入位置环（已跳过离线电机）")
     if failed:
@@ -1652,6 +1691,10 @@ class FafuArm(ArmAdapter):
         self._brake_applied = False
         self._power_off_latched = False
         self._connection_enable_pending = False
+        self._user_enabled = False
+        self._enabled_lost_since: float | None = None
+        self._position_loss_noted = False
+        self._enable_retry_mono = 0.0
         self._power_off_requested = False
         self._dyn_ready = False
         self._writer_err = ""
@@ -1792,7 +1835,7 @@ class FafuArm(ArmAdapter):
         if not self.allow_motion:
             return "真臂当前只读（arm_allow_motion=false），不会下发运动或使能"
         if self._connection_enable_pending and not allow_disabled:
-            return "新连接尚未确认使能，请先使能"
+            return ENABLE_UNCONFIRMED
         if self._power_off_latched and not allow_disabled:
             return "机械臂已去使能，请先使能"
         return None
@@ -1888,6 +1931,8 @@ class FafuArm(ArmAdapter):
                 self._brake_applied = False
                 self._power_off_latched = False
                 self._connection_enable_pending = False
+                self._set_user_enabled(False)
+                self._enable_retry_mono = 0.0
                 self._power_off_requested = False
                 self._offline_ids = list(missing)
             reprobe_ids = list(self._full_joint_ids)
@@ -1922,6 +1967,7 @@ class FafuArm(ArmAdapter):
         """Require an explicit Enable without releasing an already supported arm."""
         with self._lock:
             self._connection_enable_pending = True
+            self._set_user_enabled(False)
             self._power_off_requested = False
             self._servo_intent = False
             self._pending_grip = None
@@ -2160,6 +2206,7 @@ class FafuArm(ArmAdapter):
         self._wait_servo_idle(1.0)
         self._end_servo()
         with self._lock:
+            self._set_user_enabled(False)
             robot = self._robot
             self._robot = None
             self._offline_ids = []
@@ -2196,6 +2243,7 @@ class FafuArm(ArmAdapter):
             self._link_error = "USB/总线已断开"
         self._servo_intent = False
         self._pending_grip = None
+        self._set_user_enabled(False)
         self._servoing = False
         self._writer_busy = False
         try:
@@ -2674,7 +2722,7 @@ class FafuArm(ArmAdapter):
         if len(start) < self.n:
             return "轨迹关节数不足"
         self._abort_replay(hold=False)
-        err = self._ensure_enabled()
+        err = self._authorize_motion()
         if err:
             return err
         self._replay_frames = frames
@@ -3030,9 +3078,9 @@ class FafuArm(ArmAdapter):
             except Exception:
                 pass
 
-    def _ensure_enabled(self) -> str | None:
+    def _ensure_enabled(self, *, allow_motor_reset: bool = True) -> str | None:
         if self._connection_enable_pending:
-            return "新连接尚未确认使能，请先使能"
+            return ENABLE_UNCONFIRMED
         if self._power_off_latched:
             return "机械臂已去使能，请先使能"
         robot = self._robot
@@ -3049,6 +3097,12 @@ class FafuArm(ArmAdapter):
         # it only servo_j. is_enabled() may also block on cache-miss reads
         # long enough to trip the firmware watchdog.
         if self._servoing or self._sdk_servoing(robot):
+            return None
+        # The 100 Hz writer must not motor_reset, and must not repeat a mode
+        # switch on every tick. An explicit Enable is the only reset path.
+        if self._user_enabled and not allow_motor_reset:
+            return None
+        if not allow_motor_reset and time.monotonic() < self._enable_retry_mono:
             return None
         _force_silent_gripper_offline(robot)
         extra = list(self._offline_ids)
@@ -3070,15 +3124,54 @@ class FafuArm(ArmAdapter):
         # iterates missing IDs, latches FAULT, and blocks the whole arm.
         if self._present_joints_enabled(robot) or self._flag_enabled(robot):
             return None
+        if not allow_motor_reset:
+            self._enable_retry_mono = time.monotonic() + ENABLE_RETRY_GAP_S
         try:
             _enable_present_motors(
                 robot,
                 gripper_id=self.gripper_id,
                 extra=extra,
+                allow_motor_reset=allow_motor_reset,
             )
         except Exception as exc:
             return self._enable_failure(robot, exc)
         return None
+
+    def _publish_enable_authority(self) -> None:
+        robot = self._robot
+        if robot is None:
+            return
+        try:
+            robot._station_user_enabled = bool(self._user_enabled)
+        except Exception:
+            pass
+
+    def _set_user_enabled(self, enabled: bool) -> None:
+        self._user_enabled = bool(enabled)
+        if not enabled:
+            self._enabled_lost_since = None
+            self._position_loss_noted = False
+        self._publish_enable_authority()
+
+    def _authorize_motion(self) -> str | None:
+        """Let an already authorized arm move without scanning or resetting motors.
+
+        Live serial reads block the command thread and starve the 100 Hz servo
+        watchdog. Only ``set_powered(True)`` may do that scan. A fake controller
+        has no watchdog, so it keeps the in-memory enable path.
+        """
+        blocked = self.refuse_motion()
+        if blocked:
+            return blocked
+        if self._user_enabled or self._servoing:
+            return None
+        robot = self._robot
+        # Fake controllers have no servo watchdog. If a test already enabled
+        # the in-memory plant, let the motion proceed. A cold fake still has
+        # to be enabled explicitly, same as the real arm.
+        if robot is not None and getattr(robot, "_ht", None) is None and self._flag_enabled(robot):
+            return None
+        return MOTION_NEEDS_ENABLE
 
     def _enable_failure(self, robot: Any, exc: BaseException) -> str | None:
         if self._present_joints_enabled(robot):
@@ -3253,7 +3346,7 @@ class FafuArm(ArmAdapter):
                 logger.warning("SDK 仍为 ESTOP，尝试保持姿态前先 enable")
             else:
                 return
-        err = self._ensure_enabled()
+        err = self._ensure_enabled(allow_motor_reset=False)
         if err:
             logger.warning("冻结当前角失败: %s", err)
             return
@@ -3545,7 +3638,7 @@ class FafuArm(ArmAdapter):
             return "servo 未结束，无法进入重力/阻抗"
         if not self._stop_gravity(join=True):
             return "上一轮重力环未退出"
-        err = self._ensure_enabled()
+        err = self._ensure_enabled(allow_motor_reset=False)
         if err:
             return err
         self._grav_stop.clear()
@@ -3721,6 +3814,7 @@ class FafuArm(ArmAdapter):
 
     def _start_servo_session(self, robot: Any, opts: Any) -> str | None:
         """Open SDK servo. A bad gripper must not leave _servoing false."""
+        self._publish_enable_authority()
         self._drop_gripper_from_servo(robot)
         extra = list(self._offline_ids)
         if getattr(robot, "_ht", None) is not None:
@@ -3821,7 +3915,24 @@ class FafuArm(ArmAdapter):
             self._servoing = False
         if self._servo_intent and self._stream_q_rad is not None:
             self._freeze_needed = False
-            err = self._ensure_enabled()
+            if (
+                self._user_enabled
+                and self._position_loss_noted
+                and not self._servoing
+                and not self._sdk_servoing(robot)
+                and time.monotonic() >= self._enable_retry_mono
+            ):
+                self._enable_retry_mono = time.monotonic() + ENABLE_RETRY_GAP_S
+                try:
+                    _enable_present_motors(
+                        robot,
+                        gripper_id=self.gripper_id,
+                        extra=list(self._offline_ids),
+                        allow_motor_reset=False,
+                    )
+                except Exception:
+                    logger.warning("位置环恢复失败", exc_info=True)
+            err = self._ensure_enabled(allow_motor_reset=False)
             if err and (
                 self._present_joints_enabled(robot) or _vendor_partial_axis_text(err)
             ):
@@ -3830,14 +3941,14 @@ class FafuArm(ArmAdapter):
                 err = None
             if err:
                 logger.warning("servo 使能失败: %s", err)
-                self._writer_err = err
+                self._writer_err = "" if err == ENABLE_UNCONFIRMED else err
                 name = _robot_state_name(robot)
                 if name in ("dead", "disconnected"):
                     self._servo_intent = False
                     self._home_path = []
                     self._abort_replay(hold=False)
                     self._freeze_needed = True
-            else:
+            elif self._user_enabled or self._servoing or self._present_joints_enabled(robot):
                 if not self._servoing:
                     opts = self._make_servo_opts()
                     err_start = self._start_servo_session(robot, opts)
@@ -3868,16 +3979,24 @@ class FafuArm(ArmAdapter):
                     except Exception as exc:
                         logger.exception("servo_j 失败")
                         self._writer_err = f"servo_j 失败: {exc}"
-                        ended = self._end_servo()
-                        self._hold_stream_pose()
-                        if not ended:
-                            self._freeze_needed = True
+                        if not self._user_enabled:
+                            ended = self._end_servo()
+                            self._hold_stream_pose()
+                            if not ended:
+                                self._freeze_needed = True
                     else:
                         if sent is False:
                             reason = getattr(robot, "_servo_aborted_reason", None) or "servo_j 未发送"
                             logger.warning("servo_j 拒绝: %s", reason)
                             self._writer_err = str(reason)
-                            if self._home_path or replaying:
+                            if self._user_enabled:
+                                # One rejected frame must not servo_end: that
+                                # blocks the writer and drops position mode.
+                                # If the SDK session is already gone, the next
+                                # tick opens a new one without motor_reset.
+                                if not self._sdk_servoing(robot):
+                                    self._servoing = False
+                            elif self._home_path or replaying:
                                 pass
                             else:
                                 ended = self._end_servo()
@@ -3913,7 +4032,7 @@ class FafuArm(ArmAdapter):
                 if not (self._replay_frames or self._replay_t0 is not None):
                     self._writer_err = offline
                 return
-            err = self._ensure_enabled()
+            err = self._ensure_enabled(allow_motor_reset=False)
             if err:
                 logger.warning("夹爪使能失败: %s", err)
                 self._writer_err = f"夹爪: {err}"
@@ -4013,7 +4132,7 @@ class FafuArm(ArmAdapter):
         # Sim used to servo_end (~120 ms) then move_j. That extra wait, plus
         # independent-axis crawl, made the twin lag the live arm. Same 100 Hz
         # synchronized servo path as hardware.
-        err = self._ensure_enabled()
+        err = self._authorize_motion()
         if err:
             return err
         now = self._measured_deg()
@@ -4039,7 +4158,7 @@ class FafuArm(ArmAdapter):
         return None
 
     def set_gripper_open(self, open_: bool, effort: int | None = None) -> str | None:
-        blocked = self.refuse_motion()
+        blocked = self._authorize_motion()
         if blocked:
             logger.warning("忽略夹爪: %s", blocked)
             return blocked
@@ -4058,7 +4177,7 @@ class FafuArm(ArmAdapter):
         return None
 
     def set_gripper_deg(self, deg: float, effort: int | None = None) -> str | None:
-        blocked = self.refuse_motion()
+        blocked = self._authorize_motion()
         if blocked:
             return blocked
         if self._float_writer_active():
@@ -4145,7 +4264,7 @@ class FafuArm(ArmAdapter):
         self._abort_replay(hold=False)
         self._hold_latched = False
         self._parked = False
-        err = self._ensure_enabled()
+        err = self._authorize_motion()
         if err:
             return err
         spd = min(float(speed_deg_s), HOME_MAX_DEG_S)
@@ -4204,7 +4323,7 @@ class FafuArm(ArmAdapter):
         if name in ("Gravity", "Gra+Fri"):
             if self._use_sdk_float():
                 try:
-                    err = self._ensure_enabled()
+                    err = self._ensure_enabled(allow_motor_reset=False)
                     if err:
                         self._ctrl_mode = "Position"
                         return err
@@ -4494,7 +4613,7 @@ class FafuArm(ArmAdapter):
         if self._float_writer_active() or self._ctrl_mode in ("Gravity", "Gra+Fri"):
             return "重力/阻抗环运行中请先切回 Position 再跑路点"
         self._abort_replay(hold=False)
-        err = self._ensure_enabled()
+        err = self._authorize_motion()
         if err:
             return err
         clipped = [self._clip_deg(q) for q in waypoints_deg]
@@ -4536,6 +4655,7 @@ class FafuArm(ArmAdapter):
         """Engage SDK brake (MODE_BRAKE). Do not call SDK emergency_stop (MODE_STOP / free-spin)."""
         fresh = not self._brake_latched
         self._brake_latched = True
+        self._set_user_enabled(False)
         self._stop_recording()
         self._rec_entered_float = False
         self._abort_replay(hold=False)
@@ -4588,9 +4708,15 @@ class FafuArm(ArmAdapter):
             except Exception:
                 logger.exception("SDK resume 失败")
         try:
-            self._ensure_enabled()
+            err = self._ensure_enabled(allow_motor_reset=False)
         except Exception:
             logger.exception("急停解除后使能失败")
+            err = "急停解除后使能失败"
+        if err:
+            logger.warning("急停解除后使能失败: %s", err)
+            self._set_user_enabled(False)
+        else:
+            self._set_user_enabled(True)
         self._adopt_measured_cmd()
         self._hold_latched = True
         self._parked = True
@@ -4606,6 +4732,9 @@ class FafuArm(ArmAdapter):
         if on:
             if self._power_off_requested:
                 return "正在去使能，请等待设备状态确认"
+            if self._user_enabled and not self._power_off_latched and not self._connection_enable_pending:
+                self._publish_enable_authority()
+                return None
             was_off = self._power_off_latched
             was_pending = self._connection_enable_pending
             self._connection_enable_pending = False
@@ -4630,7 +4759,9 @@ class FafuArm(ArmAdapter):
             if err:
                 self._power_off_latched = was_off
                 self._connection_enable_pending = was_pending
+                self._set_user_enabled(False)
                 return err
+            self._set_user_enabled(True)
             self._writer_err = ""
             self._adopt_measured_cmd()
             # Cold enable used to leave no servo session. 发送位置 / follow
@@ -4679,6 +4810,7 @@ class FafuArm(ArmAdapter):
                 failed.append(self.gripper_id)
             if not ids or absent or failed:
                 raise RuntimeError(f"无法确认 STOP 模式（无反馈：{absent}，未停止：{failed}）")
+            self._set_user_enabled(False)
             self._ctrl_mode = "Position"
             self._servo_cmd_rad = None
             self._stream_q_rad = None
@@ -4721,6 +4853,33 @@ class FafuArm(ArmAdapter):
             else:
                 out.append(math.radians(motor_position_to_deg(float(pos))))
         return out
+
+    def _apply_enable_latch(self, raw: bool) -> bool:
+        """Report a confirmed enable until the user disables, stops, or disconnects.
+
+        Mode samples flap while the servo watchdog is briefly starved. That
+        must not revoke the enable or the lamp follows the flap.
+        """
+        if not self._user_enabled:
+            self._enabled_lost_since = None
+            self._position_loss_noted = False
+            return raw
+        if raw:
+            self._enabled_lost_since = None
+            self._position_loss_noted = False
+            return True
+        now = time.monotonic()
+        if self._enabled_lost_since is None:
+            self._enabled_lost_since = now
+        elif (
+            not self._position_loss_noted
+            and now - self._enabled_lost_since >= ENABLE_LOSS_HOLD_S
+        ):
+            self._position_loss_noted = True
+            logger.warning("位置环持续丢失，保持使能授权，写者将不复位地尝试恢复")
+            if not self._writer_err:
+                self._writer_err = "位置环丢失，已使能仍保留；正在尝试恢复位置模式"
+        return True
 
     def _joints_enabled(self, states: dict, ids: list[int], robot: Any) -> bool:
         seen = 0
@@ -4915,6 +5074,7 @@ class FafuArm(ArmAdapter):
                 ok = [False] * self.n
                 enabled = False
                 moving = False
+                self._set_user_enabled(False)
             else:
                 extra["link_err"] = ""
                 if self._q_fb_err:
@@ -4926,6 +5086,7 @@ class FafuArm(ArmAdapter):
                     enabled = self._joints_enabled(states, ids, robot)
                 else:
                     enabled = self._flag_enabled(robot)
+                enabled = self._apply_enable_latch(enabled)
             tgt = list(self._target_deg) if self.allow_motion else list(q_deg)
             extra_tgt = getattr(robot, "_tgt_rad", None)
             # Fake servo_j exposes the next interpolated setpoint, not the

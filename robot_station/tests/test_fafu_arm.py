@@ -498,5 +498,214 @@ class FafuArmTests(unittest.TestCase):
         self.assertTrue(all(not m.get("online") for m in snap.motors if m.get("name") != "夹爪"))
 
 
+class EnableStabilityTests(unittest.TestCase):
+    def test_late_position_read_does_not_reset(self) -> None:
+        from unittest.mock import patch
+
+        from robot_station.adapters.fafu_arm import switch_motors_to_position
+
+        class Motor:
+            def __init__(self, mode: int) -> None:
+                self.mode = mode
+
+        reads = {"n": 0}
+
+        class Ht:
+            resets: list[int] = []
+
+            def read_motor_state(self, _mid: int, _timeout: float) -> Motor:
+                reads["n"] += 1
+                return Motor(0x0A if reads["n"] >= 3 else 0)
+
+            def set_motor_mode(self, _mid: int, _mode: int) -> Motor:
+                return Motor(0)
+
+            def motor_reset(self, mid: int) -> None:
+                self.resets.append(int(mid))
+
+        ht = Ht()
+        robot = type("Robot", (), {"MODE_POSITION": 0x0A, "_ht": ht})()
+        with patch("robot_station.adapters.fafu_arm.time.sleep"):
+            switch_motors_to_position(robot, [1])
+        self.assertEqual(ht.resets, [])
+
+    def test_persistent_miss_resets_once_unless_writer_forbids_it(self) -> None:
+        from unittest.mock import patch
+
+        from robot_station.adapters.fafu_arm import switch_motors_to_position
+
+        class Motor:
+            def __init__(self) -> None:
+                self.mode = 0
+
+        class Ht:
+            def __init__(self) -> None:
+                self.resets: list[int] = []
+
+            def read_motor_state(self, _mid: int, _timeout: float) -> Motor:
+                return Motor()
+
+            def set_motor_mode(self, _mid: int, _mode: int) -> Motor:
+                return Motor()
+
+            def motor_reset(self, mid: int) -> None:
+                self.resets.append(int(mid))
+
+        robot = type("Robot", (), {"MODE_POSITION": 0x0A})()
+        with patch("robot_station.adapters.fafu_arm.time.sleep"):
+            ht = Ht()
+            robot._ht = ht
+            with self.assertRaises(RuntimeError) as raised:
+                switch_motors_to_position(robot, [1], allow_motor_reset=True)
+            self.assertEqual(ht.resets, [1])
+            self.assertIn("未能切入位置环", str(raised.exception))
+            self.assertNotIn("新连接尚未确认使能", str(raised.exception))
+
+            ht = Ht()
+            robot._ht = ht
+            with self.assertRaises(RuntimeError) as raised:
+                switch_motors_to_position(robot, [1], allow_motor_reset=False)
+            self.assertEqual(ht.resets, [])
+            self.assertIn("1", str(raised.exception))
+
+    def test_latched_enable_ignores_one_bad_mode_sample(self) -> None:
+        from unittest.mock import patch
+
+        from robot_station.adapters.fafu_sim import FakeFafuController, FakeMotorState
+
+        arm = FafuArm(allow_motion=True, controller_cls=FakeFafuController)
+        arm.start()
+        self.addCleanup(arm.stop)
+        self.assertIsNone(arm.set_powered(True))
+        self.assertTrue(arm._user_enabled)
+
+        def states(*_args: object, **_kwargs: object) -> dict[int, FakeMotorState]:
+            return {
+                i: FakeMotorState(mode=0 if i == 1 else 0x0A, position=0.0)
+                for i in range(1, 7)
+            }
+
+        arm._robot.get_motor_states = states
+        self.assertTrue(arm.poll().enabled)
+        with patch("robot_station.adapters.fafu_arm._enable_present_motors") as enable:
+            self.assertIsNone(arm._ensure_enabled(allow_motor_reset=False))
+            enable.assert_not_called()
+
+    def test_confirmed_enable_clears_gate_error(self) -> None:
+        core = MotionCore(StationConfig(arm="sim", open_browser=False))
+        core.arm.start()
+        self.addCleanup(core.arm.stop)
+        core.add_client("operator")
+        core._cmd_err = "新连接尚未确认使能，请先使能"
+        core.arm._writer_err = "新连接尚未确认使能，请先使能"
+        core.arm._connection_enable_pending = True
+        self.assertIsNone(core.on_power("operator", True))
+        self.assertEqual(core.snapshot()["cmd_err"], "")
+        self.assertEqual(core.arm._writer_err, "")
+        self.assertFalse(core.arm._connection_enable_pending)
+        self.assertTrue(core.arm.poll().enabled)
+
+    def test_latched_home_does_not_scan_or_reset(self) -> None:
+        arm = FafuArm(allow_motion=True, required=False)
+        bus = type("Bus", (), {})()
+        bus.reads = 0
+        bus.resets = 0
+
+        def read_motor_state(*_args: object, **_kwargs: object) -> None:
+            bus.reads += 1
+            raise AssertionError("home must not read motor mode")
+
+        def motor_reset(*_args: object, **_kwargs: object) -> None:
+            bus.resets += 1
+            raise AssertionError("home must not reset motors")
+
+        bus.read_motor_state = read_motor_state
+        bus.motor_reset = motor_reset
+        arm._robot = type(
+            "Robot",
+            (),
+            {
+                "_ht": bus,
+                "get_joint_values": lambda self, prefer_cache=True: [0.2, 0.3, 0.1, 0.0, 0.0, 0.0],
+            },
+        )()
+        arm._user_enabled = True
+        self.assertIsNone(arm.home(20.0))
+        self.assertTrue(arm._home_path)
+        self.assertEqual(bus.reads, 0)
+        self.assertEqual(bus.resets, 0)
+
+    def test_mode_loss_does_not_drop_enable_authority(self) -> None:
+        from robot_station.adapters.fafu_sim import FakeFafuController, FakeMotorState
+
+        arm = FafuArm(allow_motion=True, controller_cls=FakeFafuController)
+        arm.start()
+        self.addCleanup(arm.stop)
+        self.assertIsNone(arm.set_powered(True))
+        arm._robot.get_motor_states = lambda *_a, **_k: {
+            i: FakeMotorState(mode=0, position=0.0) for i in range(1, 7)
+        }
+        arm._enabled_lost_since = 0.0
+        for _ in range(6):
+            self.assertTrue(arm.poll().enabled)
+        self.assertTrue(arm._user_enabled)
+
+    def test_rejected_servo_frame_keeps_session_while_enabled(self) -> None:
+        from robot_station.adapters.fafu_sim import FakeFafuController
+
+        arm = FafuArm(allow_motion=True, controller_cls=FakeFafuController)
+        arm.start()
+        self.addCleanup(arm.stop)
+        self.assertIsNone(arm.set_powered(True))
+        fake = arm._robot
+        fake.servo_j = lambda *_a, **_k: False
+        fake.is_servoing = True
+        ended: list[str] = []
+        fake.servo_end = lambda *_a, **_k: ended.append("end")
+        arm._servoing = True
+        arm._servo_intent = True
+        arm._parked = False
+        arm._stream_rx_mono = __import__("time").monotonic()
+        arm._stream_q_rad = list(fake.q_rad)
+        arm._servo_cmd_rad = list(fake.q_rad)
+        arm.servo(0.01)
+        self.assertEqual(ended, [])
+        self.assertTrue(arm._servoing)
+
+    def test_disable_estop_and_stop_clear_latch(self) -> None:
+        from robot_station.adapters.fafu_sim import FakeFafuController
+
+        arm = FafuArm(allow_motion=True, controller_cls=FakeFafuController)
+        arm.start()
+        self.addCleanup(arm.stop)
+        self.assertIsNone(arm.set_powered(True))
+        arm.emergency_stop()
+        self.assertFalse(arm._user_enabled)
+        self.assertIsNone(arm.set_powered(True))
+        self.assertTrue(arm._user_enabled)
+        self.assertIsNone(arm.set_powered(False))
+        arm.servo(0.01)
+        self.assertFalse(arm._user_enabled)
+        self.assertIsNone(arm.set_powered(True))
+        arm.stop()
+        self.assertFalse(arm._user_enabled)
+
+    def test_sim_motion_requires_enable_and_keeps_working_afterward(self) -> None:
+        from robot_station.adapters.fafu_sim import FakeFafuController
+
+        arm = FafuArm(allow_motion=True, controller_cls=FakeFafuController)
+        arm.start()
+        self.addCleanup(arm.stop)
+        self.assertIn("请先使能", arm.home(20.0) or "")
+        self.assertIn("请先使能", arm.apply_targets([12, 40, 40, 0, 0, 0], 20.0) or "")
+        self.assertIn("请先使能", arm.run_path([[12, 40, 40, 0, 0, 0]], 20.0) or "")
+        self.assertIn("请先使能", arm.set_gripper_open(False) or "")
+        self.assertIsNone(arm.set_powered(True))
+        self.assertIsNone(arm.home(20.0))
+        self.assertTrue(arm._home_path)
+        self.assertIsNone(arm.run_path([[12, 40, 40, 0, 0, 0]], 20.0))
+        self.assertIsNone(arm.set_gripper_open(False))
+
+
 if __name__ == "__main__":
     unittest.main()
