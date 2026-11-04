@@ -79,6 +79,7 @@ from robot_station.traj import (
     TrajectoryWriter,
     clip_replay_rate,
     delete_recording,
+    gripper_motion,
     rename_recording,
     load_traj,
     make_traj_path,
@@ -1727,6 +1728,7 @@ class FafuArm(ArmAdapter):
         self._replay_t0: float | None = None
         self._replay_rate = 1.0
         self._replay_settle_left = 0.0
+        self._replay_drive_gripper = False
         self._rec_entered_float = False
         self._traj_name = ""
         self._grav_urdf_name = ""
@@ -2577,6 +2579,7 @@ class FafuArm(ArmAdapter):
         self._replay_t0 = None
         self._replay_rate = 1.0
         self._replay_settle_left = 0.0
+        self._replay_drive_gripper = False
         if was:
             self._home_path = []
             if hold:
@@ -2617,9 +2620,10 @@ class FafuArm(ArmAdapter):
             end = [math.degrees(x) for x in prefix[-1]["pos"]]
             if max(abs(a-b) for a, b in zip(self._measured_deg(), end)) > 3:
                 return "当前位置与轨迹末点相差超过 3°，请先前往末点再续录"
-            gpos = prefix[-1].get("gpos")
-            if gpos is not None and abs(float(self.poll().gripper_deg or 0) - math.degrees(gpos)) > 3:
-                return "夹爪与轨迹末点相差超过 3°，请先在手动控制中调整夹爪再续录"
+            if gripper_motion(prefix):
+                gpos = prefix[-1].get("gpos")
+                if gpos is not None and abs(float(self.poll().gripper_deg or 0) - math.degrees(gpos)) > 3:
+                    return "夹爪与轨迹末点相差超过 3°，请先在手动控制中调整夹爪再续录"
             name = name or Path(append_from).stem + "_续录"
         kind = (teach or "").strip().lower()
         self._rec_entered_float = False
@@ -2729,6 +2733,7 @@ class FafuArm(ArmAdapter):
         self._replay_t0 = None
         self._replay_rate = clip_replay_rate(rate)
         self._replay_settle_left = REPLAY_SETTLE_S
+        self._replay_drive_gripper = gripper_motion(frames)
         self._traj_name = file_path.name
         now = self._measured_deg()
         start_deg = [math.degrees(float(x)) for x in start[: self.n]]
@@ -2821,15 +2826,19 @@ class FafuArm(ArmAdapter):
         self._parked = False
         self._hold_latched = False
         self._note_stream()
-        gpos = sample.get("gpos")
-        if gpos is not None:
-            deg = math.degrees(float(gpos))
-            if abs(deg - float(self._grip_cmd_deg)) > 2.0:
-                robot = self._robot
-                offline = robot is not None and self._gripper_offline_reason(robot)
-                if not offline:
-                    self._pending_grip = ("deg", deg)
-                self._grip_cmd_deg = deg
+        # A flat gripper channel is not an action. Do not compare its absolute
+        # angle with the command cache: that cache changes when a program step
+        # opens or closes the gripper, and the same file would then move it.
+        if self._replay_drive_gripper:
+            gpos = sample.get("gpos")
+            if gpos is not None:
+                deg = math.degrees(float(gpos))
+                if abs(deg - float(self._grip_cmd_deg)) > 2.0:
+                    robot = self._robot
+                    offline = robot is not None and self._gripper_offline_reason(robot)
+                    if not offline:
+                        self._pending_grip = ("deg", deg)
+                    self._grip_cmd_deg = deg
         if elapsed >= last_t:
             self._replay_frames = []
             self._replay_t0 = None
@@ -3741,6 +3750,30 @@ class FafuArm(ArmAdapter):
         except Exception:
             logger.exception("重力环异常退出后冻结姿态失败")
         self._writer_err = f"重力环结束: {err}"
+
+    def park_joint_path(self) -> None:
+        """Stop a timed joint path on the command already sent.
+
+        Replacing that command with feedback makes one reverse velocity step.
+        The position loop then loses the torque that was holding the arm, and
+        gravity drops it before the next pose can catch it. A simulator path
+        that never published a servo command still freezes the plant.
+        """
+        following = bool(self._home_path)
+        parked_on_command = bool(self._parked and self._servo_intent and self._servo_cmd_rad)
+        cmd = list(self._servo_cmd_rad) if self._servo_cmd_rad else None
+        self._home_path = []
+        if not cmd or not (following or parked_on_command):
+            self.hold(abort_path=True)
+            return
+        self._servo_cmd_rad = cmd
+        self._stream_q_rad = list(cmd)
+        self._target_deg = [math.degrees(float(x)) for x in cmd[: self.n]]
+        self._servo_intent = True
+        self._parked = True
+        self._hold_latched = True
+        self._freeze_needed = False
+        self._note_stream()
 
     def hold(self, *, abort_path: bool = False) -> None:
         if not self.allow_motion or self._robot is None:

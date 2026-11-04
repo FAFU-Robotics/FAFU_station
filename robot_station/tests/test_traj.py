@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import tempfile
 import time
@@ -13,6 +14,7 @@ from robot_station.traj import (
     TrajectoryWriter,
     clip_replay_rate,
     delete_recording,
+    gripper_motion,
     rename_recording,
     load_traj,
     make_traj_path,
@@ -68,6 +70,16 @@ class TrajFileTests(unittest.TestCase):
             header, frames = load_traj(path)
             self.assertIsNone(header)
             self.assertEqual(len(frames), 2)
+
+    def test_gripper_motion_ignores_flat_and_missing_channels(self) -> None:
+        flat = [{"t": 0.0, "gpos": 1.3}, {"t": 0.2, "gpos": 1.3}]
+        self.assertFalse(gripper_motion(flat))
+        missing = [{"t": 0.0, "pos": [0.0] * 6}, {"t": 0.2, "gpos": None}]
+        self.assertFalse(gripper_motion(missing))
+        barely = [{"t": 0.0, "gpos": 0.0}, {"t": 0.2, "gpos": math.radians(2.0)}]
+        self.assertFalse(gripper_motion(barely))
+        moved = [{"t": 0.0, "gpos": math.radians(75.0)}, {"t": 0.2, "gpos": math.radians(8.0)}]
+        self.assertTrue(gripper_motion(moved))
 
     def test_prepare_playback_resamples_and_smooths(self) -> None:
         samples = []

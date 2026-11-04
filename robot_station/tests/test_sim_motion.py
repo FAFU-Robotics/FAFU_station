@@ -1573,6 +1573,89 @@ class TrajMotionTests(unittest.TestCase):
             finally:
                 arm.stop()
 
+    def _write_grip_file(self, directory: Path, name: str, joints: list[float], grips: list[float]) -> Path:
+        from robot_station.traj import TrajectoryWriter
+
+        path = directory / name
+        writer = TrajectoryWriter(path, teach="soft", mode="Position", n=6)
+        for i, grip in enumerate(grips):
+            writer.log(joints, [0.0] * 6, grip, 0.0)
+            if i + 1 < len(grips):
+                time.sleep(0.012)
+        writer.close()
+        return path
+
+    def _pump_arm(self, arm: FafuArm, seconds: float) -> None:
+        ticks = max(1, int(seconds / 0.01))
+        for _ in range(ticks):
+            arm.servo(0.01)
+            time.sleep(0.01)
+
+    def test_flat_gripper_channel_does_not_open_after_close(self) -> None:
+        from tests.test_traj import recordings_tmpdir
+
+        with recordings_tmpdir() as tmp:
+            arm = FafuArm(allow_motion=True, controller_cls=FakeFafuController, required=True)
+            arm.start()
+            try:
+                fake = FakeFafuController.last
+                assert fake is not None
+                fake.enable()
+                self.assertIsNone(arm.set_gripper_open(False))
+                self._pump_arm(arm, 0.05)
+                closed = float(arm.gripper_limits[0])
+                open_rad = math.radians(float(arm.gripper_limits[1]))
+                self.assertAlmostEqual(arm._grip_cmd_deg, closed)
+                path = self._write_grip_file(tmp, "flat_open.jsonl", list(fake.q_rad), [open_rad] * 12)
+                # The file's constant open angle is not a gripper action, so continuing
+                # the recording must not demand that the closed gripper match it.
+                self.assertIsNone(arm.record_start(append_from=path.name, teach="soft"))
+                self.assertIsNone(arm.record_stop())
+                fake.calls.clear()
+                self.assertIsNone(arm.replay_start(str(path), 1.0, 80.0))
+                self.assertFalse(arm._replay_drive_gripper)
+                self._pump_arm(arm, 0.8)
+                self.assertAlmostEqual(arm._grip_cmd_deg, closed)
+                self.assertFalse(fake.gripper_open)
+                self.assertNotIn("open_gripper", fake.calls)
+                self.assertNotIn("gripper_control", fake.calls)
+                self._pump_arm(arm, 0.6)
+                self.assertFalse(arm._replay_frames)
+                fake.calls.clear()
+                self.assertIsNone(arm.set_gripper_open(False))
+                self._pump_arm(arm, 0.05)
+                fake.calls.clear()
+                self.assertIsNone(arm.replay_start(str(path), 1.0, 80.0))
+                self._pump_arm(arm, 0.8)
+                self.assertAlmostEqual(arm._grip_cmd_deg, closed)
+                self.assertFalse(fake.gripper_open)
+                self.assertNotIn("open_gripper", fake.calls)
+                self.assertNotIn("gripper_control", fake.calls)
+            finally:
+                arm.stop()
+
+    def test_moving_gripper_channel_still_follows_recorded_angle(self) -> None:
+        from tests.test_traj import recordings_tmpdir
+
+        with recordings_tmpdir() as tmp:
+            arm = FafuArm(allow_motion=True, controller_cls=FakeFafuController, required=True)
+            arm.start()
+            try:
+                fake = FakeFafuController.last
+                assert fake is not None
+                fake.enable()
+                closed = float(arm.gripper_limits[0])
+                opened = float(arm.gripper_limits[1])
+                grips = [math.radians(opened)] * 4 + [math.radians(closed)] * 28
+                path = self._write_grip_file(tmp, "grip_closes.jsonl", list(fake.q_rad), grips)
+                self.assertIsNone(arm.replay_start(str(path), 1.0, 80.0))
+                self.assertTrue(arm._replay_drive_gripper)
+                self._pump_arm(arm, 1.4)
+                self.assertAlmostEqual(arm._grip_cmd_deg, closed, delta=2.0)
+                self.assertFalse(fake.gripper_open)
+            finally:
+                arm.stop()
+
     def test_drag_record_enters_gravity(self) -> None:
         from tests.test_traj import recordings_tmpdir
 

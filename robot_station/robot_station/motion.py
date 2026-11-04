@@ -910,6 +910,15 @@ class MotionCore:
             data["trajectory"] = {"endpoint_hold_id": hold["id"] if hold else ""}
             return data
 
+    def _park_endpoint_command(self) -> None:
+        """Button release: keep the in-flight joint command, drop the rest of the path."""
+        self._endpoint_hold = None
+        park = getattr(self.arm, "park_joint_path", None)
+        if callable(park):
+            park()
+        else:
+            self.arm.hold(abort_path=True)
+
     def _stop_endpoint_hold(self) -> None:
         if self._endpoint_hold:
             self._endpoint_hold = None
@@ -971,10 +980,9 @@ class MotionCore:
                 hold = self._endpoint_hold
                 matches = bool(hold and hold["owner"] == cid and hold["id"] == msg.get("hold_id"))
                 if matches:
-                    if action == "traj_endpoint_stop":
-                        self._stop_endpoint_hold()
-                    elif time.monotonic() - hold["touch"] >= ENDPOINT_HOLD_TIMEOUT_S:
-                        self._stop_endpoint_hold()
+                    stopping = action == "traj_endpoint_stop" or time.monotonic() - hold["touch"] >= ENDPOINT_HOLD_TIMEOUT_S
+                    if stopping:
+                        self._park_endpoint_command()
                     else:
                         hold["touch"] = time.monotonic()
                 return {"active": bool(matches and self._endpoint_hold)}
@@ -1353,10 +1361,13 @@ class MotionCore:
 
     def _step_arm(self, now: float, dt: float, ncli: int, moving: bool) -> None:
         hold = self._endpoint_hold
-        if hold and (now - hold["touch"] >= ENDPOINT_HOLD_TIMEOUT_S or
-                     not self.gate.motion_allowed() or
-                     self._endpoint_reached(self.arm.poll(), hold["target"])):
-            self._stop_endpoint_hold()
+        if hold:
+            expired = now - hold["touch"] >= ENDPOINT_HOLD_TIMEOUT_S
+            arrived = self._endpoint_reached(self.arm.poll(), hold["target"])
+            if not self.gate.motion_allowed():
+                self._stop_endpoint_hold()
+            elif expired or arrived:
+                self._park_endpoint_command()
         if self.program.active and now - self._program_touch > 2.0:
             self.program.stop("程序控制连接超时")
             self.arm.hold(abort_path=True)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import time
 import unittest
+from unittest.mock import patch
 
 from robot_station.config import StationConfig
 from robot_station.motion import MotionCore, ENDPOINT_HOLD_TIMEOUT_S
@@ -96,6 +97,72 @@ class EndpointHoldTests(unittest.TestCase):
         self.command("traj_endpoint_stop", token="press-2")
         for _ in range(5): self.core._step(time.monotonic(), 0.01)
         self.assertGreater(self.core.arm.poll().q_deg[0], before+0.1)
+
+    def test_release_keeps_inflight_command_when_feedback_is_behind(self):
+        self.begin()
+        arm = self.core.arm
+        lead = [math.radians(q) for q in arm.poll().q_deg]
+        lead[0] += math.radians(4.0)
+        arm._servo_cmd_rad = list(lead)
+        arm._stream_q_rad = list(lead)
+        arm._home_path = [[math.radians(q) for q in self.target]]
+        low = [value - math.radians(6.0) for value in lead]
+        with patch.object(arm, "_read_joint_q_rad", return_value=list(low)), \
+             patch.object(arm, "hold", wraps=arm.hold) as held:
+            reply = self.command("traj_endpoint_stop")
+            self.assertTrue(reply["ok"], reply)
+            self.assertFalse(reply["data"]["active"])
+            held.assert_not_called()
+        self.assertIsNone(self.core._endpoint_hold)
+        self.assertEqual(arm._home_path, [])
+        for got, want in zip(arm._servo_cmd_rad, lead):
+            self.assertAlmostEqual(got, want, places=6)
+
+    def test_arrival_keeps_endpoint_command_when_joint_read_lags(self):
+        self.begin()
+        arm = self.core.arm
+        target_rad = [math.radians(q) for q in self.target]
+        low = [value - math.radians(6.0) for value in target_rad]
+        original_poll = arm.poll
+
+        def arrived():
+            snap = original_poll()
+            snap.feedback_deg = list(self.target)
+            snap.q_deg = list(self.target)
+            return snap
+
+        def park():
+            arm._servo_cmd_rad = list(target_rad)
+            arm._stream_q_rad = list(target_rad)
+            arm._home_path = []
+            arm._parked = True
+            arm._servo_intent = True
+
+        park()
+        with patch.object(arm, "poll", side_effect=arrived), \
+             patch.object(arm, "_read_joint_q_rad", return_value=list(low)), \
+             patch.object(arm, "hold", wraps=arm.hold) as held:
+            reply = self.command("traj_endpoint_stop")
+            self.assertTrue(reply["ok"], reply)
+            self.assertFalse(reply["data"]["active"])
+            held.assert_not_called()
+        self.assertIsNone(self.core._endpoint_hold)
+        for got, want in zip(arm._servo_cmd_rad, target_rad):
+            self.assertAlmostEqual(got, want, places=6)
+
+        self.core._endpoint_hold = {
+            "id": "press-arrive", "owner": "operator",
+            "touch": time.monotonic(), "target": list(self.target),
+        }
+        park()
+        with patch.object(arm, "poll", side_effect=arrived), \
+             patch.object(arm, "_read_joint_q_rad", return_value=list(low)), \
+             patch.object(arm, "hold", wraps=arm.hold) as held:
+            self.core._step(time.monotonic(), 0.01)
+            held.assert_not_called()
+        self.assertIsNone(self.core._endpoint_hold)
+        for got, want in zip(arm._servo_cmd_rad, target_rad):
+            self.assertAlmostEqual(got, want, places=6)
 
     def test_old_click_only_request_and_disabled_arm_cannot_start_motion(self):
         self.assertFalse(self.command("traj_endpoint", token="")["ok"])

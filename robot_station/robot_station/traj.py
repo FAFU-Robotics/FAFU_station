@@ -7,6 +7,7 @@ waypoint panel.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import threading
@@ -18,6 +19,9 @@ PLAYBACK_DT = 0.01
 SMOOTH_WINDOW = 7
 REPLAY_RATE_MIN = 0.5
 REPLAY_RATE_MAX = 1.0
+# A gripper channel this flat did not move. Replay must not treat its absolute
+# angle as a target; that angle is often just the untouched command default.
+GRIPPER_MOTION_TOL_DEG = 2.0
 _UNSAFE_NAME = re.compile(r'[\\/:*?"<>|\x00-\x1f]+')
 
 
@@ -302,6 +306,30 @@ def _gradient(y: list[float], t: list[float]) -> list[float]:
         dt = t[i + 1] - t[i - 1]
         out[i] = (y[i + 1] - y[i - 1]) / dt if abs(dt) > 1e-12 else 0.0
     return out
+
+
+def gripper_motion(frames: list[dict[str, Any]]) -> bool:
+    """True only when this trajectory's own gripper samples actually move.
+
+    Missing samples, or a peak-to-peak span of at most ``GRIPPER_MOTION_TOL_DEG``,
+    are not a gripper action. Playback must leave the gripper where it already is.
+    """
+    values: list[float] = []
+    for frame in frames:
+        if not isinstance(frame, dict):
+            continue
+        raw = frame.get("gpos")
+        if raw is None or isinstance(raw, bool):
+            continue
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(value):
+            values.append(value)
+    if not values:
+        return False
+    return max(values) - min(values) > math.radians(GRIPPER_MOTION_TOL_DEG)
 
 
 def prepare_playback(
