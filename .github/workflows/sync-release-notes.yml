@@ -10,7 +10,7 @@ on:
       tag:
         description: "Release tag to update (e.g. v1.6.1)"
         required: true
-        default: v1.7.1
+        default: v1.7.2
 
 permissions:
   contents: write
